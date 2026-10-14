@@ -12,28 +12,28 @@
       :root {
         color-scheme: light dark;
         /* dark is the base (default); light applies via prefers-color-scheme */
-        --bg: #181A1B;
-        --text: #E8E6E3;
-        --muted: #988F81;
-        --btn-bg: #262A2B;
+        --bg: #181a1b;
+        --text: #e8e6e3;
+        --muted: #988f81;
+        --btn-bg: #262a2b;
         --btn-border: var(--muted);
         --thead-border: var(--text);
         --row-border: var(--muted);
-        --status: #E06C60;
-        --up: #7BB98C;
-        --down: #DE8482;
-        --flat: #7FA6D9;
+        --status: #e06c60;
+        --up: #7bb98c;
+        --down: #de8482;
+        --flat: #7fa6d9;
       }
       @media (prefers-color-scheme: light) {
         :root {
-          --bg: #F6F3EC;
-          --text: #33302B;
-          --muted: #8A8175;
-          --btn-bg: #E9E4D8;
-          --status: #B03A2A;
-          --up: #2E7D4F;
-          --down: #B0392B;
-          --flat: #3A6EA5;
+          --bg: #f6f3ec;
+          --text: #33302b;
+          --muted: #8a8175;
+          --btn-bg: #e9e4d8;
+          --status: #b03a2a;
+          --up: #2e7d4f;
+          --down: #b0392b;
+          --flat: #3a6ea5;
         }
       }
       * {
@@ -207,12 +207,54 @@
         margin: 0 0 0.5rem;
         font-size: 0.9rem;
       }
-      #copybuttons,
-      #copybuttons td {
+      #use-opencode h3 {
+        font-size: 1rem;
+        margin: 1.1rem 0 0.35rem;
+      }
+      /* the copy tables keep the .actions button look outside .actions */
+      .copybuttons,
+      .copybuttons td {
         border: none;
       }
-      #copybuttons td:nth-child(2) {
+      .copybuttons td:nth-child(2) {
         padding-top: 0.7rem;
+      }
+      /* v1/v2 version badges on the "Use it with OpenCode" headings */
+      .verbadge {
+        display: inline-block;
+        font-size: 0.72rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        border: 1px solid var(--muted);
+        color: var(--muted);
+        border-radius: 4px;
+        padding: 0.05rem 0.4rem;
+        vertical-align: 1px;
+      }
+      .verbadge.v2 {
+        color: var(--up);
+        border-color: var(--up);
+      }
+      /* v2 plugin snippet: static JSON syntax highlighting (the page's CSP
+         allows one inline script only, so tokens are marked up by hand) */
+      .jsonbox {
+        background: var(--btn-bg);
+        border: 1px solid var(--muted);
+        border-radius: 6px;
+        padding: 0.7rem 0.9rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.83rem;
+        overflow-x: auto;
+        margin: 0.6rem 0;
+      }
+      .jsonbox .jk {
+        color: var(--flat);
+      }
+      .jsonbox .js {
+        color: var(--up);
+      }
+      .jsonbox .jp {
+        color: var(--muted);
       }
       footer {
         margin-top: 1.5rem;
@@ -231,22 +273,10 @@
   <body>
     <h1>model-compare</h1>
     <p class="sub">
-      Best value-for-money LLM on OpenRouter, refreshed every 6 hrs by
+      Best value-for-money LLM on OpenRouter, refreshed every 3 hrs by
       <a href="https://github.com/canonical/model-compare"
         >canonical/model-compare</a
       >.
-    </p>
-
-    <p class="hint">
-      Tip: save the <code>curl</code> variant as a shell alias, so every launch
-      picks up the fresh value:
-    </p>
-    <p class="hint">
-      <code id="alias-hint"></code>
-    </p>
-    <p class="hint">
-      <code>best.txt</code> always serves the <em>balanced</em> #1, regardless
-      of the tab shown here.
     </p>
 
     <h2>Ranked picks</h2>
@@ -289,14 +319,14 @@
     </div>
 
     <p class="hint">
-      Prices shown are what a long session pays: several models bill at a
-      higher rate once the prompt outgrows their cheap short-context tier.
+      Prices shown are what a long session pays: several models bill at a higher
+      rate once the prompt outgrows their cheap short-context tier.
     </p>
     <p class="hint">
-      <span class="tier">TIER</span> marks how prices vary: a token threshold
-      is the prompt size above which the higher rate applies; a percentage is
-      a scheduled off-peak discount (price shown: the standard rate); SCHED
-      marks a schedule whose discount is under 1%. Hover a cell for details.
+      <span class="tier">TIER</span> marks how prices vary: a token threshold is
+      the prompt size above which the higher rate applies; a percentage is a
+      scheduled off-peak discount (price shown: the standard rate); SCHED marks
+      a schedule whose discount is under 1%. Hover a cell for details.
     </p>
 
     <div id="deals-section">
@@ -338,43 +368,13 @@
       </div>
       <p class="hint" id="deals-legend" hidden>
         <span class="offpeak">SCHEDULE</span> shows when the discounted rate
-        applies — long windows are clipped, hover for the full text.
-        $IN/$OUT are the discounted prices during those windows; the
-        standard rate applies at all other times.
+        applies — long windows are clipped, hover for the full text. $IN/$OUT
+        are the discounted prices during those windows; the standard rate
+        applies at all other times.
       </p>
       <p class="hint" id="deals-empty" hidden>
         No scheduled off-peak discounts in the current data.
       </p>
-    </div>
-
-    <div class="actions">
-      <p class="hint">Copy to clipboard:</p>
-      <table id="copybuttons">
-        <tr>
-          <td>
-            <button type="button" id="copy-model" disabled>#1 model</button>
-          </td>
-          <td><code id="model-value">—</code></td>
-        </tr>
-        <tr>
-          <td>
-            <button type="button" id="copy-command" disabled>
-              OpenCode with #1
-            </button>
-          </td>
-          <td><code id="command-value">—</code></td>
-        </tr>
-        <tr>
-          <td>
-            <button type="button" id="copy-curl" disabled>
-              OpenCode with curl
-            </button>
-          </td>
-          <td>
-            <code id="curl-value"></code>
-          </td>
-        </tr>
-      </table>
     </div>
 
     <div id="highlights" hidden>
@@ -384,6 +384,84 @@
       <p id="hl-intelligence"></p>
       <h2>Price movements &amp; deals</h2>
       <p id="hl-prices"></p>
+    </div>
+
+    <div id="use-opencode">
+      <h2>Use it with OpenCode</h2>
+
+      <div class="actions">
+        <p class="hint">Copy to clipboard:</p>
+        <table id="copybuttons" class="copybuttons">
+          <tr>
+            <td>
+              <button type="button" id="copy-model" disabled>#1 model</button>
+            </td>
+            <td><code id="model-value">—</code></td>
+          </tr>
+        </table>
+      </div>
+
+      <h3>
+        <span class="verbadge">OpenCode v1</span> Launch flag, shell alias
+      </h3>
+      <div class="actions">
+        <table class="copybuttons">
+          <tr>
+            <td>
+              <button type="button" id="copy-command" disabled>
+                OpenCode with #1
+              </button>
+            </td>
+            <td><code id="command-value">—</code></td>
+          </tr>
+          <tr>
+            <td>
+              <button type="button" id="copy-curl" disabled>
+                OpenCode with curl
+              </button>
+            </td>
+            <td>
+              <code id="curl-value"></code>
+            </td>
+          </tr>
+        </table>
+      </div>
+      <p class="hint">
+        Tip: save the <code>curl</code> variant as a shell alias, so every
+        launch picks up the fresh value:
+      </p>
+      <p class="hint">
+        <code id="alias-hint"></code>
+      </p>
+      <p class="hint">
+        <code>best.txt</code> always serves the <em>balanced</em> #1, regardless
+        of the tab shown above.
+      </p>
+
+      <h3><span class="verbadge v2">OpenCode v2</span> model-compare plugin</h3>
+      <p class="hint">
+        (OpenCode v2 has no <code>--model</code> for TUI launches.) Add the
+        plugin to <code>opencode.jsonc</code> (project or global):
+      </p>
+      <pre class="jsonbox"><span class="jp">{</span>
+  <span class="jk">"$schema"</span><span class="jp">:</span> <span class="js">"https://opencode.ai/config.json"</span><span class="jp">,</span>
+  <span class="jk">"plugins"</span><span class="jp">:</span> <span class="jp">[</span>
+    <span class="jp">{</span>
+      <span class="jk">"package"</span><span class="jp">:</span> <span class="js">"model-compare-opencode-plugin"</span><span class="jp">,</span>
+      <span class="jk">"options"</span><span class="jp">:</span> <span class="jp">{</span> <span class="jk">"source"</span><span class="jp">:</span> <span class="js">"auto"</span><span class="jp">,</span> <span class="jk">"defaultPriority"</span><span class="jp">:</span> <span class="js">"balanced"</span> <span class="jp">}</span>
+    <span class="jp">}</span>
+  <span class="jp">]</span>
+<span class="jp">}</span></pre>
+      <p class="hint">
+        It registers three aliases in the model picker —
+        <code>model-compare/balanced</code>, <code>/price</code>,
+        <code>/quality</code> — always resolving to the current best. Point your
+        default at one, or switch any session with <code>/use-best</code>. For
+        options, keyboard shortcuts, weights, and pins, see
+        <a href="https://github.com/canonical/model-compare-opencode-plugin"
+          >model-compare-opencode-plugin on GitHub</a
+        >.
+      </p>
     </div>
 
     <footer>
@@ -537,8 +615,10 @@
           var endsK = row.tier_note.charAt(row.tier_note.length - 1) === "k";
           var size = parseInt(row.tier_note.slice(1), 10);
           var hover =
-            "Charges a higher rate once the prompt exceeds " + size +
-            (endsK ? "k" : "") + " tokens; price shown: that long-context rate.";
+            "Charges a higher rate once the prompt exceeds " +
+            size +
+            (endsK ? "k" : "") +
+            " tokens; price shown: that long-context rate.";
           // Below-threshold (base) prices ride along when the row carries
           // them: formatted by the same fmtPrice as the table columns.
           // Finite and non-negative: strings, NaN, +/-Infinity, negatives
@@ -552,22 +632,25 @@
           ) {
             hover +=
               " The short-context rate is $" +
-              fmtPrice(row.base_input_usd_per_m) + " in / $" +
-              fmtPrice(row.base_output_usd_per_m) + " out per 1M tokens.";
+              fmtPrice(row.base_input_usd_per_m) +
+              " in / $" +
+              fmtPrice(row.base_output_usd_per_m) +
+              " out per 1M tokens.";
           }
           hovers.push(hover);
         }
         if (row.sched_note === "SCHED") {
           hovers.push(
             "Price varies on a schedule by less than 1%; price shown: the " +
-            "standard rate."
+              "standard rate.",
           );
         } else if (row.sched_note) {
           hovers.push(
-            "Runs up to " + row.sched_note.slice(1) +
-            " cheaper during scheduled off-peak hours" +
-            (row.sched_detail ? " (" + row.sched_detail + ")" : "") +
-            "; price shown: the standard rate."
+            "Runs up to " +
+              row.sched_note.slice(1) +
+              " cheaper during scheduled off-peak hours" +
+              (row.sched_detail ? " (" + row.sched_detail + ")" : "") +
+              "; price shown: the standard rate.",
           );
         }
         return {
@@ -590,7 +673,8 @@
             : new Date().toISOString().slice(0, 10);
           var d = new Date(today + "T00:00:00Z");
           d.setUTCDate(d.getUTCDate() - 7);
-          baseline = historyData.snapshots[d.toISOString().slice(0, 10)] || null;
+          baseline =
+            historyData.snapshots[d.toISOString().slice(0, 10)] || null;
         }
         shown.forEach(function (row, i) {
           var tr = document.createElement("tr");
@@ -704,7 +788,8 @@
               if (note) {
                 var pct = note === "SCHED" ? "less than 1%" : note.slice(1);
                 td.title =
-                  "Cheapest scheduled rates: up to " + pct +
+                  "Cheapest scheduled rates: up to " +
+                  pct +
                   " below the standard price during the listed windows.";
               }
             }
@@ -740,7 +825,7 @@
               clipped = true;
             }
             if (clipped) cell.title = cell.dataset.full;
-          }
+          },
         );
       }
 
