@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-10-14
+
+### Added
+
+- The site gains a bottom-of-page "Use it with OpenCode" section that
+  distinguishes OpenCode v1 (`opencode --model`, shell alias, copy
+  buttons) from OpenCode v2 (the model-compare-opencode-plugin, with a
+  syntax-highlighted `opencode.jsonc` snippet, the
+  `model-compare/balanced|price|quality` picker aliases and `/use-best`).
+
+### Changed
+
+- The published catalog refreshes every 3 hours instead of 6, halving the
+  worst-case staleness window.
+- The page subtitle states the 3-hour cadence.
+
 ## [0.3.2] - 2026-10-10
 
 ### Added
