@@ -1005,6 +1005,130 @@ def apply_endpoint_pricing(candidates, args, filtered):
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter session-cost dataset (per-task cost, outside the score)
+# ---------------------------------------------------------------------------
+
+
+SESSION_COST_URL = "https://openrouter.ai/api/v1/datasets/session-cost"
+SESSION_COST_HARNESS_SLUG = "hermes-agent"
+# The turn range the catalog/CLI surfaces (Task 8); the fetch itself keeps
+# every turn range the dataset returns.
+SESSION_COST_DISPLAY_TURN_RANGE = "10-49-turns"
+SESSION_COST_ATTRIBUTION = "Data © OpenRouter, CC BY 4.0"
+
+
+def strip_permaslug_date(permaslug: str) -> str:
+    """Permaslug without its trailing -YYYYMMDD (undated ids map to themselves)."""
+    match = re.match(r"^(.*)-(\d{8})$", permaslug)
+    return match.group(1) if match else permaslug
+
+
+def fetch_session_cost(args) -> dict | None:
+    """Per-task session-cost medians from OpenRouter's dataset, or None.
+
+    A separate published dimension (design section 4.8): the median USD
+    cost of real sessions through the pinned published harness -- never
+    part of the weighted score. One bulk paginated fetch per invocation
+    (?app_slug=<harness>&limit=500&offset=k) regardless of the model list;
+    pagination stops on a page shorter than the limit or once the next
+    offset would exceed the API's 5000 cap. Cells key on dated permaslugs
+    (z-ai/glm-5.3-flash-20260826), stripped to the bare catalog id with
+    strip_permaslug_date; when several strip to the same id, the latest
+    date wins each turn-range cell (same rule as build_aa_benchmarks).
+
+    Returns None (graceful degradation, design section 4.9) when no key is
+    configured (the --openrouter-api-key flag, else OPENROUTER_API_KEY),
+    when the fetch fails after fetch_json's retries, or when the response
+    shape is unexpected -- a malformed payload must never crash the run.
+    The merged result is cached under "session-cost" with the standard TTL.
+    """
+    api_key = args.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    if not args.no_cache:
+        cached = load_cache("session-cost", args.cache_ttl)
+        if isinstance(cached, dict) and isinstance(cached.get("medians"), dict):
+            return cached
+    cells = []
+    # The API caps limit at 500 and offset at 5000 (11 full pages max).
+    offset = 0
+    while offset <= 5000:
+        try:
+            payload = fetch_json(
+                f"{SESSION_COST_URL}?app_slug={SESSION_COST_HARNESS_SLUG}"
+                f"&limit=500&offset={offset}",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=30,
+                retries=3,
+            )
+        except Exception as exc:
+            warn(f"session-cost dataset request failed ({exc})")
+            return None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            warn("session-cost dataset returned an unexpected response shape")
+            return None
+        cells.extend(cell for cell in data if isinstance(cell, dict))
+        if len(data) < 500:
+            break
+        offset += 500
+    medians: dict[str, dict[str, float]] = {}
+    seen_date: dict[tuple[str, str], str] = {}
+
+    def accept(bare, date, turn_range, median):
+        key = (bare, turn_range)
+        if key in seen_date and seen_date[key] >= date:
+            return
+        seen_date[key] = date
+        medians.setdefault(bare, {})[turn_range] = median
+
+    for cell in cells:
+        permaslug = cell.get("model_permaslug")
+        turn_range = cell.get("turn_range")
+        raw = cell.get("median_session_cost_usd")
+        if not (
+            isinstance(permaslug, str)
+            and permaslug
+            and isinstance(turn_range, str)
+            and turn_range
+        ):
+            continue
+        # Non-finite medians would serialize as NaN and poison the catalog.
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        try:
+            median = float(raw)  # huge ints raise OverflowError
+        except OverflowError:
+            continue
+        if not math.isfinite(median):
+            continue
+        match = re.match(r"^(.*)-(\d{8})$", permaslug)
+        accept(
+            strip_permaslug_date(permaslug),
+            match.group(2) if match else "",
+            turn_range,
+            median,
+        )
+    if not medians:
+        warn("session-cost dataset returned no usable cells")
+        return None
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    if not isinstance(meta, dict):
+        warn("session-cost dataset returned an unexpected response shape")
+        return None
+    result = {
+        "attribution": SESSION_COST_ATTRIBUTION,
+        "app_slug": SESSION_COST_HARNESS_SLUG,
+        "as_of": meta.get("as_of"),
+        "window_days": meta.get("window_days"),
+        "window_end_date": meta.get("window_end_date"),
+        "medians": medians,
+    }
+    save_cache("session-cost", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # OpenRouter catalog
 # ---------------------------------------------------------------------------
 

@@ -4737,3 +4737,155 @@ def test_catalog_aa_fallback_not_masked_by_openrouter_matches():
     assert doc["sources"]["aa"]["mode"] == "openrouter"
     assert doc["sources"]["aa"]["fallback"] == "none"
     bsd.validate_catalog(doc)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter session-cost dataset (per-task cost, outside the score)
+# ---------------------------------------------------------------------------
+
+
+def _cost_cell(permaslug, turn_range, median):
+    """One session-cost dataset cell (brainstorm section 2.6 shape)."""
+    return {
+        "app_name": "Hermes Agent",
+        "app_slug": "hermes-agent",
+        "median_session_cost_usd": median,
+        "model_permaslug": permaslug,
+        "turn_range": turn_range,
+    }
+
+
+def _cost_payload(cells, as_of="2026-10-15T00:00:00Z"):
+    return {
+        "data": cells,
+        "meta": {
+            "as_of": as_of,
+            "version": "1",
+            "window_days": 30,
+            "window_end_date": "2026-10-12",
+        },
+    }
+
+
+def test_session_cost_merges_dated_permaslugs(monkeypatch):
+    """Dated permaslugs strip to the bare id; the latest date wins the cell."""
+    payload = _cost_payload(
+        [
+            _cost_cell("z-ai/glm-5.3-flash-20260826", "10-49-turns", 0.25),
+            _cost_cell("z-ai/glm-5.3-flash-20260901", "10-49-turns", 0.50),
+        ]
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    result = mc.fetch_session_cost(make_args(openrouter_api_key=None))
+    assert result["medians"] == {"z-ai/glm-5.3-flash": {"10-49-turns": 0.50}}
+    # The strip helper: dated -> bare, undated unchanged.
+    assert (
+        mc.strip_permaslug_date("z-ai/glm-5.3-flash-20260826") == "z-ai/glm-5.3-flash"
+    )
+    assert mc.strip_permaslug_date("z-ai/glm-5.3-flash") == "z-ai/glm-5.3-flash"
+
+
+def test_session_cost_keyless_returns_none(monkeypatch):
+    """No flag and no env: None, and the network is never touched."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    def no_network(*a, **k):
+        raise AssertionError("fetch_json must not be called without a key")
+
+    monkeypatch.setattr(mc, "fetch_json", no_network)
+    assert mc.fetch_session_cost(make_args(openrouter_api_key=None)) is None
+
+
+def test_session_cost_fetch_failure_returns_none(monkeypatch, capsys):
+    """A fetch failing after fetch_json's retries warns once and yields None."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(mc, "fetch_json", boom)
+    assert mc.fetch_session_cost(make_args(openrouter_api_key=None)) is None
+    assert "session-cost dataset request failed" in capsys.readouterr().err
+    # Same None contract for a response with an unexpected shape: a
+    # malformed payload must never crash the run.
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: ["not", "a", "dict"])
+    assert mc.fetch_session_cost(make_args(openrouter_api_key=None)) is None
+    assert "unexpected response shape" in capsys.readouterr().err
+
+
+def test_session_cost_pagination_stops_on_short_page(monkeypatch):
+    """Pagination requests pages until one is shorter than the limit."""
+    calls = []
+
+    def fake_fetch_json(url, headers=None, timeout=30, retries=1):
+        calls.append(url)
+        return _cost_payload([_cost_cell("acme/model-a", "1-turn", 0.10)])
+
+    monkeypatch.setattr(mc, "fetch_json", fake_fetch_json)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    result = mc.fetch_session_cost(make_args(openrouter_api_key=None))
+    # A short first page ends pagination: exactly one request.
+    assert len(calls) == 1
+    assert calls[0].endswith("offset=0")
+    assert result["medians"] == {"acme/model-a": {"1-turn": 0.10}}
+    # A full 500-cell page keeps going; the next short page stops it.
+    calls.clear()
+    full_page = _cost_payload(
+        [_cost_cell(f"acme/model-{i}", "1-turn", 0.10) for i in range(500)]
+    )
+
+    def paged_fetch_json(url, headers=None, timeout=30, retries=1):
+        calls.append(url)
+        return full_page if url.endswith("offset=0") else _cost_payload([])
+
+    monkeypatch.setattr(mc, "fetch_json", paged_fetch_json)
+    result = mc.fetch_session_cost(make_args(openrouter_api_key=None))
+    assert len(calls) == 2
+    assert calls[0].endswith("offset=0") and calls[1].endswith("offset=500")
+    assert result["medians"] == {
+        f"acme/model-{i}": {"1-turn": 0.10} for i in range(500)
+    }
+
+
+def test_session_cost_shape_and_attribution(monkeypatch):
+    """Envelope: attribution + harness + meta; every turn range survives."""
+    payload = _cost_payload(
+        [
+            _cost_cell("acme/model-a", "1-turn", 0.05),
+            _cost_cell("acme/model-a", "2-9-turns", 0.10),
+            _cost_cell("acme/model-a", "10-49-turns", 1.74),
+            _cost_cell("acme/model-a", "50-plus-turns", 9.99),
+        ]
+    )
+    seen = {}
+
+    def fake_fetch_json(url, headers=None, timeout=30, retries=1):
+        seen["url"] = url
+        seen["headers"] = headers
+        return payload
+
+    monkeypatch.setattr(mc, "fetch_json", fake_fetch_json)
+    # The flag wins over the env for the key (same resolution as AA).
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-env")
+    result = mc.fetch_session_cost(make_args(openrouter_api_key="sk-flag"))
+    assert result == {
+        "attribution": "Data © OpenRouter, CC BY 4.0",
+        "app_slug": "hermes-agent",
+        "as_of": "2026-10-15T00:00:00Z",
+        "window_days": 30,
+        "window_end_date": "2026-10-12",
+        "medians": {
+            "acme/model-a": {
+                "1-turn": 0.05,
+                "2-9-turns": 0.10,
+                "10-49-turns": 1.74,
+                "50-plus-turns": 9.99,
+            }
+        },
+    }
+    assert seen["headers"] == {"Authorization": "Bearer sk-flag"}
+    assert seen["url"] == (
+        f"{mc.SESSION_COST_URL}?app_slug=hermes-agent&limit=500&offset=0"
+    )
+    assert mc.SESSION_COST_DISPLAY_TURN_RANGE == "10-49-turns"
