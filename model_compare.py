@@ -2193,6 +2193,43 @@ def fmt_discount(value) -> str:
     return f"{value:.0%}" if has_discount(value) else "--"
 
 
+def fmt_prec(cand) -> str:
+    """PREC cell: the precision the ranked price is quoted at.
+
+    The maker's default precision when disclosed, the best available
+    otherwise, "n/a" when none could be derived; "!" flags default routing
+    that favors cheaper sub-default endpoints (annotations.risk_flag).
+    Candidates that never went through the endpoint stage degrade to "n/a".
+    """
+    cell = cand.get("default_precision") or "n/a"
+    if (cand.get("annotations") or {}).get("risk_flag"):
+        cell += "!"
+    return cell
+
+
+def fmt_quant_note(annotations: dict) -> str | None:
+    """One-line note on the cheapest sub-default endpoint (PREC tooltip).
+
+    The exact string the site shows (Task 11 renders it verbatim), so the
+    format is pinned by test. None when there is no non-eligible live
+    endpoint -- nothing cheaper to route to. cheapest_quantized.price is
+    stored per-token, the way build_annotations leaves it; the note shows
+    USD per 1M like every other price the CLI prints. A missing spread
+    (defensive) drops the parenthetical.
+    """
+    quant = (annotations or {}).get("cheapest_quantized")
+    if not quant:
+        return None
+    note = (
+        f"cheapest non-baseline: {quant['quantization']} @ {quant['provider']}, "
+        f"${fmt_price(quant['price'] * 1_000_000)}/M"
+    )
+    spread = (annotations or {}).get("price_spread")
+    if spread is not None:
+        note += f" in ({spread:.2f}x baseline)"
+    return note
+
+
 def print_table(top, total_candidates, weights, quality_note):
     headers = [
         "RANK",
@@ -2201,6 +2238,7 @@ def print_table(top, total_candidates, weights, quality_note):
         "$IN/M",
         "$OUT/M",
         "DISC",
+        "PREC",
         "TIER",
         "CTX",
         "AGE",
@@ -2216,6 +2254,7 @@ def print_table(top, total_candidates, weights, quality_note):
                 fmt_price(cand["price_in"]),
                 fmt_price(cand["price_out"]),
                 fmt_discount(cand["discount"]),
+                fmt_prec(cand),
                 cand["tier_note"] or cand["sched_note"] or "--",
                 fmt_context(cand["context"]),
                 fmt_age(cand["age_days"]),
@@ -2262,6 +2301,12 @@ def print_table(top, total_candidates, weights, quality_note):
         "schedule whose discount is under 1%. --json lists each model's "
         "schedule."
     )
+    print(
+        "PREC = precision the ranked price is quoted at (maker's default when "
+        "disclosed, best available otherwise; ! = default routing favors "
+        "cheaper sub-default endpoints); prices are the cheapest live endpoint "
+        "at that precision."
+    )
 
 
 def print_json(top):
@@ -2307,6 +2352,10 @@ def print_json(top):
             "risk_flag": (cand.get("annotations") or {}).get("risk_flag"),
             "price_spread": (cand.get("annotations") or {}).get("price_spread"),
             "session_cost_usd": None,
+            # The cheapest-sub-default note, exactly as the CLI prints it
+            # (Task 11 shows it verbatim). Emit-first: Task 9's ROW_KEYS
+            # pins this key last; pre-endpoint candidates degrade to None.
+            "quant_note": fmt_quant_note(cand.get("annotations")),
         }
         for cand in top
     ]

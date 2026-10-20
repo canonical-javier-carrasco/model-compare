@@ -1912,15 +1912,16 @@ def test_json_rows_carry_new_additive_keys(monkeypatch, capsys):
     mc.compute_scores(candidates, args, {})
     mc.print_json(candidates)
     (row,) = json.loads(capsys.readouterr().out)
-    # The missing-key check build_site_data does still passes, and the four
+    # The missing-key check build_site_data does still passes, and the five
     # new keys close the row in the exact order Task 9's ROW_KEYS extension
-    # pins.
+    # pins (quant_note trails: Task 6b appended it after Task 6's four).
     assert all(key in row for key in bsd.ROW_KEYS)
-    assert list(row)[-4:] == [
+    assert list(row)[-5:] == [
         "default_precision",
         "risk_flag",
         "price_spread",
         "session_cost_usd",
+        "quant_note",
     ]
     assert row["default_precision"] == "fp8"
     assert row["risk_flag"] is True
@@ -1937,6 +1938,111 @@ def test_json_rows_tolerate_pre_endpoint_candidates(capsys):
         assert row["risk_flag"] is None
         assert row["price_spread"] is None
         assert row["session_cost_usd"] is None
+        assert row["quant_note"] is None
+
+
+# ---------------------------------------------------------------------------
+# Provider-aware eval: CLI/site surface (PREC column, risk marker, quant_note)
+# ---------------------------------------------------------------------------
+
+
+def test_fmt_quant_note_formats_cheapest_non_baseline():
+    # cheapest_quantized.price is stored per-token (blended, exactly as
+    # build_annotations leaves it); the note shows USD per 1M like every
+    # other price the CLI prints. The exact string is the site tooltip's
+    # verbatim content (Task 11), so it is pinned here.
+    annotations = {
+        "price_spread": 0.17,
+        "cheapest_quantized": {
+            "provider": "open-inference",
+            "quantization": "fp4",
+            "price": 0.000000026,
+        },
+        "risk_flag": True,
+        "baseline_context_below_catalog": False,
+    }
+    assert mc.fmt_quant_note(annotations) == (
+        "cheapest non-baseline: fp4 @ open-inference, $0.026/M in (0.17x baseline)"
+    )
+    # Defensive: a quantized endpoint without a comparable spread drops the
+    # parenthetical only.
+    assert mc.fmt_quant_note({**annotations, "price_spread": None}) == (
+        "cheapest non-baseline: fp4 @ open-inference, $0.026/M"
+    )
+
+
+def test_fmt_quant_note_none_without_non_eligible():
+    # No non-eligible live endpoint: nothing cheaper to route to, no note.
+    annotations = {
+        "price_spread": None,
+        "cheapest_quantized": None,
+        "risk_flag": False,
+        "baseline_context_below_catalog": False,
+    }
+    assert mc.fmt_quant_note(annotations) is None
+    # Candidates that never went through the endpoint stage carry no
+    # annotations at all.
+    assert mc.fmt_quant_note({}) is None
+    assert mc.fmt_quant_note(None) is None
+
+
+def test_cli_table_shows_prec_column_and_risk_marker(monkeypatch, capsys):
+    models = [
+        make_model(id="z-ai/glm", name="Z.AI: GLM"),
+        # First-party all-unknown model: eligibility survives the carve-out
+        # while the default precision stays null (PREC cell "n/a").
+        make_model(id="anthropic/claude", name="Anthropic: Claude"),
+    ]
+
+    def fake_fetch(model_id, a):
+        if model_id == "z-ai/glm":
+            return _endpoint_stage_eps()
+        return [_endpoint(provider_name="Anthropic", quantization="unknown")]
+
+    monkeypatch.setattr(mc, "fetch_model_endpoints", fake_fetch)
+    args = make_args(min_context=0)
+    candidates, _ = mc.build_candidates(models, args, {}, {m["id"] for m in models}, [])
+    candidates, _ = mc.apply_endpoint_pricing(candidates, args, [])
+    mc.compute_scores(candidates, args, {})
+    mc.print_table(
+        candidates[:2],
+        len(candidates),
+        mc.PRIORITY_WEIGHTS["balanced"],
+        "quality data unavailable, ranked on price/context/age",
+    )
+    out = capsys.readouterr().out
+    header = out.splitlines()[0]
+    assert "PREC" in header
+    assert header.index("DISC") < header.index("PREC") < header.index("TIER")
+    risk_row = next(line for line in out.splitlines() if "z-ai/glm" in line)
+    assert "fp8!" in risk_row
+    plain_row = next(line for line in out.splitlines() if "anthropic/claude" in line)
+    assert "n/a" in plain_row
+    assert (
+        "PREC = precision the ranked price is quoted at (maker's default when "
+        "disclosed, best available otherwise; ! = default routing favors "
+        "cheaper sub-default endpoints); prices are the cheapest live endpoint "
+        "at that precision."
+    ) in out
+
+
+def test_json_rows_carry_quant_note(monkeypatch, capsys):
+    args = make_args(min_context=0)
+    monkeypatch.setattr(
+        mc, "fetch_model_endpoints", lambda mid, a: _endpoint_stage_eps()
+    )
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    candidates, _ = mc.build_candidates(models, args, {}, {"z-ai/glm"}, [])
+    candidates, _ = mc.apply_endpoint_pricing(candidates, args, [])
+    mc.compute_scores(candidates, args, {})
+    mc.print_json(candidates)
+    (row,) = json.loads(capsys.readouterr().out)
+    # Appended after Task 6's four keys; Task 9's ROW_KEYS extension pins
+    # quant_note as the fifth (emit-first keeps the missing-key check green).
+    assert list(row)[-1] == "quant_note"
+    assert row["quant_note"] == (
+        "cheapest non-baseline: fp4 @ DeepInfra, $0.125/M in (0.50x baseline)"
+    )
 
 
 def test_endpoint_stage_applies_results_in_candidate_order(monkeypatch):
