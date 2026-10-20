@@ -2215,13 +2215,18 @@ def fmt_quant_note(annotations: dict) -> str | None:
     endpoint -- nothing cheaper to route to. cheapest_quantized.price is
     stored per-token, the way build_annotations leaves it; the note shows
     USD per 1M like every other price the CLI prints. A missing spread
-    (defensive) drops the parenthetical.
+    (defensive) drops the parenthetical. A null quantization (third-party
+    null == "unknown" for eligibility) and a null provider_name on
+    malformed data render the design's "unknown" sentinel, never Python's
+    None repr.
     """
     quant = (annotations or {}).get("cheapest_quantized")
     if not quant:
         return None
+    quantization = quant["quantization"] or "unknown"
+    provider = quant["provider"] or "unknown"
     note = (
-        f"cheapest non-baseline: {quant['quantization']} @ {quant['provider']}, "
+        f"cheapest non-baseline: {quantization} @ {provider}, "
         f"${fmt_price(quant['price'] * 1_000_000)}/M"
     )
     spread = (annotations or {}).get("price_spread")

@@ -1986,6 +1986,38 @@ def test_fmt_quant_note_none_without_non_eligible():
     assert mc.fmt_quant_note(None) is None
 
 
+def test_fmt_quant_note_renders_unknown_for_null_quantization():
+    # A third-party null-quantization endpoint can be the cheapest
+    # non-baseline (build_annotations puts third-party unknown/null in the
+    # quantization-caused subset; baseline_eligible treats null == "unknown").
+    # The design's sentinel must be rendered -- never Python's None repr,
+    # which Task 11 would show verbatim on the site. Same guard for a null
+    # provider_name on malformed data (Task 6's own fixture has that case).
+    annotations = {
+        "price_spread": 0.17,
+        "cheapest_quantized": {
+            "provider": "Relace",
+            "quantization": None,
+            "price": 0.000000026,
+        },
+        "risk_flag": True,
+        "baseline_context_below_catalog": False,
+    }
+    assert mc.fmt_quant_note(annotations) == (
+        "cheapest non-baseline: unknown @ Relace, $0.026/M in (0.17x baseline)"
+    )
+    assert mc.fmt_quant_note(
+        {
+            **annotations,
+            "cheapest_quantized": {
+                "provider": None,
+                "quantization": None,
+                "price": 0.000000026,
+            },
+        }
+    ) == ("cheapest non-baseline: unknown @ unknown, $0.026/M in (0.17x baseline)")
+
+
 def test_cli_table_shows_prec_column_and_risk_marker(monkeypatch, capsys):
     models = [
         make_model(id="z-ai/glm", name="Z.AI: GLM"),
