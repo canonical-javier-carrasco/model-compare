@@ -22,6 +22,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent / "web"))
 import build_site_data as bsd  # noqa: E402  (web/ module, contract validator)
 import model_compare as mc
+from model_compare import (
+    PRECISION_LADDER,
+    is_first_party,
+    normalize_provider,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1027,6 +1032,29 @@ def test_schedules_skip_invalid_top_level_models():
         ]
     )
     assert [s["id"] for s in doc["schedules"]] == ["acme/hy4-ok"]
+
+
+# ---------------------------------------------------------------------------
+# Provider-aware eval: precision ladder + first-party detection
+# ---------------------------------------------------------------------------
+
+
+def test_precision_ladder_fp6_outranks_int8():
+    assert PRECISION_LADDER["fp6"] > PRECISION_LADDER["int8"]
+    assert PRECISION_LADDER["fp32"] == max(PRECISION_LADDER.values())
+    assert PRECISION_LADDER["int4"] == min(PRECISION_LADDER.values())
+    assert "unknown" not in PRECISION_LADDER
+
+
+def test_normalize_provider_strips_punctuation():
+    assert normalize_provider("Z.AI") == normalize_provider("z-ai") == "zai"
+    assert normalize_provider("AWS Bedrock") == normalize_provider("aws-bedrock")
+
+
+def test_first_party_author_and_partner():
+    assert is_first_party("Z.AI", "z-ai")
+    assert is_first_party("AWS Bedrock", "anthropic")
+    assert not is_first_party("OpenInference", "z-ai")
 
 
 # ---------------------------------------------------------------------------

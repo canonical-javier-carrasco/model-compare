@@ -109,6 +109,47 @@ CATALOG_DROP_REASONS = (
 PAREN_RE = re.compile(r"\([^)]*\)")
 PROVIDER_PREFIX_RE = re.compile(r"^[^:\s]{1,30}:\s*")
 
+# Quantization precision ladder: label -> rank, highest fidelity first. The
+# ladder ordering in the design doc is authoritative: fp6 > int8 is strict,
+# and formats within one fidelity tier share the same rank. "unknown" never
+# enters the ladder -- it only routes through the first-party eligibility
+# carve-out, never through rank comparison.
+PRECISION_LADDER: dict[str, int] = {
+    "fp32": 4,
+    "bf16": 3,
+    "fp16": 3,
+    "fp8": 2,
+    "mxfp8": 2,
+    "fp6": 1,
+    "int8": 0,
+    "fp4": -1,
+    "mxfp4": -1,
+    "nvfp4": -1,
+    "int4": -2,
+}
+
+# Every quantization value an endpoint may report: the ladder keys plus the
+# "unknown" sentinel. Whether a recorded value is recognized at all is
+# membership here, not ladder rank.
+QUANTIZATION_ENUM: frozenset[str] = frozenset(PRECISION_LADDER) | {"unknown"}
+
+# Official partner hosts that serve closed labs' models: an endpoint on one
+# of these providers counts as first-party for the eligibility carve-out
+# even though it is not the maker itself. Entries are compared after
+# normalize_provider (casefold + strip non-alphanumerics), so the slugs here
+# are display forms -- "aws-bedrock" and "AWS Bedrock" both hit. Extend only
+# with live-data evidence (e.g. an endpoint tag matching <lab>-official).
+FIRST_PARTY_HOSTS = frozenset(
+    {"bedrock", "azure", "vertex", "azure-ai", "google-vertex", "aws-bedrock"}
+)
+
+# Explicit provider-name aliases that normalization alone cannot bridge.
+# Empty initially: add entries only once verified against live data. Keys
+# are canonical maker slugs, values the recorded provider names; alias
+# VALUES are compared normalized, exactly like FIRST_PARTY_HOSTS entries,
+# and a match makes the provider first-party under both criteria.
+FIRST_PARTY_ALIASES: dict[str, str] = {}
+
 
 def warn(msg: str) -> None:
     print(f"warning: {msg}", file=sys.stderr)
@@ -116,6 +157,38 @@ def warn(msg: str) -> None:
 
 def norm_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+# ---------------------------------------------------------------------------
+# Provider normalization + first-party detection
+# ---------------------------------------------------------------------------
+
+
+def normalize_provider(name: str) -> str:
+    """Casefold a provider name and strip ALL non-alphanumeric characters.
+
+    "Z.AI", "z-ai" and "z ai" all normalize to "zai", so a live-recorded
+    maker name matches its author slug regardless of punctuation or case.
+    None or empty input normalizes to "".
+    """
+    return re.sub(r"[^a-z0-9]+", "", (name or "").casefold())
+
+
+def is_first_party(provider_name: str, author: str) -> bool:
+    """True iff the provider is the model's own maker or a partner host.
+
+    Criterion 1: the normalized provider name equals the normalized author
+    slug. Criterion 2: it matches a normalized FIRST_PARTY_HOSTS entry or a
+    normalized FIRST_PARTY_ALIASES value. Everything else is third-party.
+    """
+    provider = normalize_provider(provider_name)
+    if provider == normalize_provider(author):
+        return True
+    if provider in {normalize_provider(host) for host in FIRST_PARTY_HOSTS}:
+        return True
+    return any(
+        provider == normalize_provider(alias) for alias in FIRST_PARTY_ALIASES.values()
+    )
 
 
 # ---------------------------------------------------------------------------
