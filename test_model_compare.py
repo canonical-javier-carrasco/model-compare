@@ -12,6 +12,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from argparse import Namespace
 from datetime import datetime, timezone
@@ -1122,6 +1123,37 @@ def test_load_cache_expired_returns_stale_payload(tmp_path, monkeypatch):
     assert mc.load_cache_expired("k") == {"v": 1}  # ...but the stale load keeps it
 
 
+def test_fetch_model_endpoints_round_trip(monkeypatch):
+    """Task 3 deferred coverage: the per-model cache round trip.
+
+    Cache name flattens the model id ("/" -> "_"); --no-cache bypasses the
+    read (refetches) but still writes; a second call serves from the cache
+    without hitting the network again.
+    """
+    payload = {"data": [_endpoint()]}
+    calls = []
+
+    def fake_fetch_json(url, headers=None, timeout=30, retries=1):
+        calls.append(url)
+        return payload
+
+    monkeypatch.setattr(mc, "fetch_json", fake_fetch_json)
+    args = make_args(no_cache=False, cache_ttl=3600)
+    eps = mc.fetch_model_endpoints("z-ai/glm", args)
+    assert calls == [mc.OPENROUTER_ENDPOINTS_URL.format(id="z-ai/glm")]
+    assert eps == mc.parse_endpoints(payload)
+    # Saved under the flattened cache name ("/" -> "_", hyphen kept).
+    assert Path(mc.cache_path("endpoints:z-ai_glm")).exists()
+    # Second call: served from cache, no refetch.
+    assert mc.fetch_model_endpoints("z-ai/glm", args) == eps
+    assert len(calls) == 1
+    # --no-cache bypasses the cache READ but the write still happens.
+    assert mc.fetch_model_endpoints("z-ai/glm", make_args(no_cache=True)) == eps
+    assert len(calls) == 2
+    assert mc.fetch_model_endpoints("z-ai/glm", args) == eps
+    assert len(calls) == 2  # the write refreshed the cache: still no refetch
+
+
 # ---------------------------------------------------------------------------
 # Provider-aware eval: default precision, eligibility, baseline selection
 # ---------------------------------------------------------------------------
@@ -1687,6 +1719,263 @@ def test_flag_list_mismatch_raises():
         mc.NON_ELIGIBLE_UNIVERSE(eps, [True])
     with pytest.raises(ValueError):
         mc.build_steering("m", eps, [True], "fp8", make_args())
+
+
+# ---------------------------------------------------------------------------
+# Provider-aware eval: CLI wiring (endpoint stage, drops, --json keys)
+# ---------------------------------------------------------------------------
+
+
+def _endpoint_stage_eps():
+    """A maker fp8 endpoint plus a cheaper sub-default fp4 partner.
+
+    The fp8 endpoint is the only eligible one and becomes the baseline; the
+    fp4 endpoint feeds the annotations universe. Prices are chosen so the
+    baseline blended price (0.25/M) is clearly below the models-API blended
+    price a candidate carries before the stage runs (1.25/M with make_model's
+    default pricing).
+    """
+    return [
+        _endpoint(
+            provider_name="Z.AI",
+            tag="z-ai/fp8",
+            quantization="fp8",
+            pricing={"prompt": "0.0000002", "completion": "0.0000004"},
+        ),
+        _endpoint(
+            provider_name="DeepInfra",
+            tag="deepinfra/fp4",
+            quantization="fp4",
+            pricing={"prompt": "0.0000001", "completion": "0.0000002"},
+        ),
+    ]
+
+
+def _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id, fail_ids=()):
+    """Stub every fetcher so mc.run() exercises the endpoint stage offline."""
+    zdr = {m["id"] for m in models}
+    monkeypatch.setattr(mc, "fetch_openrouter_models", lambda a: (models, False))
+    monkeypatch.setattr(mc, "fetch_openrouter_frontend", lambda a: ({}, zdr, {}, set()))
+    monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False))
+    calls = []
+
+    def fake_fetch(model_id, args):
+        calls.append(model_id)
+        if model_id in fail_ids:
+            raise RuntimeError("endpoint fetch failed")
+        endpoints = endpoints_by_id[model_id]
+        # Mirror fetch_model_endpoints: a successful fetch writes the cache
+        # the stale-annotations rule reads later.
+        mc.save_cache(f"endpoints:{model_id.replace('/', '_')}", endpoints)
+        return endpoints
+
+    monkeypatch.setattr(mc, "fetch_model_endpoints", fake_fetch)
+    return calls
+
+
+def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
+    models = [
+        make_model(id="z-ai/glm", name="Z.AI: GLM"),
+        make_model(id="acme/plain", name="Acme: Plain"),
+    ]
+    endpoints_by_id = {
+        "z-ai/glm": _endpoint_stage_eps(),
+        # Third-party unknown-quantization endpoint: nothing eligible, no
+        # baseline -> fail-closed drop.
+        "acme/plain": [
+            _endpoint(provider_name="Relace", tag="relace/x", quantization="unknown")
+        ],
+    }
+    _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id)
+    args = make_args(min_context=0, catalog=True)
+    assert mc.run(args, models, False) == 0
+    doc = json.loads(capsys.readouterr().out)
+    pool = doc["pool"]
+    assert pool["listed"] == len(models)
+    assert pool["candidates"] == 1
+    assert pool["listed"] == pool["candidates"] + sum(pool["dropped"].values())
+    assert pool["dropped"]["no_baseline_eligible_endpoint"] == 1
+    (entry,) = doc["filtered"]
+    assert entry["id"] == "acme/plain"
+    assert entry["name"] == "Acme: Plain"
+    assert entry["reasons"] == ["no_baseline_eligible_endpoint"]
+    # The fetch succeeded, so the cache written moments ago backs the
+    # display annotations, marked stale (the model is not ranked on them).
+    assert entry["annotations"]["stale"] is True
+    bsd.validate_catalog(doc)
+
+
+def test_candidate_pricing_replaced_by_baseline(monkeypatch):
+    args = make_args(min_context=0)
+    eps = _endpoint_stage_eps()
+    monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: eps)
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    candidates, dropped = mc.build_candidates(models, args, {}, {"z-ai/glm"}, [])
+    assert dropped == {}
+    # Before the stage the candidate carries the models-API prices.
+    assert candidates[0]["blended"] == pytest.approx(1.25)
+    candidates, extra = mc.apply_endpoint_pricing(candidates, args, [])
+    assert extra == {}
+    cand = candidates[0]
+    # Catalog pricing block == baseline endpoint prices, not models-API prices.
+    assert cand["price_in"] == pytest.approx(0.2)
+    assert cand["price_out"] == pytest.approx(0.4)
+    assert cand["blended"] == pytest.approx(0.75 * 0.2 + 0.25 * 0.4)
+    assert cand["base_price_in"] == pytest.approx(0.2)
+    assert cand["base_price_out"] == pytest.approx(0.4)
+    assert cand["tier_prompt_tokens"] is None
+    assert cand["tiers"] == []
+    assert cand["schedule"] is None
+    assert cand["max_discount"] is None
+    assert cand["tier_note"] is None
+    assert cand["sched_note"] is None
+    assert cand["sched_detail"] is None
+    # The advertised models-API scalars are retained for comparison only.
+    assert cand["advertised_pricing"] == {
+        "input_per_1m": 1.0,
+        "output_per_1m": 2.0,
+        "blended_per_1m": 1.25,
+        "source": "models-api",
+    }
+    assert cand["default_precision"] == "fp8"
+    assert cand["endpoints"] == eps
+    assert cand["annotations"] == {
+        "price_spread": pytest.approx(0.5),
+        "cheapest_quantized": {
+            "provider": "DeepInfra",
+            "quantization": "fp4",
+            "price": pytest.approx(0.75 * 0.0000001 + 0.25 * 0.0000002),
+        },
+        "risk_flag": True,
+        "baseline_context_below_catalog": True,
+    }
+    assert cand["steering"] == {
+        "model": "z-ai/glm",
+        "provider": {
+            "order": ["z-ai/fp8"],
+            "ignore": ["deepinfra/fp4"],
+            "quantizations": ["fp8"],
+            "allow_fallbacks": True,
+        },
+    }
+
+
+def test_fetch_failure_drops_model_with_stale_annotations(monkeypatch):
+    models = [
+        make_model(id="z-ai/glm", name="Z.AI: GLM"),
+        make_model(id="acme/nocache", name="Acme: No Cache"),
+    ]
+    args = make_args(min_context=0)
+
+    def boom(model_id, a):
+        raise RuntimeError("endpoint fetch failed")
+
+    monkeypatch.setattr(mc, "fetch_model_endpoints", boom)
+    # Only z-ai/glm has an (expired) cached endpoint list to fall back to.
+    stale_eps = [_endpoint(provider_name="Z.AI", tag="z-ai/fp8", quantization="fp8")]
+    mc.save_cache("endpoints:z-ai_glm", stale_eps)
+    path = Path(mc.cache_path("endpoints:z-ai_glm"))
+    blob = json.loads(path.read_text())
+    blob["fetched_at"] = time.time() - 999999
+    path.write_text(json.dumps(blob))
+
+    filtered = []
+    candidates, dropped = mc.build_candidates(
+        models, args, {}, set(m["id"] for m in models), filtered
+    )
+    assert dropped == {}
+    candidates, extra = mc.apply_endpoint_pricing(candidates, args, filtered)
+    assert candidates == []
+    assert dropped == {}
+    assert extra == {"endpoint_fetch_failed": 2}
+    by_id = {entry["id"]: entry for entry in filtered}
+    glm = by_id["z-ai/glm"]
+    assert glm["reasons"] == ["endpoint_fetch_failed"]
+    assert glm["name"] == "Z.AI: GLM"
+    assert glm["annotations"]["stale"] is True
+    # Built from the stale cache: the single eligible endpoint yields no
+    # non-eligible universe, so risk_flag is False.
+    assert glm["annotations"]["risk_flag"] is False
+    nocache = by_id["acme/nocache"]
+    assert nocache["reasons"] == ["endpoint_fetch_failed"]
+    assert "annotations" not in nocache
+
+
+def test_json_rows_carry_new_additive_keys(monkeypatch, capsys):
+    args = make_args(min_context=0)
+    monkeypatch.setattr(
+        mc, "fetch_model_endpoints", lambda mid, a: _endpoint_stage_eps()
+    )
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    candidates, _ = mc.build_candidates(models, args, {}, {"z-ai/glm"}, [])
+    candidates, _ = mc.apply_endpoint_pricing(candidates, args, [])
+    mc.compute_scores(candidates, args, {})
+    mc.print_json(candidates)
+    (row,) = json.loads(capsys.readouterr().out)
+    # The missing-key check build_site_data does still passes, and the four
+    # new keys close the row in the exact order Task 9's ROW_KEYS extension
+    # pins.
+    assert all(key in row for key in bsd.ROW_KEYS)
+    assert list(row)[-4:] == [
+        "default_precision",
+        "risk_flag",
+        "price_spread",
+        "session_cost_usd",
+    ]
+    assert row["default_precision"] == "fp8"
+    assert row["risk_flag"] is True
+    assert row["price_spread"] == pytest.approx(0.5)
+    assert row["session_cost_usd"] is None  # Task 7 fills it
+
+
+def test_json_rows_tolerate_pre_endpoint_candidates(capsys):
+    # Candidates that never went through the endpoint stage (the historical
+    # shape) still serialize: the new keys degrade to null.
+    mc.print_json(_scored_candidates())
+    for row in json.loads(capsys.readouterr().out):
+        assert row["default_precision"] is None
+        assert row["risk_flag"] is None
+        assert row["price_spread"] is None
+        assert row["session_cost_usd"] is None
+
+
+def test_endpoint_stage_applies_results_in_candidate_order(monkeypatch):
+    # Results must land per candidate id in the original candidates order,
+    # never in completion order. The gate makes "a/slow" finish only after
+    # "a/fast" has returned, so completion order is the reverse of input
+    # order -- a completion-order implementation would swap the survivors.
+    models = [make_model(id="a/slow"), make_model(id="a/fast")]
+    args = make_args(min_context=0)
+    gate = threading.Event()
+
+    def fake_fetch(model_id, a):
+        if model_id == "a/slow":
+            assert gate.wait(timeout=5)
+        else:
+            gate.set()
+        return [_endpoint(provider_name="A", tag="a/fp8", quantization="fp8")]
+
+    monkeypatch.setattr(mc, "fetch_model_endpoints", fake_fetch)
+    candidates, dropped = mc.build_candidates(
+        models, args, {}, {"a/slow", "a/fast"}, []
+    )
+    assert dropped == {}
+    survivors, extra = mc.apply_endpoint_pricing(candidates, args, [])
+    assert extra == {}
+    assert [c["id"] for c in survivors] == ["a/slow", "a/fast"]
+
+
+def test_catalog_drop_reasons_carry_endpoint_stage_drops():
+    # The registry stays load-bearing: pool.dropped zero-fills from it, and
+    # the publish drop-rate gate reads the endpoint-derived reasons.
+    for reason in ("no_baseline_eligible_endpoint", "endpoint_fetch_failed"):
+        assert reason in mc.CATALOG_DROP_REASONS
+
+
+def test_parse_args_openrouter_api_key_flag():
+    args = mc.parse_args(["--openrouter-api-key", "sk-or"])
+    assert args.openrouter_api_key == "sk-or"
+    assert mc.parse_args([]).openrouter_api_key is None
 
 
 # ---------------------------------------------------------------------------
@@ -2551,6 +2840,9 @@ def test_best_prints_provider_qualified_id(monkeypatch, capsys):
         mc, "fetch_openrouter_frontend", lambda a: ({}, {"acme/model-a"}, {}, set())
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False))
+    # The endpoint stage fetches per candidate: one eligible endpoint keeps
+    # the model in the pool (offline stub, like every other fetcher here).
+    monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
     argv = ["--best", "--no-cache", "--min-context", "0", "--no-require-tools"]
     assert mc.main(argv) == 0
     assert capsys.readouterr().out.strip() == "openrouter/acme/model-a"
@@ -2577,6 +2869,9 @@ def test_table_mode_prints_composed_quality_note(monkeypatch, capsys):
         ),
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False))
+    # The endpoint stage fetches per candidate: one eligible endpoint keeps
+    # both models in the pool (offline stub, like every other fetcher here).
+    monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
     argv = ["--top", "1", "--no-cache", "--min-context", "0", "--no-require-tools"]
     assert mc.main(argv) == 0
     captured = capsys.readouterr()
@@ -3975,6 +4270,9 @@ def test_catalog_no_zdr_marks_skipped(monkeypatch, capsys):
         mc, "fetch_openrouter_frontend", lambda args: ({}, set(), {}, set())
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda args: ([], None, False))
+    # The endpoint stage fetches per candidate: one eligible endpoint keeps
+    # the models in the pool (offline stub, like every other fetcher here).
+    monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
     models = [
         make_model(id="acme/model-a", created=1_700_000_000),
         make_model(

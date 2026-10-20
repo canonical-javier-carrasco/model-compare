@@ -54,6 +54,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -90,7 +91,11 @@ CATALOG_SCHEMA_VERSION = 2
 
 # The drop-reason keys build_candidates counts, verbatim -- keep in sync with
 # its drop() call sites. pool.dropped lists all of them zero-filled so the
-# contract is self-describing.
+# contract is self-describing. The last two come from the endpoint stage
+# (apply_endpoint_pricing's drop sites), not build_candidates: snake_case
+# while the older reasons are human phrases. The mixed naming convention is
+# a deliberate, documented extension -- machine-readable reasons for the
+# endpoint-stage drops the publish drop-rate gate keys on.
 CATALOG_DROP_REASONS = (
     "malformed id",
     "context",
@@ -104,6 +109,8 @@ CATALOG_DROP_REASONS = (
     "tool calling",
     "expired",
     "age",
+    "no_baseline_eligible_endpoint",
+    "endpoint_fetch_failed",
 )
 
 PAREN_RE = re.compile(r"\([^)]*\)")
@@ -833,6 +840,168 @@ def build_steering(
         provider["quantizations"] = sorted(quants)
     provider["allow_fallbacks"] = True
     return {"model": model_id, "provider": provider}
+
+
+def _stale_filtered_annotations(model_id, catalog_context, args):
+    """Annotations for a dropped model's filtered entry, or None.
+
+    Built from the model's last cached endpoint list (load_cache_expired --
+    TTL ignored), never from a fresh fetch: the model is out of the ranking,
+    so the block is marked "stale": True for display in the filtered section
+    only (design section 4.9). Same builders as the live stage: eligibility
+    and baseline are re-derived from the cached list, so the shape matches a
+    ranked candidate's annotations. A model whose cache holds no endpoint
+    list at all yields None (the entry carries the drop reason alone).
+    """
+    cached = load_cache_expired(f"endpoints:{model_id.replace('/', '_')}")
+    if not isinstance(cached, list):
+        return None
+    author = model_id.partition("/")[0]
+    try:
+        default_precision = derive_default_precision(cached, author)
+        eligible_flags = [
+            baseline_eligible(endpoint, default_precision, author, args)
+            for endpoint in cached
+        ]
+        baseline = pick_baseline(cached, eligible_flags, args)
+        annotations = build_annotations(
+            cached, eligible_flags, baseline, catalog_context, args
+        )
+    except Exception:
+        # Display-only block for an already-dropped model: never fail the run.
+        return None
+    annotations["stale"] = True
+    return annotations
+
+
+def _endpoint_stage_drop(extra_dropped, filtered, cand, reason, args):
+    """Count one endpoint-stage drop and append its filtered entry.
+
+    Same validated entry shape as build_candidates' drop() plus the optional
+    stale annotations block (absent cache -> reasons only).
+    """
+    extra_dropped[reason] = extra_dropped.get(reason, 0) + 1
+    entry = {"id": cand["id"], "name": cand["name"] or cand["id"], "reasons": [reason]}
+    annotations = _stale_filtered_annotations(cand["id"], cand.get("context"), args)
+    if annotations is not None:
+        entry["annotations"] = annotations
+    filtered.append(entry)
+
+
+def apply_endpoint_pricing(candidates, args, filtered):
+    """Reprice every candidate at its baseline endpoint (design section 4.9).
+
+    The CLI stage between build_candidates and resolve_quality. Endpoint
+    fetches run concurrently (ThreadPoolExecutor, 8 workers) through
+    fetch_model_endpoints' per-model cache, but the results are applied PER
+    CANDIDATE ID in the original candidates order -- never in completion
+    order -- so the stage is deterministic.
+
+    Per candidate: endpoints = fetch. On fetch failure after fetch_json's
+    internal retries the model is dropped "endpoint_fetch_failed" and removed
+    from the returned list. With endpoints, default_precision is derived,
+    every endpoint scored for baseline eligibility and the baseline picked;
+    no usable baseline drops the model "no_baseline_eligible_endpoint"
+    (the stale-annotations filtered-entry rule covers both drop reasons).
+    Otherwise the candidate is mutated in place: the pricing block
+    (price_in/price_out/blended/base_*/tier/schedule/notes) is replaced with
+    the baseline endpoint's effective_pricing outputs scaled per-1M exactly
+    like build_candidates, and the additive keys "endpoints", "default_precision",
+    "annotations" (catalog context = the candidate's existing "context"),
+    "advertised_pricing" (the models-API scalars the candidate carried before
+    the mutation, source-tagged) and "steering" are attached.
+
+    A baseline whose prices are missing/non-finite counts as unusable
+    (pick_baseline's blended-price skip is authoritative for the top-level
+    effective prices; the same finiteness bar applies to the base prices the
+    mutation would publish). Returns (surviving candidates in the original
+    order, dropped counts for the two new reasons).
+    """
+    extra_dropped: dict[str, int] = {}
+    if not candidates:
+        return candidates, extra_dropped
+    endpoints_by_id: dict[str, list] = {}
+    failed_ids: set[str] = set()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {}
+        for cand in candidates:
+            # Duplicate ids fetch once and share the result.
+            futures.setdefault(
+                cand["id"], pool.submit(fetch_model_endpoints, cand["id"], args)
+            )
+        for cand_id, future in futures.items():
+            try:
+                endpoints_by_id[cand_id] = future.result()
+            except Exception:
+                # fetch_json already retried 3 times; the caller owns the
+                # fail-closed policy.
+                failed_ids.add(cand_id)
+    survivors = []
+    for cand in candidates:
+        cand_id = cand["id"]
+        if cand_id in failed_ids:
+            _endpoint_stage_drop(
+                extra_dropped, filtered, cand, "endpoint_fetch_failed", args
+            )
+            continue
+        endpoints = endpoints_by_id[cand_id]
+        author = cand_id.partition("/")[0]
+        default_precision = derive_default_precision(endpoints, author)
+        eligible_flags = [
+            baseline_eligible(endpoint, default_precision, author, args)
+            for endpoint in endpoints
+        ]
+        baseline = pick_baseline(endpoints, eligible_flags, args)
+        eff = (
+            effective_pricing(
+                baseline.get("pricing"), args.min_context, args.input_share
+            )
+            if baseline is not None
+            else None
+        )
+        if baseline is None or not all(
+            isinstance(eff[key], float) and math.isfinite(eff[key])
+            for key in ("price_in", "price_out", "base_price_in", "base_price_out")
+        ):
+            _endpoint_stage_drop(
+                extra_dropped, filtered, cand, "no_baseline_eligible_endpoint", args
+            )
+            continue
+        # The advertised models-API scalars, captured before the mutation.
+        advertised_pricing = {
+            "input_per_1m": cand["price_in"],
+            "output_per_1m": cand["price_out"],
+            "blended_per_1m": cand["blended"],
+            "source": "models-api",
+        }
+        # Replace the pricing block with the baseline endpoint's outputs,
+        # scaled per-1M exactly like build_candidates.
+        cand["price_in"] = eff["price_in"] * 1_000_000.0
+        cand["price_out"] = eff["price_out"] * 1_000_000.0
+        cand["blended"] = (
+            args.input_share * cand["price_in"]
+            + (1.0 - args.input_share) * cand["price_out"]
+        )
+        cand["base_price_in"] = eff["base_price_in"] * 1_000_000.0
+        cand["base_price_out"] = eff["base_price_out"] * 1_000_000.0
+        cand["tier_prompt_tokens"] = eff["tier_prompt_tokens"]
+        cand["tiers"] = eff["tiers"]
+        cand["schedule"] = eff["schedule"]
+        cand["max_discount"] = eff["max_discount"]
+        cand["tier_note"] = fmt_tier_note(eff["tier_prompt_tokens"])
+        cand["sched_note"] = fmt_sched_note(eff["max_discount"])
+        cand["sched_detail"] = fmt_sched_detail(eff["schedule"], eff["peak_blended"])
+        cand["endpoints"] = endpoints
+        cand["default_precision"] = default_precision
+        cand["annotations"] = build_annotations(
+            endpoints, eligible_flags, baseline, cand["context"], args
+        )
+        cand["advertised_pricing"] = advertised_pricing
+        cand["steering"] = build_steering(
+            cand_id, endpoints, eligible_flags, default_precision, args
+        )
+        survivors.append(cand)
+    return survivors, extra_dropped
 
 
 # ---------------------------------------------------------------------------
@@ -2129,6 +2298,15 @@ def print_json(top):
             "age_days": round(cand["age_days"], 1)
             if cand["age_days"] is not None
             else None,
+            # Additive endpoint-stage keys (Task 9's ROW_KEYS extension
+            # pins this exact key set and order). Risk/spread come from the
+            # annotations block; session_cost_usd stays None until Task 7
+            # fills it. Candidates that never went through the endpoint
+            # stage (historical test paths) degrade to null.
+            "default_precision": cand.get("default_precision"),
+            "risk_flag": (cand.get("annotations") or {}).get("risk_flag"),
+            "price_spread": (cand.get("annotations") or {}).get("price_spread"),
+            "session_cost_usd": None,
         }
         for cand in top
     ]
@@ -2399,6 +2577,11 @@ def parse_args(argv=None):
         help="Artificial Analysis API key (or set AA_API_KEY; free at artificialanalysis.ai)",
     )
     parser.add_argument(
+        "--openrouter-api-key",
+        default=None,
+        help="OpenRouter API key (or set OPENROUTER_API_KEY; free at openrouter.ai/keys)",
+    )
+    parser.add_argument(
         "--no-require-tools",
         action="store_true",
         help="do not require tool-calling support (coding agents want it)",
@@ -2473,6 +2656,10 @@ def run(args, models, or_cached) -> int:
 
     filtered = []
     candidates, dropped = build_candidates(models, args, discounts, zdr_ids, filtered)
+    # The provider-aware stage: every surviving candidate is repriced at its
+    # baseline endpoint (or dropped fail-closed) before any scoring runs.
+    candidates, extra_dropped = apply_endpoint_pricing(candidates, args, filtered)
+    dropped.update(extra_dropped)
     if not candidates:
         warn(
             f"no models satisfy the filters (min-context={args.min_context}, "
