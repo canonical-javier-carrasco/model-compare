@@ -411,6 +411,173 @@ def endpoint_schedule_ok(endpoint, args) -> bool:
     return not result["schedule_error"]
 
 
+# Schedule gate for args-less callers: effective_pricing's schedule_error
+# depends only on the SHAPE of pricing.overrides (malformed windows, bad
+# utc_days, ...), never on min_context/input_share -- those only affect the
+# resolved prices. derive_default_precision has no args parameter (pinned
+# interface), so it gates through this fixed stand-in; any args would give
+# the same schedule_error verdict.
+_SCHEDULE_GATE_ARGS = argparse.Namespace(min_context=0, input_share=0.75)
+
+
+def _baseline_universe(endpoints: list[dict], args=None) -> list[dict]:
+    """The shared derivation universe (design section 4.1).
+
+    Live (status == 0), not a variant endpoint (:free/:batch marker or
+    zero-priced), and passing the schedule gate. Schedule-broken endpoints
+    must not pin the default that governs healthy endpoints, same rationale
+    as the variant exclusion. args defaults to the structural stand-in
+    (see _SCHEDULE_GATE_ARGS); callers with real args pass them.
+    """
+    if args is None:
+        args = _SCHEDULE_GATE_ARGS
+    return [
+        endpoint
+        for endpoint in endpoints
+        if endpoint.get("status") == 0
+        and not is_variant_endpoint(endpoint)
+        and endpoint_schedule_ok(endpoint, args)
+    ]
+
+
+def derive_default_precision(endpoints: list[dict], author: str) -> str | None:
+    """Derive a model's default precision from its endpoint list (section 4.1).
+
+    Universe: live non-variant schedule-passing endpoints (_baseline_universe).
+    Primary rule: the highest-ranked KNOWN quantization among the maker's
+    endpoints -- matched by normalized author-slug equality only, so partner
+    hosts never pin the maker's default (section 4.2 criterion 2 does not
+    apply here). Fallback: when the maker has no known quantization, the
+    highest-ranked known quantization across the FULL universe (partners
+    included -- best-available). None when no endpoint in the universe has a
+    known quantization (the all-unknown closed-model case): eligibility then
+    relies solely on the first-party carve-out.
+
+    Known means a PRECISION_LADDER key: "unknown" and unparseable/absent
+    values never enter the ladder. An endpoint whose provider_name is
+    absent/empty (or normalizes to empty) is skipped for maker matching
+    (never first-party -- fail-closed), but still feeds the fallback
+    universe.
+    """
+    universe = _baseline_universe(endpoints, _SCHEDULE_GATE_ARGS)
+    maker = normalize_provider(author)
+    maker_best = None
+    fallback_best = None
+    for endpoint in universe:
+        quantization = endpoint.get("quantization")
+        if not isinstance(quantization, str) or quantization not in PRECISION_LADDER:
+            continue  # "unknown", null, unrecognized: no rank, no pinning
+        rank = PRECISION_LADDER[quantization]
+        if fallback_best is None or rank > fallback_best[0]:
+            fallback_best = (rank, quantization)
+        # Maker matching only: a provider_name that normalizes to nothing
+        # must never match an (equally empty) author slug.
+        provider_slug = (
+            normalize_provider(endpoint.get("provider_name"))
+            if isinstance(endpoint.get("provider_name"), str)
+            else ""
+        )
+        if (
+            provider_slug
+            and provider_slug == maker
+            and (maker_best is None or rank > maker_best[0])
+        ):
+            maker_best = (rank, quantization)
+    return (maker_best or fallback_best or (None, None))[1]
+
+
+def baseline_eligible(endpoint, default_precision, author, args) -> bool:
+    """Baseline-eligibility rule (design section 4.3, fail-closed).
+
+    True iff the endpoint is live (status == 0), not a variant, passes the
+    schedule gate, and then either:
+
+    * its quantization is a known ladder label with rank >=
+      rank(default_precision) -- provider-blind (default_routing considers
+      every endpoint OpenRouter may send traffic to), or
+    * its quantization is "unknown" or null AND the endpoint is first-party
+      (the D3 carve-out: the maker or a partner host).
+
+    When default_precision is None (all-unknown model) the rank comparison is
+    meaningless -- only the carve-out applies. A provider_name that is
+    absent/empty (or normalizes to empty) is never first-party, so such an
+    endpoint can only qualify through the rank branch. An unrecognized
+    quantization string (neither a ladder label nor "unknown"/null) is a
+    schema anomaly: no rank comparison and no carve-out -- fail-closed
+    (fleet-wide new-label drift is what the publish drop-rate gate exists
+    to catch).
+    """
+    if (
+        endpoint.get("status") != 0
+        or is_variant_endpoint(endpoint)
+        or not endpoint_schedule_ok(endpoint, args)
+    ):
+        return False
+    quantization = endpoint.get("quantization")
+    if isinstance(quantization, str) and quantization in PRECISION_LADDER:
+        # Known quantization: the rank branch, provider-blind.
+        if default_precision is None:
+            return False
+        return PRECISION_LADDER[quantization] >= PRECISION_LADDER[default_precision]
+    # Unverifiable: the carve-out applies to "unknown" and null only --
+    # an unrecognized string fails closed. A provider_name that normalizes
+    # to nothing is never first-party (fail-closed; the literal
+    # is_first_party("", "") iff is guarded out here).
+    provider_name = endpoint.get("provider_name")
+    provider_slug = (
+        normalize_provider(provider_name) if isinstance(provider_name, str) else ""
+    )
+    return (
+        (quantization is None or quantization == "unknown")
+        and bool(provider_slug)
+        and is_first_party(provider_name, author)
+    )
+
+
+def pick_baseline(
+    endpoints: list[dict], eligible_flags: list[bool], args
+) -> dict | None:
+    """Pick the baseline endpoint among the eligible ones (design section 4.5).
+
+    Cheapest blended per-token price wins, computed from effective_pricing
+    with the args' min_context and input_share (the shared --input-share
+    convention). Ties broken by (normalized provider name, tag), then --
+    still tied -- first in list order (deterministic; Python's sort is
+    stable and the endpoints list order is the API's). Returns None when no
+    eligible endpoint has a usable price (the caller owns the drop).
+    """
+    candidates = []
+    for endpoint, eligible in zip(endpoints, eligible_flags):
+        if not eligible:
+            continue
+        eff = effective_pricing(
+            endpoint.get("pricing"), args.min_context, args.input_share
+        )
+        price_in, price_out = eff["price_in"], eff["price_out"]
+        if (
+            price_in is None
+            or price_out is None
+            or not math.isfinite(price_in)
+            or not math.isfinite(price_out)
+        ):
+            continue  # unpriceable: no executable blended price
+        blended = args.input_share * price_in + (1 - args.input_share) * price_out
+        provider_name = endpoint.get("provider_name")
+        candidates.append(
+            (
+                blended,
+                normalize_provider(provider_name)
+                if isinstance(provider_name, str)
+                else "",
+                endpoint.get("tag") or "",
+                endpoint,
+            )
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: candidate[:3])[3]
+
+
 # ---------------------------------------------------------------------------
 # OpenRouter catalog
 # ---------------------------------------------------------------------------

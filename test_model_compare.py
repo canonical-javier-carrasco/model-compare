@@ -1123,6 +1123,211 @@ def test_load_cache_expired_returns_stale_payload(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Provider-aware eval: default precision, eligibility, baseline selection
+# ---------------------------------------------------------------------------
+
+
+def _schedule_broken(**fields):
+    """Endpoint whose pricing.overrides fails the schedule gate.
+
+    Same malformed window as test_endpoint_schedule_gate_uses_full_schedule_error:
+    "25:99" is no valid HHMM, so effective_pricing reports schedule_error.
+    """
+    fields.setdefault(
+        "pricing",
+        {
+            "prompt": "0.00000015",
+            "completion": "0.0000005",
+            "overrides": [
+                {"utc_days": ["monday"], "utc_start": "25:99", "utc_end": "01:00"}
+            ],
+        },
+    )
+    return _endpoint(**fields)
+
+
+def test_maker_quantization_pins_default():
+    eps = [
+        _endpoint(provider_name="Z.AI", quantization="fp8"),
+        _endpoint(provider_name="DeepInfra", quantization="fp4"),
+    ]
+    assert mc.derive_default_precision(eps, "z-ai") == "fp8"
+
+
+def test_variant_and_schedule_broken_never_pin_default():
+    eps = [
+        _endpoint(provider_name="Z.AI", quantization="fp8", tag="z-ai:free"),
+        _schedule_broken(provider_name="Z.AI", quantization="fp8"),
+        _endpoint(provider_name="DeepInfra", quantization="fp4"),
+    ]
+    assert mc.derive_default_precision(eps, "z-ai") == "fp4"  # best-available fallback
+
+
+def test_all_unknown_model_default_is_null():
+    eps = [_endpoint(provider_name="Anthropic", quantization="unknown")]
+    assert mc.derive_default_precision(eps, "anthropic") is None
+
+
+def test_partner_never_pins_maker_default():
+    # Fallback semantics (design section 4.1): a partner's known quantization
+    # IS the best-available fallback when the maker itself has none -- partners
+    # never pin via the MAKER rule, but they do feed the fallback universe.
+    eps = [_endpoint(provider_name="AWS Bedrock", quantization="fp8")]
+    assert mc.derive_default_precision(eps, "anthropic") == "fp8"
+
+
+def test_maker_own_endpoint_wins_over_better_partner():
+    # The other half of "partner never pins": the maker's OWN endpoint wins
+    # the primary rule even when a partner offers a better-ranked one.
+    eps = [
+        _endpoint(provider_name="Z.AI", quantization="int8"),
+        _endpoint(provider_name="DeepInfra", quantization="fp8"),
+    ]
+    assert mc.derive_default_precision(eps, "z-ai") == "int8"
+
+
+def test_empty_provider_name_never_first_party():
+    args = make_args()
+    # is_first_party("", "") holds literally (Task 2 deferred note), but an
+    # endpoint without a provider name must never be the maker nor count as
+    # first-party -- fail-closed even when the author string is empty too.
+    # A name that only normalizes to empty (" ") is guarded the same way.
+    anon = _endpoint(provider_name=None, quantization="unknown")
+    blank = _endpoint(provider_name=" ", quantization="unknown")
+    assert not mc.baseline_eligible(anon, None, "", args)
+    assert not mc.baseline_eligible(blank, None, "", args)
+    # Matching no maker, it cannot pin one: an unknown quantization alone
+    # leaves the default null.
+    assert mc.derive_default_precision([anon], "") is None
+    assert mc.derive_default_precision([blank], "") is None
+
+
+def test_first_party_unknown_eligible_third_party_not():
+    args = make_args()
+    d = None
+    assert mc.baseline_eligible(
+        _endpoint(provider_name="Anthropic", quantization="unknown"),
+        d,
+        "anthropic",
+        args,
+    )
+    assert not mc.baseline_eligible(
+        _endpoint(provider_name="Relace", quantization="unknown"), d, "anthropic", args
+    )
+    # With a null default the rank branch is meaningless: only the carve-out
+    # applies, so even a known third-party quantization is not eligible.
+    assert not mc.baseline_eligible(
+        _endpoint(provider_name="DeepInfra", quantization="fp8"), d, "anthropic", args
+    )
+
+
+def test_variant_never_baseline_eligible():
+    args = make_args()
+    assert not mc.baseline_eligible(_endpoint(tag="z-ai:free"), "fp8", "z-ai", args)
+    assert not mc.baseline_eligible(
+        _endpoint(pricing={"prompt": "0", "completion": "0"}), "fp8", "z-ai", args
+    )
+    assert not mc.baseline_eligible(_endpoint(status=1), "fp8", "z-ai", args)
+    assert not mc.baseline_eligible(_schedule_broken(), "fp8", "z-ai", args)
+
+
+def test_sub_default_quantization_not_eligible():
+    args = make_args()
+    # A known quantization at/above the default is eligible WITHOUT
+    # first-party (the rank branch is provider-blind); below default is not.
+    assert mc.baseline_eligible(
+        _endpoint(provider_name="DeepInfra", quantization="fp8"),
+        "fp8",
+        "anthropic",
+        args,
+    )
+    assert not mc.baseline_eligible(
+        _endpoint(provider_name="DeepInfra", quantization="int8"),
+        "fp8",
+        "anthropic",
+        args,
+    )
+    # A better-than-default endpoint clears the bar trivially.
+    assert mc.baseline_eligible(
+        _endpoint(provider_name="DeepInfra", quantization="fp8"),
+        "int8",
+        "anthropic",
+        args,
+    )
+
+
+def test_unrecognized_quantization_fails_closed():
+    args = make_args()
+    # Neither a ladder label nor the "unknown" sentinel: no rank comparison
+    # and no carve-out -- fail closed even for the maker itself.
+    assert not mc.baseline_eligible(
+        _endpoint(quantization="int16"), "fp8", "z-ai", args
+    )
+    assert (
+        mc.derive_default_precision([_endpoint(quantization="int16")], "z-ai") is None
+    )
+
+
+def test_baseline_cheapest_with_pinned_tiebreak():
+    args = make_args()
+
+    def eligible(eps):
+        return [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps]
+
+    # Cheapest blended price wins regardless of name order.
+    eps = [
+        _endpoint(
+            provider_name="Alpha LLC",
+            tag="alpha/fp8",
+            pricing={"prompt": "0.0000002", "completion": "0.0000004"},
+        ),
+        _endpoint(
+            provider_name="Zed Inc",
+            tag="zed/fp8",
+            pricing={"prompt": "0.0000001", "completion": "0.0000002"},
+        ),
+    ]
+    assert mc.pick_baseline(eps, eligible(eps), args)["tag"] == "zed/fp8"
+
+    # Equal price: the normalized provider name breaks the tie.
+    eps = [
+        _endpoint(provider_name="Zed Inc", tag="zed/fp8"),
+        _endpoint(provider_name="Alpha LLC", tag="alpha/fp8"),
+    ]
+    assert mc.pick_baseline(eps, eligible(eps), args)["tag"] == "alpha/fp8"
+
+    # Equal price and provider: the tag breaks the tie.
+    eps = [
+        _endpoint(provider_name="Alpha LLC", tag="alpha/zeta"),
+        _endpoint(provider_name="Alpha LLC", tag="alpha/alpha"),
+    ]
+    assert mc.pick_baseline(eps, eligible(eps), args)["tag"] == "alpha/alpha"
+
+    # Fully equal keys: first in list order wins (deterministic final tie).
+    eps = [
+        _endpoint(provider_name="Z.AI", tag="same"),
+        _endpoint(provider_name="z ai", tag="same"),
+    ]
+    assert mc.pick_baseline(eps, eligible(eps), args)["provider_name"] == "Z.AI"
+
+    # A non-eligible endpoint never wins, however cheap ("cheap:free" is a
+    # :free variant marker, so baseline_eligible rejects it).
+    eps = [
+        _endpoint(tag="cheap:free"),
+        _endpoint(provider_name="Zed Inc", tag="zed/fp8"),
+    ]
+    flags = eligible(eps)
+    assert flags == [False, True]
+    assert mc.pick_baseline(eps, flags, args)["tag"] == "zed/fp8"
+
+    # Unpriceable (no parseable prices): skipped even when flagged eligible.
+    assert mc.pick_baseline([_endpoint(pricing={})], [True], args) is None
+
+    # Nothing eligible at all: no baseline (the caller drops the model).
+    assert mc.pick_baseline(eps, [False, False], args) is None
+
+
+# ---------------------------------------------------------------------------
 # Tiered pricing: CLI display (TIER column, legend, --json keys)
 # ---------------------------------------------------------------------------
 
