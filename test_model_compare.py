@@ -1328,6 +1328,368 @@ def test_baseline_cheapest_with_pinned_tiebreak():
 
 
 # ---------------------------------------------------------------------------
+# Provider-aware eval: annotations + steering builder
+# ---------------------------------------------------------------------------
+
+
+def test_price_spread_direction_and_null():
+    args = make_args()
+    # Completion = 2x prompt on every endpoint, so the blended ratio equals
+    # the prompt-price ratio regardless of --input-share: eligible fp8 at
+    # 0.15/M, non-eligible fp4 at 0.075/M -> spread = 0.075/0.15 = 0.5. A
+    # second, pricier non-eligible endpoint pins "cheapest", not first/mean.
+    eps = [
+        _endpoint(
+            provider_name="Z.AI",
+            tag="z-ai/fp8",
+            quantization="fp8",
+            pricing={"prompt": "0.00000015", "completion": "0.0000003"},
+        ),
+        _endpoint(
+            provider_name="DeepInfra",
+            tag="deepinfra/fp4",
+            quantization="fp4",
+            pricing={"prompt": "0.000000075", "completion": "0.00000015"},
+        ),
+        _endpoint(
+            provider_name="BetaHost",
+            tag="beta/fp4",
+            quantization="fp4",
+            pricing={"prompt": "0.0000003", "completion": "0.0000006"},
+        ),
+    ]
+    flags = [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps]
+    assert flags == [True, False, False]
+    annotations = mc.build_annotations(eps, flags, eps[0], 262144, args)
+    assert annotations["price_spread"] == pytest.approx(0.5)
+    # The quantization-caused subset is the same two fp4 endpoints here.
+    assert annotations["cheapest_quantized"] == {
+        "provider": "DeepInfra",
+        "quantization": "fp4",
+        "price": pytest.approx(0.75 * 0.000000075 + 0.25 * 0.00000015),
+    }
+
+    # Null guard: an unpriceable endpoint on either side leaves no ratio.
+    broken = _endpoint(
+        provider_name="Broken",
+        tag="broken/fp4",
+        quantization="fp4",
+        pricing={},
+    )
+    eps = [_endpoint(), broken]
+    flags = [True, mc.baseline_eligible(broken, "fp8", "z-ai", args)]
+    assert flags == [True, False]
+    assert (
+        mc.build_annotations(eps, flags, eps[0], 262144, args)["price_spread"] is None
+    )
+    # ...and on the eligible side (flags are contract inputs: an eligible
+    # endpoint may still be unpriceable -- pick_baseline's None case).
+    eps = [_endpoint(pricing={}), _endpoint(tag="second/fp4", quantization="fp4")]
+    assert (
+        mc.build_annotations(eps, [True, False], eps[0], 262144, args)["price_spread"]
+        is None
+    )
+
+
+def test_price_spread_null_when_no_non_eligible():
+    args = make_args()
+    eps = [_endpoint(), _endpoint(provider_name="Alpha", tag="alpha/fp8")]
+    flags = [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps]
+    assert flags == [True, True]
+    # Empty non-eligible universe: nothing to compare against, and no
+    # quantization-caused risk to report. Exact shape: exactly four keys.
+    assert mc.build_annotations(eps, flags, eps[0], 262144, args) == {
+        "price_spread": None,
+        "cheapest_quantized": None,
+        "risk_flag": False,
+        "baseline_context_below_catalog": False,
+    }
+
+
+def test_cheapest_quantized_excludes_schedule_gated():
+    args = make_args()
+    eps = [
+        _endpoint(),  # eligible maker baseline (blended 0.2375/M)
+        _endpoint(
+            provider_name="DeepInfra",
+            tag="deepinfra/fp4",
+            quantization="fp4",
+            pricing={"prompt": "0.00000005", "completion": "0.0000001"},
+        ),  # sub-default known quantization (blended 0.0625/M)
+        _endpoint(
+            provider_name="Relace",
+            tag="relace/unknown",
+            quantization="unknown",
+            pricing={"prompt": "0.00000002", "completion": "0.00000004"},
+        ),  # third-party unknown (blended 0.025/M)
+        _schedule_broken(
+            provider_name="CheapHost",
+            tag="cheaphost/fp4",
+            quantization="fp4",
+            pricing={
+                "prompt": "0.00000001",
+                "completion": "0.00000002",
+                "overrides": [
+                    {"utc_days": ["monday"], "utc_start": "25:99", "utc_end": "01:00"}
+                ],
+            },
+        ),  # schedule-gate-failed (blended 0.0125/M) -- in the universe, but
+        # NOT in the quantization-caused subset despite being cheapest overall
+    ]
+    flags = [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps]
+    assert flags == [True, False, False, False]
+    annotations = mc.build_annotations(eps, flags, eps[0], 262144, args)
+    # Cheapest member of the quantization subset (fp4 @0.0625 vs unknown
+    # @0.025): the third-party unknown endpoint -- the 0.0125 schedule-gated
+    # endpoint must not win even though it is the cheapest in the universe.
+    assert annotations["cheapest_quantized"] == {
+        "provider": "Relace",
+        "quantization": "unknown",
+        "price": pytest.approx(0.75 * 0.00000002 + 0.25 * 0.00000004),
+    }
+
+
+def test_risk_flag_weight_formula():
+    args = make_args()
+    # eligible fp8 @0.15/M and @0.16/M vs non-eligible fp4 @0.0258/M:
+    # 1/0.0258^2 (~1.5e3) >> 1/0.15^2 + 1/0.16^2 (~83.5) -> True. Equal
+    # in/out prices keep each blended equal to its per-M headline price.
+    eps = [
+        _endpoint(
+            provider_name="Z.AI",
+            tag="z-ai/fp8",
+            pricing={"prompt": "0.00000015", "completion": "0.00000015"},
+        ),
+        _endpoint(
+            provider_name="Alpha LLC",
+            tag="alpha/fp8",
+            pricing={"prompt": "0.00000016", "completion": "0.00000016"},
+        ),
+        _endpoint(
+            provider_name="DeepInfra",
+            tag="deepinfra/fp4",
+            quantization="fp4",
+            pricing={"prompt": "0.0000000258", "completion": "0.0000000258"},
+        ),
+    ]
+    flags = [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps]
+    assert flags == [True, True, False]
+    assert mc.build_annotations(eps, flags, eps[0], 262144, args)["risk_flag"] is True
+
+    # Eligible-only model: the non-eligible sum is empty -> False.
+    eps = [_endpoint()]
+    flags = [mc.baseline_eligible(eps[0], "fp8", "z-ai", args)]
+    assert mc.build_annotations(eps, flags, eps[0], 262144, args)["risk_flag"] is False
+
+    # Exact tie -> False (strict inequality). Identical pricing dicts make
+    # the two blended prices bit-identical, so the sums are exactly equal:
+    # Z.AI int8 (rank 0 >= rank 0) is eligible; DeepInfra int4 (rank -2 < 0)
+    # is not.
+    tie_pricing = {"prompt": "0.0000001", "completion": "0.0000002"}
+    eps = [
+        _endpoint(
+            provider_name="Z.AI",
+            tag="z-ai/int8",
+            quantization="int8",
+            pricing=tie_pricing,
+        ),
+        _endpoint(
+            provider_name="DeepInfra",
+            tag="deepinfra/int4",
+            quantization="int4",
+            pricing=tie_pricing,
+        ),
+    ]
+    flags = [mc.baseline_eligible(ep, "int8", "z-ai", args) for ep in eps]
+    assert flags == [True, False]
+    assert mc.build_annotations(eps, flags, eps[0], 262144, args)["risk_flag"] is False
+
+    # Determinism under malformed data: an unpriceable non-eligible endpoint
+    # is skipped from BOTH sums, so it cannot manufacture a risk flag.
+    eps = [
+        _endpoint(),
+        _endpoint(
+            provider_name="Broken",
+            tag="broken/fp4",
+            quantization="fp4",
+            pricing={},
+        ),
+    ]
+    flags = [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps]
+    assert flags == [True, False]
+    assert mc.build_annotations(eps, flags, eps[0], 262144, args)["risk_flag"] is False
+
+
+def test_baseline_context_below_catalog_flag():
+    args = make_args()
+    baseline = _endpoint()  # context_length 262144
+    eps, flags = [baseline], [True]
+    # Smaller than the catalog context -> True (strict comparison).
+    assert (
+        mc.build_annotations(eps, flags, baseline, 1_000_000, args)[
+            "baseline_context_below_catalog"
+        ]
+        is True
+    )
+    # Equal is not below -> False; larger -> False.
+    assert (
+        mc.build_annotations(eps, flags, baseline, 262144, args)[
+            "baseline_context_below_catalog"
+        ]
+        is False
+    )
+    assert (
+        mc.build_annotations(eps, flags, baseline, 131072, args)[
+            "baseline_context_below_catalog"
+        ]
+        is False
+    )
+    # None baseline -> False (pinned); missing context on either side is
+    # missing data, not a positive finding -> False.
+    assert (
+        mc.build_annotations(eps, flags, None, 1_000_000, args)[
+            "baseline_context_below_catalog"
+        ]
+        is False
+    )
+    assert (
+        mc.build_annotations(eps, flags, baseline, None, args)[
+            "baseline_context_below_catalog"
+        ]
+        is False
+    )
+    assert (
+        mc.build_annotations(
+            eps, flags, _endpoint(context_length=None), 1_000_000, args
+        )["baseline_context_below_catalog"]
+        is False
+    )
+
+
+def test_steering_order_ignores_and_quantizations():
+    args = make_args()
+    eps = [
+        _endpoint(provider_name="Z.AI", tag="z-ai/fp8"),  # eligible (0.2375/M)
+        _endpoint(
+            provider_name="Alpha LLC",
+            tag="alpha/fp8",
+            pricing={"prompt": "0.0000001", "completion": "0.0000002"},
+        ),  # eligible, cheaper (0.1/M)
+        _endpoint(
+            provider_name="DeepInfra", tag="deepinfra/fp4", quantization="fp4"
+        ),  # sub-default quantization
+        _endpoint(
+            provider_name="Relace", tag="relace/unknown", quantization="unknown"
+        ),  # third-party unknown
+        _endpoint(tag="z-ai:free"),  # live variant
+        _schedule_broken(
+            provider_name="CheapHost", tag="cheaphost/mxfp8", quantization="mxfp8"
+        ),  # schedule-gate-failed (mxfp8: rank == fp8, but the gate fails)
+        _endpoint(provider_name="GoneHost", tag="gone/fp8", status=1),  # not live
+    ]
+    flags = [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps]
+    assert flags == [True, True, False, False, False, False, False]
+
+    steering = mc.build_steering("z-ai/glm-5.3-flash", eps, flags, "fp8", args)
+    assert steering["model"] == "z-ai/glm-5.3-flash"
+    provider = steering["provider"]
+    # order: eligible tags cheapest first.
+    assert provider["order"] == ["alpha/fp8", "z-ai/fp8"]
+    # ignore: EVERY live non-eligible tag -- sub-default, third-party
+    # unknown, schedule-gated AND the live variant; the non-live endpoint is
+    # never listed. List order (the API's).
+    assert provider["ignore"] == [
+        "deepinfra/fp4",
+        "relace/unknown",
+        "z-ai:free",
+        "cheaphost/mxfp8",
+    ]
+    # quantizations: KNOWN quants >= rank(fp8) among live non-variant
+    # endpoints -- deduped, sorted; the schedule-gated mxfp8 still counts
+    # (no schedule filter here), the fp4/unknown/non-live/variant do not.
+    assert provider["quantizations"] == ["fp8", "mxfp8"]
+    assert provider["allow_fallbacks"] is True
+
+    # The annotations universe is the STRICTER set: live, non-variant AND
+    # non-eligible -- the variant and the non-live endpoint stay out, unlike
+    # in ignore.
+    universe = mc.NON_ELIGIBLE_UNIVERSE(eps, flags)
+    assert [ep["tag"] for ep in universe] == [
+        "deepinfra/fp4",
+        "relace/unknown",
+        "cheaphost/mxfp8",
+    ]
+
+    # Price tie between eligible endpoints: (normalized provider name, tag)
+    # breaks it -- the same comparator as pick_baseline.
+    eps_tie = [
+        _endpoint(provider_name="Zed Inc", tag="zed/fp8"),
+        _endpoint(provider_name="Alpha LLC", tag="alpha/fp8"),
+    ]
+    flags_tie = [mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps_tie]
+    steering = mc.build_steering("m", eps_tie, flags_tie, "fp8", args)
+    assert steering["provider"]["order"] == ["alpha/fp8", "zed/fp8"]
+
+    # An eligible endpoint with no computable price cannot be price-ranked;
+    # it is appended last (still provider/tag-ordered), never dropped.
+    eps_unpriced = [
+        _endpoint(provider_name="Zed Inc", tag="zed/fp8"),
+        _endpoint(provider_name="NoPrice", tag="noprice/fp8", pricing={}),
+    ]
+    flags_unpriced = [
+        mc.baseline_eligible(ep, "fp8", "z-ai", args) for ep in eps_unpriced
+    ]
+    assert flags_unpriced == [True, True]
+    steering = mc.build_steering("m", eps_unpriced, flags_unpriced, "fp8", args)
+    assert steering["provider"]["order"] == ["zed/fp8", "noprice/fp8"]
+
+
+def test_steering_omits_quantizations_when_default_null():
+    args = make_args()
+    # All-unknown closed model: the maker's endpoint is eligible via the
+    # first-party carve-out, the third-party one is not. default_precision
+    # None -> the quantizations key is OMITTED entirely, never an empty list
+    # (OpenRouter semantics would filter out every endpoint).
+    eps = [
+        _endpoint(
+            provider_name="Anthropic",
+            tag="anthropic/unknown",
+            quantization="unknown",
+        ),
+        _endpoint(
+            provider_name="Relace",
+            tag="relace/unknown",
+            quantization="unknown",
+        ),
+        _endpoint(
+            provider_name="Anthropic",
+            tag="anthropic:free",
+            quantization="unknown",
+        ),  # live variant: ignored, never ordered
+    ]
+    flags = [mc.baseline_eligible(ep, None, "anthropic", args) for ep in eps]
+    assert flags == [True, False, False]
+    steering = mc.build_steering("anthropic/claude-haiku-5.5", eps, flags, None, args)
+    provider = steering["provider"]
+    assert provider["order"] == ["anthropic/unknown"]
+    assert provider["ignore"] == ["relace/unknown", "anthropic:free"]
+    assert "quantizations" not in provider
+    assert provider["allow_fallbacks"] is True
+
+
+def test_flag_list_mismatch_raises():
+    # Parallel-list hardening (Task 4 review ruling): a flags list that does
+    # not match endpoints must raise, never truncate silently.
+    eps = [_endpoint(), _endpoint(tag="second/fp8")]
+    with pytest.raises(ValueError):
+        mc.build_annotations(eps, [True], _endpoint(), 262144, make_args())
+    with pytest.raises(ValueError):
+        mc.NON_ELIGIBLE_UNIVERSE(eps, [True])
+    with pytest.raises(ValueError):
+        mc.build_steering("m", eps, [True], "fp8", make_args())
+
+
+# ---------------------------------------------------------------------------
 # Tiered pricing: CLI display (TIER column, legend, --json keys)
 # ---------------------------------------------------------------------------
 

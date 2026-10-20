@@ -578,6 +578,263 @@ def pick_baseline(
     return min(candidates, key=lambda candidate: candidate[:3])[3]
 
 
+def _blended_price(endpoint, args) -> float | None:
+    """Blended per-token price of one endpoint (pick_baseline's price rule).
+
+    effective_pricing with the args' min_context and input_share, then
+    input_share * price_in + (1 - input_share) * price_out. None when either
+    resolved price is missing or non-finite -- no executable blended price,
+    the same skip pick_baseline applies. A zero result is returned as-is:
+    zero-priced endpoints are variants (already excluded upstream), so the
+    callers apply their own zero guards defensively.
+    """
+    eff = effective_pricing(endpoint.get("pricing"), args.min_context, args.input_share)
+    price_in, price_out = eff["price_in"], eff["price_out"]
+    if (
+        price_in is None
+        or price_out is None
+        or not math.isfinite(price_in)
+        or not math.isfinite(price_out)
+    ):
+        return None
+    blended = args.input_share * price_in + (1 - args.input_share) * price_out
+    return blended if math.isfinite(blended) else None
+
+
+def _flag_list(endpoints: list[dict], eligible_flags: list[bool]):
+    """Zip endpoints with their parallel eligibility flags, hardened.
+
+    eligible_flags is a parallel list to endpoints (the baseline_eligible
+    verdict per endpoint, same order -- Task 4 contract). A length mismatch
+    must raise, never truncate silently (Task 4 review ruling).
+    """
+    if len(endpoints) != len(eligible_flags):
+        raise ValueError(
+            "eligible_flags must be a parallel list to endpoints: "
+            f"{len(endpoints)} endpoints, {len(eligible_flags)} flags"
+        )
+    return zip(endpoints, eligible_flags, strict=True)
+
+
+def NON_ELIGIBLE_UNIVERSE(endpoints: list[dict], eligible_flags: list[bool]) -> list:
+    """The shared annotations universe (design section 4.6).
+
+    Live (status == 0), non-variant endpoints that are NOT baseline-eligible:
+    sub-default known quantization, third-party unknown/null quantization, or
+    schedule-gate-failed. All annotations derive from this one universe.
+    Eligibility comes from the parallel eligible_flags list (the
+    baseline_eligible verdicts); variants and non-live endpoints are excluded
+    even though they too are not eligible -- unlike the steering `ignore`
+    list, which includes live variants (section 4.7).
+
+    Raises ValueError when eligible_flags does not match endpoints in length.
+    """
+    return [
+        endpoint
+        for endpoint, eligible in _flag_list(endpoints, eligible_flags)
+        if endpoint.get("status") == 0
+        and not is_variant_endpoint(endpoint)
+        and not eligible
+    ]
+
+
+def build_annotations(
+    endpoints: list[dict],
+    eligible_flags: list[bool],
+    baseline,
+    catalog_context,
+    args,
+) -> dict:
+    """Per-model endpoint annotations (design section 4.6).
+
+    All four annotations derive from one shared universe -- the live
+    non-variant endpoints that are not baseline-eligible
+    (NON_ELIGIBLE_UNIVERSE):
+
+    * price_spread: cheapest non-eligible blended price divided by the
+      cheapest eligible blended price, both blended with the args'
+      min_context and input_share (the shared --input-share convention).
+      None when the universe is empty -- generalized to None when either
+      side has no priceable member at all -- and None when either cheapest
+      price is 0 (zero-priced endpoints are variants by definition, so the
+      zero half of the guard is defensive only). Unpriceable endpoints are
+      skipped when looking for a cheapest price.
+    * cheapest_quantized: {provider, quantization, price} of the cheapest
+      member of the quantization-caused subset of the universe -- endpoints
+      non-eligible due to quantization only (sub-default known quantization
+      or third-party unknown/null), NOT schedule-gate-failed ones, which are
+      excluded even when cheaper. Unpriceable subset members are skipped
+      (defensively also non-positive ones, matching the repo-wide treatment
+      of negative prices as malformed); None when the subset has no
+      priceable member. Price ties keep the first in list order
+      (deterministic).
+    * risk_flag: True iff the sum of 1/blended**2 over the universe strictly
+      exceeds the sum over the baseline-eligible endpoints (exact tie ->
+      False). Any endpoint whose blended price is 0/None (defensively also
+      negative) is skipped from BOTH sums -- variants are already excluded,
+      so this only guards malformed data, and the flag stays deterministic.
+    * baseline_context_below_catalog: True iff the baseline endpoint's
+      context_length is smaller than the catalog context (the models-API
+      value). A None baseline -- or missing context on either side -- yields
+      False: the caveat marks a positive finding, never missing data.
+
+    Raises ValueError when eligible_flags does not match endpoints in length.
+    """
+    universe = NON_ELIGIBLE_UNIVERSE(endpoints, eligible_flags)
+
+    universe_prices = []
+    for endpoint in universe:
+        price = _blended_price(endpoint, args)
+        if price is not None:
+            universe_prices.append(price)
+    eligible_prices = []
+    for endpoint, eligible in _flag_list(endpoints, eligible_flags):
+        if not eligible:
+            continue
+        price = _blended_price(endpoint, args)
+        if price is not None:
+            eligible_prices.append(price)
+    cheapest_non_eligible = min(universe_prices) if universe_prices else None
+    cheapest_eligible = min(eligible_prices) if eligible_prices else None
+    price_spread = (
+        cheapest_non_eligible / cheapest_eligible
+        if cheapest_non_eligible is not None
+        and cheapest_eligible is not None
+        and cheapest_non_eligible > 0
+        and cheapest_eligible > 0
+        else None
+    )
+
+    quantized_best = None
+    for endpoint in universe:
+        if not endpoint_schedule_ok(endpoint, args):
+            continue  # schedule-gate-failed: not a quantization-caused exclusion
+        price = _blended_price(endpoint, args)
+        if price is None or price <= 0:
+            continue  # unpriceable/non-positive: no comparable price
+        if quantized_best is None or price < quantized_best[0]:
+            quantized_best = (price, endpoint)  # ties keep the first in list order
+    if quantized_best is None:
+        cheapest_quantized = None
+    else:
+        price, endpoint = quantized_best
+        cheapest_quantized = {
+            "provider": endpoint.get("provider_name"),
+            "quantization": endpoint.get("quantization"),
+            "price": price,
+        }
+
+    non_eligible_weight = 0.0
+    for endpoint in universe:
+        price = _blended_price(endpoint, args)
+        if price is None or price <= 0:
+            continue  # skipped from BOTH sums, deterministically
+        non_eligible_weight += 1.0 / (price * price)
+    eligible_weight = 0.0
+    for endpoint, eligible in _flag_list(endpoints, eligible_flags):
+        if not eligible:
+            continue
+        price = _blended_price(endpoint, args)
+        if price is None or price <= 0:
+            continue
+        eligible_weight += 1.0 / (price * price)
+    risk_flag = non_eligible_weight > eligible_weight
+
+    baseline_context = baseline.get("context_length") if baseline is not None else None
+    baseline_context_below_catalog = (
+        baseline_context is not None
+        and catalog_context is not None
+        and baseline_context < catalog_context
+    )
+
+    return {
+        "price_spread": price_spread,
+        "cheapest_quantized": cheapest_quantized,
+        "risk_flag": risk_flag,
+        "baseline_context_below_catalog": baseline_context_below_catalog,
+    }
+
+
+def build_steering(
+    model_id: str,
+    endpoints: list[dict],
+    eligible_flags: list[bool],
+    default_precision: str | None,
+    args,
+) -> dict:
+    """OpenRouter provider steering object (design section 4.7).
+
+    {"model": model_id, "provider": {"order": [...], "ignore": [...],
+    "quantizations": [...], "allow_fallbacks": True}}.
+
+    * order: tags of the baseline-eligible endpoints, cheapest blended first
+      (blended price asc, ties broken by (normalized provider name, tag) --
+      the same comparator as pick_baseline, stable so the final tie is list
+      order). Eligible endpoints whose blended price is unpriceable cannot
+      be price-ranked; they are appended after the ranked ones (still
+      (provider, tag)-ordered) so every eligible endpoint keeps a place --
+      ranked last, never silently left to default priority.
+    * ignore: tags of EVERY live endpoint that is not baseline-eligible --
+      sub-default quantization, third-party unknown/null, schedule-gate-
+      failed AND variants (variants are live but not eligible; the universal
+      quantifier includes them). Non-live (status != 0) endpoints are never
+      listed. List order (the API's).
+    * quantizations: sorted KNOWN quantizations (PRECISION_LADDER labels)
+      with rank >= rank(default_precision) among live non-variant endpoints,
+      deduplicated -- no schedule or eligibility filter. OMITTED from the
+      provider dict entirely when default_precision is None -- never an
+      empty list (OpenRouter semantics would filter out every endpoint).
+    * allow_fallbacks: True.
+
+    Signature deviation from the plan (controller ruling at Task 5 spawn):
+    args is a required parameter -- the order ranking is real pricing math
+    (effective_pricing via min_context/input_share), and reusing the
+    shape-only _SCHEDULE_GATE_ARGS stand-in for pricing was explicitly
+    ruled out in the Task 4 review.
+
+    Raises ValueError when eligible_flags does not match endpoints in length.
+    """
+    ignore = []
+    ranked = []  # (blended, normalized provider name, tag) -- pick_baseline order
+    unranked = []  # (normalized provider name, tag) -- eligible but unpriceable
+    for endpoint, eligible in _flag_list(endpoints, eligible_flags):
+        if endpoint.get("status") == 0 and not eligible:
+            ignore.append(endpoint.get("tag") or "")
+        if not eligible:
+            continue
+        provider_name = endpoint.get("provider_name")
+        provider_key = (
+            normalize_provider(provider_name) if isinstance(provider_name, str) else ""
+        )
+        tag = endpoint.get("tag") or ""
+        price = _blended_price(endpoint, args)
+        if price is None:
+            unranked.append((provider_key, tag))
+        else:
+            ranked.append((price, provider_key, tag))
+    ranked.sort()  # stable: the final tie is list order, as in pick_baseline
+    order = [tag for _, _, tag in ranked] + [tag for _, tag in sorted(unranked)]
+
+    provider = {"order": order, "ignore": ignore}
+    if default_precision is not None:
+        default_rank = PRECISION_LADDER[default_precision]
+        quants = set()
+        for endpoint in endpoints:
+            if endpoint.get("status") != 0 or is_variant_endpoint(endpoint):
+                continue
+            quantization = endpoint.get("quantization")
+            if (
+                not isinstance(quantization, str)
+                or quantization not in PRECISION_LADDER
+            ):
+                continue  # "unknown"/null/unrecognized: not a known quantization
+            if PRECISION_LADDER[quantization] >= default_rank:
+                quants.add(quantization)
+        provider["quantizations"] = sorted(quants)
+    provider["allow_fallbacks"] = True
+    return {"model": model_id, "provider": provider}
+
+
 # ---------------------------------------------------------------------------
 # OpenRouter catalog
 # ---------------------------------------------------------------------------
