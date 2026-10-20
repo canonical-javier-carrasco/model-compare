@@ -149,6 +149,20 @@
       #table .movement {
         text-align: center;
       }
+      #table .caveat {
+        color: var(--muted);
+      }
+      #table .na {
+        color: var(--muted);
+      }
+      #table tr.endpoint-row td {
+        padding: 0.5rem 0.75rem 1rem;
+        background: var(--row-alt, transparent);
+      }
+      #table tr.endpoint-row table {
+        width: 100%;
+        font-size: 0.8rem;
+      }
       #table [title],
       #deals [title] {
         cursor: help;
@@ -301,6 +315,11 @@
           <th title="Output price, USD per 1M tokens">$OUT/M</th>
           <th title="Current discount percentage">DISC</th>
           <th
+            title="Quantization the ranked price is quoted at (the maker's default precision when disclosed; best available otherwise). ! = default OpenRouter routing favors cheaper sub-default-quantization endpoints."
+          >
+            PREC
+          </th>
+          <th
             title="How this model's pricing varies: a token threshold means a higher rate above it; a percentage means cheaper off-peak hours. Hover a cell for details."
             class="tier"
           >
@@ -309,6 +328,11 @@
           <th title="Context window in tokens">CTX</th>
           <th title="Days since listing">AGE</th>
           <th title="Composite score for the selected priority">SCORE</th>
+          <th
+            title="Median cost per task session (OpenRouter session-cost dataset, 10-49-turn sessions; CC BY 4.0). — = not available this refresh."
+          >
+            TASK$
+          </th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -492,6 +516,8 @@
       };
       var data = null;
       var historyData = null;
+      var catalogData = null;
+      var endpointExpanded = {};
       var current = "balanced";
 
       // NOTE: fmtPrice/fmtContext/fmtAge mirror the fmt_* helpers in
@@ -538,6 +564,141 @@
         if (d >= 365) return pyFixed(d / 365, 1) + "y";
         if (d >= 60) return pyFixed(d / 30.44, 0) + "mo";
         return pyFixed(d, 0) + "d";
+      }
+
+      // PREC badge: default_precision or "n/a", "!" when the routing risk
+      // flag is set. The flag means default OpenRouter routing can land on
+      // cheaper sub-default-quantization endpoints, so the ranked price is
+      // not the precision you get.
+      function fmtPrec(row) {
+        var text =
+          row.default_precision === null || row.default_precision === undefined
+            ? "n/a"
+            : String(row.default_precision);
+        if (row.risk_flag) text += "!";
+        return text;
+      }
+
+      // PREC cell tooltip: the CLI-printed quant_note string verbatim
+      // (house rule: display strings from data.json are shown as-is).
+      function fmtQuantTooltip(row) {
+        return row.quant_note || null;
+      }
+
+      // TASK$ cell: the session-cost dataset's median cost for this model's
+      // task class, USD. Null/undefined/non-finite means the dataset had no
+      // row this refresh -- the "—" state, never zero, never blank-silent.
+      // No negative guard: fmtPrice has none either, and a negative session
+      // cost is a data bug that must surface, not hide.
+      function fmtTaskCost(value) {
+        if (value === null || value === undefined) return "—";
+        if (typeof value !== "number" || !isFinite(value)) return "—";
+        return "$" + pyFixed(value, 2);
+      }
+
+      // endpointRows(catalogEntry): normalized rows for the per-model
+      // endpoint disclosure. Nulls map to their display defaults (no
+      // pricing -> "-", no status -> "non-live", no tier -> "-", no
+      // quantization -> "unknown"); the baseline endpoint is the one whose
+      // per-1M in/out prices match the entry's baseline pricing scalars
+      // (the pricing block IS the baseline endpoint's pricing, so exactly
+      // one endpoint should match -- if more do, the marker is withheld:
+      // ambiguous beats wrong).
+      function endpointRows(entry) {
+        if (!entry || !Array.isArray(entry.endpoints)) return [];
+        var base = entry.pricing || {};
+        var baseIn =
+          typeof base.input_per_1m === "number" && isFinite(base.input_per_1m)
+            ? base.input_per_1m
+            : null;
+        var baseOut =
+          typeof base.output_per_1m === "number" && isFinite(base.output_per_1m)
+            ? base.output_per_1m
+            : null;
+        var matches = 0;
+        var rows = entry.endpoints.map(function (endpoint) {
+          var pricing = endpoint.pricing || {};
+          var prompt =
+            typeof pricing.prompt === "number" && isFinite(pricing.prompt)
+              ? pricing.prompt
+              : null;
+          var completion =
+            typeof pricing.completion === "number" && isFinite(pricing.completion)
+              ? pricing.completion
+              : null;
+          var isBaseline = false;
+          if (
+            prompt !== null &&
+            completion !== null &&
+            baseIn !== null &&
+            baseOut !== null &&
+            Math.abs(prompt * 1e6 - baseIn) < 1e-9 &&
+            Math.abs(completion * 1e6 - baseOut) < 1e-9
+          ) {
+            isBaseline = true;
+            matches += 1;
+          }
+          return {
+            provider: endpoint.provider_name || "unknown",
+            badge: endpoint.quantization || "unknown",
+            priceIn: prompt === null ? "-" : fmtPrice(prompt * 1e6),
+            priceOut: completion === null ? "-" : fmtPrice(completion * 1e6),
+            status: endpoint.status || "non-live",
+            context: endpoint.context_length,
+            tier: endpoint.service_tier || "-",
+            isBaseline: isBaseline,
+          };
+        });
+        if (matches > 1) {
+          rows.forEach(function (r) {
+            r.isBaseline = false;
+          });
+        }
+        return rows;
+      }
+
+      // CTX cell caveat: shown only when the annotations flag says the
+      // baseline endpoint's context is below the catalog context. Names the
+      // baseline endpoint's context and the catalog context so the reader
+      // knows the ranked price was quoted at the smaller window. No
+      // baseline endpoint (or no context on it) -> no caveat.
+      function fmtCtxCaveat(entry, row) {
+        if (
+          !entry ||
+          !entry.annotations ||
+          entry.annotations.baseline_context_below_catalog !== true
+        ) {
+          return null;
+        }
+        if (
+          !row ||
+          row.context_tokens === null ||
+          row.context_tokens === undefined
+        ) {
+          return null;
+        }
+        var rows = endpointRows(entry);
+        var baseline = null;
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i].isBaseline) {
+            baseline = rows[i];
+            break;
+          }
+        }
+        if (
+          !baseline ||
+          baseline.context === null ||
+          baseline.context === undefined
+        ) {
+          return null;
+        }
+        return (
+          "Ranked price from a " +
+          fmtContext(baseline.context) +
+          "-token endpoint; model supports " +
+          fmtContext(row.context_tokens) +
+          "."
+        );
       }
 
       function topModel() {
@@ -659,6 +820,62 @@
         };
       }
 
+      function endpointRow(entry) {
+        var tr = document.createElement("tr");
+        tr.className = "endpoint-row";
+        var td = document.createElement("td");
+        td.colSpan = 12;
+        if (!entry) {
+          td.textContent = "No endpoint data for this model.";
+          tr.appendChild(td);
+          return tr;
+        }
+        var table = document.createElement("table");
+        var thead = document.createElement("thead");
+        var headTr = document.createElement("tr");
+        [
+          "Provider",
+          "PREC",
+          "$IN/M",
+          "$OUT/M",
+          "Status",
+          "CTX",
+          "Tier",
+          "Baseline",
+        ].forEach(function (label) {
+          var th = document.createElement("th");
+          th.textContent = label;
+          headTr.appendChild(th);
+        });
+        thead.appendChild(headTr);
+        table.appendChild(thead);
+        var tbody = document.createElement("tbody");
+        endpointRows(entry).forEach(function (er) {
+          var row = document.createElement("tr");
+          [
+            er.provider,
+            er.badge,
+            er.priceIn,
+            er.priceOut,
+            er.status,
+            er.context === null || er.context === undefined
+              ? "-"
+              : fmtContext(er.context),
+            er.tier,
+            er.isBaseline ? "✓" : "",
+          ].forEach(function (cell) {
+            var c = document.createElement("td");
+            c.textContent = cell;
+            row.appendChild(c);
+          });
+          tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+        td.appendChild(table);
+        tr.appendChild(td);
+        return tr;
+      }
+
       function render() {
         var rows = (data && data.priorities[current]) || [];
         var shown = mainExpanded ? rows : rows.slice(0, DEFAULT_MAIN_ROWS);
@@ -692,6 +909,17 @@
             else movement = { cls: "flat", text: "•" };
           }
           var tier = tierCellData(row);
+          var entry = null;
+          if (catalogData && Array.isArray(catalogData.models)) {
+            for (var j = 0; j < catalogData.models.length; j++) {
+              if (catalogData.models[j].id === row.model) {
+                entry = catalogData.models[j];
+                break;
+              }
+            }
+          }
+          var precTooltip = fmtQuantTooltip(row);
+          var ctxCaveat = fmtCtxCaveat(entry, row);
           var cells = [
             String(i + 1),
             row.model,
@@ -699,10 +927,12 @@
             fmtPrice(row.input_usd_per_m),
             fmtPrice(row.output_usd_per_m),
             row.discount_pct || "--",
+            fmtPrec(row),
             tier.text,
             fmtContext(row.context_tokens),
             fmtAge(row.age_days),
             row.score.toFixed(3),
+            fmtTaskCost(row.session_cost_usd),
           ];
           cells.forEach(function (cell, idx) {
             if (idx === 1) {
@@ -714,12 +944,31 @@
             var td = document.createElement("td");
             td.textContent = cell;
             if (idx === 6) {
+              if (precTooltip) td.title = precTooltip;
+            } else if (idx === 7) {
               td.className = "tier";
               if (tier.hover) td.title = tier.hover;
+            } else if (idx === 8) {
+              if (ctxCaveat) {
+                td.title = ctxCaveat;
+                td.className = "caveat";
+              }
+            } else if (idx === 11) {
+              if (cell === "—") {
+                td.title = "Not available this refresh.";
+                td.className = "na";
+              }
             }
             tr.appendChild(td);
           });
+          tr.addEventListener("click", function () {
+            endpointExpanded[row.model] = !endpointExpanded[row.model];
+            render();
+          });
           els.tbody.appendChild(tr);
+          if (endpointExpanded[row.model]) {
+            els.tbody.appendChild(endpointRow(entry));
+          }
         });
         var model = topModel();
         var hasTop = model !== null;
@@ -926,6 +1175,25 @@
             if (payload && payload.sections) renderHighlights(payload.sections);
           })
           .catch(function () {});
+
+        // catalog.json is a separate artifact: a failure must never block
+        // the data.json table (degraded mode), just surface a one-line
+        // notice and leave the per-model disclosure empty.
+        fetch("catalog.json", { cache: "no-cache" })
+          .then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          })
+          .then(function (payload) {
+            catalogData = payload;
+            render();
+          })
+          .catch(function () {
+            catalogData = null;
+            els.status.textContent =
+              "Endpoint details unavailable: catalog.json failed to load.";
+            els.status.hidden = false;
+          });
       }
 
       init();

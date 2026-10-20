@@ -294,3 +294,289 @@ def test_tier_tooltip_rejects_negative_output_price():
         " base_input_usd_per_m: 0.1, base_output_usd_per_m: -0.5})"
     )
     assert out["hover"] == SHORT_TIER_HOVER
+
+
+# ---------------------------------------------------------------------------
+# Task 11: quantization badge (PREC), session cost (TASK$), endpoint disclosure
+# ---------------------------------------------------------------------------
+
+# Shared catalog entry used by the fmtCtxCaveat and endpointRows tests.
+# provider-a's per-token prices (1.25e-6, 10e-6) scale to exactly the entry's
+# per-1M pricing (1.25, 10.0), so it is the baseline endpoint.
+CATALOG_ENTRY_JS = """
+{
+  id: 'test-model',
+  pricing: { input_per_1m: 1.25, output_per_1m: 10.0 },
+  annotations: { baseline_context_below_catalog: true },
+  endpoints: [
+    {
+      provider_name: 'provider-a',
+      quantization: 'fp8',
+      pricing: { prompt: 1.25e-6, completion: 10e-6 },
+      status: 'active',
+      context_length: 163840,
+      service_tier: 'standard'
+    }
+  ]
+}
+"""
+
+
+def test_fmt_prec_formats_default_precision():
+    assert run_js("fmtPrec({default_precision: 'fp8', risk_flag: false})") == "fp8"
+
+
+def test_fmt_prec_appends_risk_flag():
+    assert run_js("fmtPrec({default_precision: 'fp8', risk_flag: true})") == "fp8!"
+
+
+def test_fmt_prec_null_precision_is_na():
+    assert run_js("fmtPrec({default_precision: null, risk_flag: false})") == "n/a"
+
+
+def test_fmt_prec_null_precision_with_risk_flag():
+    assert run_js("fmtPrec({default_precision: null, risk_flag: true})") == "n/a!"
+
+
+def test_fmt_prec_treats_false_and_null_risk_flag_identically():
+    # JS truthiness: both false and null are falsy, so neither adds the "!".
+    # Documented here because data.json emits false for "no risk" and null
+    # for "unknown" -- the badge does not distinguish them (see task 11 stub
+    # reconciliation note).
+    assert run_js("fmtPrec({default_precision: 'fp8', risk_flag: false})") == "fp8"
+    assert run_js("fmtPrec({default_precision: 'fp8', risk_flag: null})") == "fp8"
+
+
+def test_fmt_task_cost_formats_usd():
+    assert run_js("fmtTaskCost(1.5)") == "$1.50"
+    assert run_js("fmtTaskCost(0)") == "$0.00"
+
+
+def test_fmt_task_cost_null_is_na():
+    # data.json emits null when the session-cost dataset has no row for the
+    # model this refresh -- the site must show the not-available marker, never
+    # 0.00 and never blank-silent.
+    assert run_js("fmtTaskCost(null)") == "—"
+
+
+def test_fmt_task_cost_undefined_is_na():
+    assert run_js("fmtTaskCost(undefined)") == "—"
+
+
+def test_fmt_task_cost_non_finite_is_na():
+    assert run_js("fmtTaskCost(NaN)") == "—"
+    assert run_js("fmtTaskCost(Infinity)") == "—"
+
+
+def test_fmt_task_cost_no_negative_guard():
+    # Consistency with fmtPrice: no negative guard. A negative session cost
+    # is a data bug that must surface, not hide.
+    assert run_js("fmtTaskCost(-1.5)") == "$-1.50"
+
+
+def test_fmt_quant_tooltip_verbatim():
+    assert (
+        run_js("fmtQuantTooltip({quant_note: 'Sub-default fp8'})") == "Sub-default fp8"
+    )
+
+
+def test_fmt_quant_tooltip_null():
+    assert run_js("fmtQuantTooltip({quant_note: null})") is None
+
+
+def test_fmt_quant_tooltip_missing():
+    assert run_js("fmtQuantTooltip({})") is None
+
+
+def test_fmt_ctx_caveat_active():
+    out = run_js(f"fmtCtxCaveat({CATALOG_ENTRY_JS}, {{context_tokens: 1048576}})")
+    assert out == "Ranked price from a 164K-token endpoint; model supports 1.05M."
+
+
+def test_fmt_ctx_caveat_null_when_annotation_false():
+    entry = CATALOG_ENTRY_JS.replace(
+        "baseline_context_below_catalog: true", "baseline_context_below_catalog: false"
+    )
+    assert run_js(f"fmtCtxCaveat({entry}, {{context_tokens: 1048576}})") is None
+
+
+def test_fmt_ctx_caveat_null_when_no_baseline():
+    # No endpoint matches the entry pricing, so there is no baseline context
+    # to cite -- the caveat is withheld rather than guessing.
+    entry = CATALOG_ENTRY_JS.replace(
+        "baseline_context_below_catalog: true", "baseline_context_below_catalog: false"
+    )
+    assert run_js(f"fmtCtxCaveat({entry}, {{context_tokens: 1048576}})") is None
+
+
+def test_fmt_ctx_caveat_null_when_row_context_null():
+    assert run_js(f"fmtCtxCaveat({CATALOG_ENTRY_JS}, {{context_tokens: null}})") is None
+
+
+def test_endpoint_rows_null_pricing():
+    entry = """
+    {
+      pricing: { input_per_1m: 1.0, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p',
+          quantization: 'fp8',
+          pricing: null,
+          status: 'active',
+          context_length: 1000,
+          service_tier: 'standard'
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out == [
+        {
+            "provider": "p",
+            "badge": "fp8",
+            "priceIn": "-",
+            "priceOut": "-",
+            "status": "active",
+            "context": 1000,
+            "tier": "standard",
+            "isBaseline": False,
+        }
+    ]
+
+
+def test_endpoint_rows_null_status_is_non_live():
+    entry = """
+    {
+      pricing: { input_per_1m: 1.0, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p',
+          quantization: 'fp8',
+          pricing: { prompt: 1e-6, completion: 10e-6 },
+          status: null,
+          context_length: 1000,
+          service_tier: 'standard'
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out[0]["status"] == "non-live"
+
+
+def test_endpoint_rows_null_service_tier():
+    entry = """
+    {
+      pricing: { input_per_1m: 1.0, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p',
+          quantization: 'fp8',
+          pricing: { prompt: 1e-6, completion: 10e-6 },
+          status: 'active',
+          context_length: 1000,
+          service_tier: null
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out[0]["tier"] == "-"
+
+
+def test_endpoint_rows_null_quantization():
+    entry = """
+    {
+      pricing: { input_per_1m: 1.0, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p',
+          quantization: null,
+          pricing: { prompt: 1e-6, completion: 10e-6 },
+          status: 'active',
+          context_length: 1000,
+          service_tier: 'standard'
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out[0]["badge"] == "unknown"
+
+
+def test_endpoint_rows_identifies_baseline():
+    entry = """
+    {
+      pricing: { input_per_1m: 1.25, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p1',
+          quantization: 'fp8',
+          pricing: { prompt: 1.25e-6, completion: 10e-6 },
+          status: 'active',
+          context_length: 1000,
+          service_tier: 'standard'
+        },
+        {
+          provider_name: 'p2',
+          quantization: 'int8',
+          pricing: { prompt: 2e-6, completion: 20e-6 },
+          status: 'active',
+          context_length: 1000,
+          service_tier: 'standard'
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out[0]["isBaseline"] is True
+    assert out[1]["isBaseline"] is False
+
+
+def test_endpoint_rows_ambiguous_baseline_marks_none():
+    entry = """
+    {
+      pricing: { input_per_1m: 1.25, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p1',
+          quantization: 'fp8',
+          pricing: { prompt: 1.25e-6, completion: 10e-6 },
+          status: 'active',
+          context_length: 1000,
+          service_tier: 'standard'
+        },
+        {
+          provider_name: 'p2',
+          quantization: 'int8',
+          pricing: { prompt: 1.25e-6, completion: 10e-6 },
+          status: 'active',
+          context_length: 1000,
+          service_tier: 'standard'
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out[0]["isBaseline"] is False
+    assert out[1]["isBaseline"] is False
+
+
+def test_endpoint_rows_no_match_marks_none():
+    entry = """
+    {
+      pricing: { input_per_1m: 1.25, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p1',
+          quantization: 'fp8',
+          pricing: { prompt: 9e-6, completion: 90e-6 },
+          status: 'active',
+          context_length: 1000,
+          service_tier: 'standard'
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out[0]["isBaseline"] is False
