@@ -31,6 +31,16 @@ ROW_KEYS = (
     "discount_pct",
     "context_tokens",
     "age_days",
+    # data.json v2 row keys (Task 9): exactly the additive keys
+    # model_compare.print_json appends (default_precision first,
+    # quant_note last). print_json always emits them -- pre-endpoint
+    # candidates degrade to null -- so the missing-key check below
+    # demands them on every row.
+    "default_precision",
+    "risk_flag",
+    "price_spread",
+    "session_cost_usd",
+    "quant_note",
 )
 # provider-qualified opencode id (openrouter/<provider/model>), the plain
 # catalog id (<provider/model>), each with an optional :variant suffix.
@@ -39,7 +49,28 @@ MODEL_ID_RE = re.compile(
     r"(?::[a-zA-Z0-9_.-]+)?$"
 )
 
-CATALOG_SCHEMA_VERSION = 2
+CATALOG_SCHEMA_VERSION = 3
+
+# Duplicated from model_compare.py: build_site_data is subprocess-isolated
+# from the CLI, and the catalog constants are duplicated here by convention
+# (same precedent as CATALOG_ENTRY_KEYS below). The ladder keys are the only
+# quantization labels a recorded endpoint may name besides "unknown" and
+# null; default_precision is restricted to the ladder keys alone -- the
+# derivation never yields the "unknown" sentinel.
+PRECISION_LADDER = {
+    "fp32": 4,
+    "bf16": 3,
+    "fp16": 3,
+    "fp8": 2,
+    "mxfp8": 2,
+    "fp6": 1,
+    "int8": 0,
+    "fp4": -1,
+    "mxfp4": -1,
+    "nvfp4": -1,
+    "int4": -2,
+}
+QUANTIZATION_ENUM = frozenset(PRECISION_LADDER) | {"unknown"}
 
 CATALOG_ENTRY_KEYS = (
     "id",
@@ -58,7 +89,33 @@ CATALOG_ENTRY_KEYS = (
     "aa",
     "quality_match",
     "scores",
+    # Schema v3 additive blocks (Task 8/9): the producer emits all four on
+    # every entry, null when the candidate skipped the endpoint stage.
+    "endpoints",
+    "default_precision",
+    "advertised_pricing",
+    "annotations",
 )
+# Keys of one parsed endpoint (model_compare.parse_endpoints' output shape).
+CATALOG_ENDPOINT_KEYS = (
+    "provider_name",
+    "tag",
+    "quantization",
+    "pricing",
+    "context_length",
+    "status",
+    "service_tier",
+)
+# Keys of the per-model annotations block (design section 4.6).
+CATALOG_ANNOTATION_KEYS = (
+    "price_spread",
+    "cheapest_quantized",
+    "risk_flag",
+    "baseline_context_below_catalog",
+)
+# The OpenRouter session-cost dataset's four turn ranges (brainstorm
+# section 2.6): the only keys a medians cell dict may carry.
+SESSION_COST_TURN_RANGES = ("1-turn", "2-9-turns", "10-49-turns", "50-plus-turns")
 CATALOG_PRICING_KEYS = ("input_per_1m", "output_per_1m", "blended_per_1m")
 CATALOG_BASE_KEYS = ("input_per_1m", "output_per_1m", "blended_per_1m")
 CATALOG_WEEKDAYS = (
@@ -201,6 +258,158 @@ def _validate_price_block(block, label) -> None:
     ]
     if bad:
         raise ValueError(f"{label} must hold non-negative numbers: " + ", ".join(bad))
+
+
+def _validate_catalog_endpoints(endpoints, label) -> None:
+    """Schema v3 endpoint list: null, or parsed endpoint dicts.
+
+    parse_endpoints (Task 3) emits exactly these seven keys with prices
+    parsed to numbers or null -- the shape downstream arithmetic (baseline
+    pricing, annotations) indexes into, so a deviation fails here.
+    """
+    if endpoints is None:
+        return
+    if not isinstance(endpoints, list):
+        raise ValueError(f"{label} must be a list or null")
+    for j, endpoint in enumerate(endpoints):
+        sub = f"{label}[{j}]"
+        if not isinstance(endpoint, dict):
+            raise ValueError(f"{sub} is not an object")
+        missing = [key for key in CATALOG_ENDPOINT_KEYS if key not in endpoint]
+        if missing:
+            raise ValueError(f"{sub} is missing keys: {', '.join(missing)}")
+        for key in ("provider_name", "tag", "service_tier"):
+            value = endpoint[key]
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{sub} {key} must be a string or null")
+        quantization = endpoint["quantization"]
+        if quantization is not None and quantization not in QUANTIZATION_ENUM:
+            raise ValueError(f"{sub} has unknown quantization: {quantization!r}")
+        pricing = endpoint["pricing"]
+        if not isinstance(pricing, dict) or any(
+            key not in pricing for key in ("prompt", "completion")
+        ):
+            raise ValueError(f"{sub} pricing is incomplete")
+        bad = [
+            key
+            for key in ("prompt", "completion")
+            if pricing[key] is not None
+            and (not _is_number(pricing[key]) or pricing[key] < 0)
+        ]
+        if bad:
+            raise ValueError(
+                f"{sub} pricing must hold non-negative numbers or null: "
+                + ", ".join(bad)
+            )
+        for key in ("context_length", "status"):
+            value = endpoint[key]
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool)
+            ):
+                raise ValueError(f"{sub} {key} must be an integer or null")
+
+
+def _validate_catalog_advertised_pricing(advertised, label) -> None:
+    """Schema v3 advertised-pricing block: null, or the models-API scalars.
+
+    The endpoint stage captures the candidate's pre-mutation models-API
+    prices (source-tagged "models-api"); the site shows them next to the
+    baseline prices, so the trio must stay numeric-or-null and the tag
+    exact.
+    """
+    if advertised is None:
+        return
+    if not isinstance(advertised, dict):
+        raise ValueError(f"{label} is not an object")
+    missing = [key for key in CATALOG_BASE_KEYS if key not in advertised]
+    if missing:
+        raise ValueError(f"{label} is missing keys: {', '.join(missing)}")
+    bad = [
+        key
+        for key in CATALOG_BASE_KEYS
+        if advertised[key] is not None
+        and (not _is_number(advertised[key]) or advertised[key] < 0)
+    ]
+    if bad:
+        raise ValueError(
+            f"{label} must hold non-negative numbers or null: " + ", ".join(bad)
+        )
+    if advertised.get("source") != "models-api":
+        raise ValueError(f"{label} source must be 'models-api'")
+
+
+def _validate_catalog_annotations(annotations, label) -> None:
+    """Schema v3 annotations block (design section 4.6): null, or the four
+    annotation fields the CLI and site read."""
+    if annotations is None:
+        return
+    if not isinstance(annotations, dict):
+        raise ValueError(f"{label} is not an object")
+    missing = [key for key in CATALOG_ANNOTATION_KEYS if key not in annotations]
+    if missing:
+        raise ValueError(f"{label} is missing keys: {', '.join(missing)}")
+    spread = annotations["price_spread"]
+    if spread is not None and not _is_number(spread):
+        raise ValueError(f"{label} price_spread must be a number or null")
+    cheapest = annotations["cheapest_quantized"]
+    if cheapest is not None:
+        if not isinstance(cheapest, dict) or any(
+            key not in cheapest for key in ("provider", "quantization", "price")
+        ):
+            raise ValueError(f"{label} cheapest_quantized is incomplete")
+        for key in ("provider", "quantization"):
+            value = cheapest[key]
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"{label} cheapest_quantized {key} must be a string or null"
+                )
+        if not _is_number(cheapest["price"]):
+            raise ValueError(f"{label} cheapest_quantized price must be a number")
+    for key in ("risk_flag", "baseline_context_below_catalog"):
+        if not isinstance(annotations[key], bool):
+            raise ValueError(f"{label} {key} must be a boolean")
+
+
+def _validate_catalog_session_cost(session_cost) -> None:
+    """Top-level session-cost envelope (Task 7), present only when the
+    fetch succeeded: harness attribution, window meta and per-model medians
+    over the dataset's four turn ranges."""
+    if not isinstance(session_cost, dict):
+        raise ValueError("catalog session_cost is not an object")
+    for key in ("attribution", "app_slug", "as_of", "window_end_date"):
+        value = session_cost.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"catalog session_cost {key} must be a non-empty string")
+    window_days = session_cost.get("window_days")
+    if (
+        not isinstance(window_days, int)
+        or isinstance(window_days, bool)
+        or window_days <= 0
+    ):
+        raise ValueError("catalog session_cost window_days must be a positive integer")
+    medians = session_cost.get("medians")
+    if not isinstance(medians, dict):
+        raise ValueError("catalog session_cost medians must be an object")
+    for model_id, cells in medians.items():
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError(
+                "catalog session_cost medians keys must be non-empty id strings"
+            )
+        if not isinstance(cells, dict):
+            raise ValueError(
+                f"catalog session_cost medians {model_id!r} must be an object"
+            )
+        for turn_range, median in cells.items():
+            if turn_range not in SESSION_COST_TURN_RANGES:
+                raise ValueError(
+                    f"catalog session_cost medians {model_id!r} has unknown "
+                    f"turn range: {turn_range!r}"
+                )
+            if median is not None and not _is_number(median):
+                raise ValueError(
+                    f"catalog session_cost medians {model_id!r} {turn_range} "
+                    "must be a number or null"
+                )
 
 
 def validate_catalog(document) -> None:
@@ -392,6 +601,20 @@ def validate_catalog(document) -> None:
             raise ValueError(f"models[{i}] has unknown quality_match")
         if parameters["zdr_required"] and entry["zdr"] is not True:
             raise ValueError(f"models[{i}] is not zdr=true under zdr_required")
+        # Schema v3 additive blocks: the producer emits all four (null when
+        # the candidate skipped the endpoint stage); the shapes downstream
+        # consumers index into are pinned here.
+        default_precision = entry["default_precision"]
+        if default_precision is not None and default_precision not in PRECISION_LADDER:
+            raise ValueError(
+                f"models[{i}] default_precision must be a precision-ladder key "
+                f"or null: {default_precision!r}"
+            )
+        _validate_catalog_endpoints(entry["endpoints"], f"models[{i}] endpoints")
+        _validate_catalog_advertised_pricing(
+            entry["advertised_pricing"], f"models[{i}] advertised_pricing"
+        )
+        _validate_catalog_annotations(entry["annotations"], f"models[{i}] annotations")
     # ids double as the document's primary key for downstream consumers:
     # unique within models, and never also present in filtered.
     model_ids = [entry["id"] for entry in models]
@@ -457,9 +680,13 @@ def validate_catalog(document) -> None:
         schedule_ids.append(entry["id"])
     if len(set(schedule_ids)) != len(schedule_ids):
         raise ValueError("catalog schedules contain duplicate ids")
+    # Session-cost envelope (Task 7): present only when the fetch succeeded
+    # (consumers branch on key presence, never on a null shape).
+    if "session_cost" in document:
+        _validate_catalog_session_cost(document["session_cost"])
 
 
-HISTORY_SCHEMA_VERSION = 2
+HISTORY_SCHEMA_VERSION = 3
 HISTORY_RETENTION = 10
 HISTORY_TOP_N = 20
 
@@ -713,8 +940,9 @@ def order_rows(rows, ranking) -> list:
 
 # data.json's own contract version: additive changes are free; renaming,
 # removing, or changing the meaning of a field bumps it (mirrors the catalog
-# and history documents).
-DATA_SCHEMA_VERSION = 1
+# and history documents). v2: the five provider-aware row keys became part
+# of ROW_KEYS' required set (print_json emits them on every row).
+DATA_SCHEMA_VERSION = 2
 
 
 def project_schedules(catalog) -> list:

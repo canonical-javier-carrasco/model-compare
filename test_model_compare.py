@@ -1737,21 +1737,31 @@ def _endpoint_stage_eps():
     baseline blended price (0.25/M) is clearly below the models-API blended
     price a candidate carries before the stage runs (1.25/M with make_model's
     default pricing).
+
+    Parsed through mc.parse_endpoints: this is the stand-in for
+    fetch_model_endpoints' return value, which is parse_endpoints' output
+    (numeric prices, the overrides key) -- not the raw API payload. The
+    catalog document carries these dicts verbatim, and the site validator
+    demands the parsed shape.
     """
-    return [
-        _endpoint(
-            provider_name="Z.AI",
-            tag="z-ai/fp8",
-            quantization="fp8",
-            pricing={"prompt": "0.0000002", "completion": "0.0000004"},
-        ),
-        _endpoint(
-            provider_name="DeepInfra",
-            tag="deepinfra/fp4",
-            quantization="fp4",
-            pricing={"prompt": "0.0000001", "completion": "0.0000002"},
-        ),
-    ]
+    return mc.parse_endpoints(
+        {
+            "data": [
+                _endpoint(
+                    provider_name="Z.AI",
+                    tag="z-ai/fp8",
+                    quantization="fp8",
+                    pricing={"prompt": "0.0000002", "completion": "0.0000004"},
+                ),
+                _endpoint(
+                    provider_name="DeepInfra",
+                    tag="deepinfra/fp4",
+                    quantization="fp4",
+                    pricing={"prompt": "0.0000001", "completion": "0.0000002"},
+                ),
+            ]
+        }
+    )
 
 
 def _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id, fail_ids=()):
@@ -1808,7 +1818,7 @@ def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
     # The fetch succeeded, so the cache written moments ago backs the
     # display annotations, marked stale (the model is not ranked on them).
     assert entry["annotations"]["stale"] is True
-    _validate_catalog_interim(monkeypatch, doc)
+    bsd.validate_catalog(doc)
 
 
 def test_candidate_pricing_replaced_by_baseline(monkeypatch):
@@ -3758,33 +3768,9 @@ def test_parse_iso_datetime_bad():
 
 # Test-file mirror of the producer/validator contract so the key set lives
 # in exactly two places: the producer (build_catalog) and the validator it
-# feeds. bsd.CATALOG_ENTRY_KEYS already carries the "aa" trio.
+# feeds. bsd.CATALOG_ENTRY_KEYS carries the "aa" trio plus Task 9's four
+# schema-v3 additive blocks.
 CATALOG_ENTRY_KEYS = set(bsd.CATALOG_ENTRY_KEYS)
-
-# Schema v3 (Task 8) adds four provider-aware keys to every entry. Task 9's
-# validator bump folds them into bsd.CATALOG_ENTRY_KEYS, collapsing this
-# back to the plain set -- until then the entry-shape guard pins the exact
-# v3 key set instead of loosening to a subset check.
-CATALOG_ENTRY_KEYS_V3 = CATALOG_ENTRY_KEYS | {
-    "endpoints",
-    "default_precision",
-    "advertised_pricing",
-    "annotations",
-}
-
-
-def _validate_catalog_interim(monkeypatch, doc):
-    """bsd.validate_catalog with the schema_version check aligned to the producer.
-
-    INTERIM (Task 8 -> Task 9): the producer emits schema_version 3 while
-    the validator still demands 2 -- the planned one-task window between
-    the two tasks. Pinning the validator's constant to the producer's keeps
-    every structural check of the drift guard active; Task 9 bumps
-    bsd.CATALOG_SCHEMA_VERSION to 3 and every call site collapses back to
-    plain bsd.validate_catalog(doc).
-    """
-    monkeypatch.setattr(bsd, "CATALOG_SCHEMA_VERSION", mc.CATALOG_SCHEMA_VERSION)
-    bsd.validate_catalog(doc)
 
 
 def catalog_pool(**overrides):
@@ -3918,7 +3904,7 @@ def test_catalog_entry_shape():
     doc = build_doc()
     assert {e["id"] for e in doc["models"]} == {"acme/model-a", "acme/model-b"}
     for entry in doc["models"]:
-        assert set(entry) == CATALOG_ENTRY_KEYS_V3
+        assert set(entry) == CATALOG_ENTRY_KEYS
         assert set(entry["pricing"]) == {
             "input_per_1m",
             "output_per_1m",
@@ -4310,11 +4296,11 @@ def test_catalog_rankings_deterministic_across_builds_and_input_order():
     assert mc.catalog_rankings(list(reversed(candidates)), weights) == first
 
 
-def test_cli_json_rows_project_cleanly_onto_catalog_rankings(monkeypatch, capsys):
+def test_cli_json_rows_project_cleanly_onto_catalog_rankings(capsys):
     # Cross-program check: real --json rows (top 2) per priority and the real
     # catalog pass the site's order_rows / validate_catalog / build_snapshot.
     doc = _inverting_catalog()
-    _validate_catalog_interim(monkeypatch, doc)
+    bsd.validate_catalog(doc)
     priorities = {}
     for priority in mc.PRIORITY_WEIGHTS:
         args, models, zdr, quality_by_id = inverting_pool()
@@ -4341,10 +4327,10 @@ def test_catalog_deterministic_modulo_generated_at():
     assert doc1 == doc2
 
 
-def test_catalog_document_passes_site_validator(monkeypatch):
+def test_catalog_document_passes_site_validator():
     # drift between the producer and the site validator must fail the
     # suite here, not the publish
-    _validate_catalog_interim(monkeypatch, build_doc())  # must not raise
+    bsd.validate_catalog(build_doc())  # must not raise
 
     # mixed provenance (OR benchmarks + AA api fallback) must survive too
     args, models, candidates, dropped, filtered, discounts, _, _, aa_by_id = (
@@ -4375,7 +4361,7 @@ def test_catalog_document_passes_site_validator(monkeypatch):
         "matched": 2,
         "matched_openrouter": 1,
     }
-    _validate_catalog_interim(monkeypatch, doc)  # must not raise
+    bsd.validate_catalog(doc)  # must not raise
 
 
 def test_catalog_aa_block_carries_or_trio():
@@ -4770,14 +4756,14 @@ def test_catalog_aa_fallback_tracks_aa_source(aa_source, fallback):
     assert doc["sources"]["aa"]["fallback"] == fallback
 
 
-def test_catalog_aa_fallback_not_masked_by_openrouter_matches(monkeypatch):
+def test_catalog_aa_fallback_not_masked_by_openrouter_matches():
     # Regression: the publish gate read mode alone, and any OpenRouter
     # match turned a failed AA API into mode "openrouter".
     doc = build_doc(aa_source=None)
     assert doc["sources"]["aa"]["matched_openrouter"] > 0
     assert doc["sources"]["aa"]["mode"] == "openrouter"
     assert doc["sources"]["aa"]["fallback"] == "none"
-    _validate_catalog_interim(monkeypatch, doc)  # must not raise
+    bsd.validate_catalog(doc)  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -5091,3 +5077,19 @@ def test_json_rows_carry_session_cost_usd(monkeypatch, capsys):
     assert rows["z-ai/glm"]["session_cost_usd"] == pytest.approx(0.42)
     # A model the dataset does not cover degrades to None.
     assert rows["acme/plain"]["session_cost_usd"] is None
+
+
+def test_best_run_skips_session_cost_fetch(monkeypatch, capsys):
+    # The session-cost medians surface only in --catalog/--json output, so
+    # a keyed --best run must not pay the paginated fetch (Task 9's run()
+    # gate). The stub raises: any fetch attempt fails the test loudly.
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    _stub_endpoint_pipeline(monkeypatch, models, {"z-ai/glm": _endpoint_stage_eps()})
+
+    def boom(args):
+        raise AssertionError("session-cost fetch must be skipped for --best")
+
+    monkeypatch.setattr(mc, "fetch_session_cost", boom)
+    args = make_args(min_context=0, best=True, openrouter_api_key="sk-or")
+    assert mc.run(args, models, False) == 0
+    assert capsys.readouterr().out.strip() == "openrouter/z-ai/glm"

@@ -2883,19 +2883,24 @@ def run(args, models, or_cached) -> int:
     )
     weights = compute_scores(candidates, args, quality_by_id)
 
-    # Per-task session-cost medians (Task 7): one fetch per invocation,
-    # shared by every output path (--catalog block, --json rows; publish
-    # runs --json per priority, so the cache makes the repeat cost free).
-    # Keyless, fetch_session_cost returns None before any network or cache
-    # access, keeping scripting paths cheap.
-    session_cost = fetch_session_cost(args)
-    # The key-presence fact distinguishes "skipped" from "unavailable";
-    # same expression fetch_session_cost uses for its own guard.
-    session_cost_mode = (
-        "skipped"
-        if not (args.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY"))
-        else ("ok" if session_cost else "unavailable")
-    )
+    # Per-task session-cost medians (Task 7): one fetch per invocation, but
+    # only on the output paths that surface it (--catalog block, --json
+    # rows; publish runs --json per priority, so the cache makes the repeat
+    # cost free). A keyed --best/plain run skips the paginated fetch
+    # entirely -- the medians never reach those outputs. Keyless,
+    # fetch_session_cost returns None before any network or cache access.
+    if args.catalog or args.json:
+        session_cost = fetch_session_cost(args)
+        # The key-presence fact distinguishes "skipped" from "unavailable";
+        # same expression fetch_session_cost uses for its own guard.
+        session_cost_mode = (
+            "skipped"
+            if not (args.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY"))
+            else ("ok" if session_cost else "unavailable")
+        )
+    else:
+        session_cost = None
+        session_cost_mode = "skipped"
     # run() owns the per-candidate attachment (build_catalog stays pure);
     # print_json reads it for the session_cost_usd display cell.
     for cand in candidates:

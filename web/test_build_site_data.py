@@ -22,6 +22,13 @@ def make_row(**overrides):
         "discount_pct": "--",
         "context_tokens": 2_000_000,
         "age_days": 10.0,
+        # data.json v2 row keys (Task 9): print_json always emits them, and
+        # the nulls are the pre-endpoint degradation the producer prints.
+        "default_precision": None,
+        "risk_flag": None,
+        "price_spread": None,
+        "session_cost_usd": None,
+        "quant_note": None,
     }
     row.update(overrides)
     return row
@@ -336,6 +343,12 @@ def make_catalog_entry(**overrides):
             "age": 0.94,
             "overall": {"balanced": 0.85, "price": 0.82, "quality": 0.86},
         },
+        # Catalog v3 additive blocks (Task 9): null when the candidate
+        # skipped the endpoint stage -- the producer's degradation shape.
+        "endpoints": None,
+        "default_precision": None,
+        "advertised_pricing": None,
+        "annotations": None,
     }
     entry.update(overrides)
     return entry
@@ -343,7 +356,7 @@ def make_catalog_entry(**overrides):
 
 def make_catalog():
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "tool": "model-compare",
         "generated_at": "2026-09-02T09:15:00+00:00",
         "parameters": {
@@ -597,7 +610,7 @@ def test_main_writes_catalog_next_to_data_json(tmp_path):
     assert bsd.main(argv) == 0
     catalog_path = out.parent / "catalog.json"
     written = json.loads(catalog_path.read_text())
-    assert written["schema_version"] == 2
+    assert written["schema_version"] == 3
     assert written["models"][0]["id"] == "acme/model-a"
     assert out.exists()  # data.json still written
 
@@ -660,7 +673,7 @@ def make_history_snapshot(date, generated_at, **overrides):
 
 def make_history(**overrides):
     doc = {
-        "schema_version": 2,
+        "schema_version": 3,
         "updated_at": "2026-08-26T09:15:00+00:00",
         "snapshots": {
             "2026-08-26": make_history_snapshot(
@@ -791,7 +804,7 @@ def test_merge_history_upserts_and_prunes():
     assert len(merged["snapshots"]) == 10
     assert merged["snapshots"][today] == snap
     assert merged["updated_at"] == "2026-09-02T09:15:00+00:00"
-    assert merged["schema_version"] == 2
+    assert merged["schema_version"] == 3
 
 
 def test_merge_history_same_day_last_write_wins():
@@ -858,12 +871,12 @@ def test_merge_history_drops_prev_snapshot_with_corrupt_ranks():
 
 def test_merge_history_rejects_unknown_schema_version():
     prev = make_history()
-    prev["schema_version"] = 3
+    prev["schema_version"] = 4
     merged = bsd.merge_history(
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 2
+    assert merged["schema_version"] == 3
 
 
 def test_merge_history_tolerates_prev_without_schema_version():
@@ -959,7 +972,7 @@ def test_validate_history_happy_and_rejections():
     doc["updated_at"] = "2026-09-02T09:15:00+00:00"
     bsd.validate_history(doc)  # must not raise
     with pytest.raises(ValueError):
-        bsd.validate_history({"schema_version": 3})
+        bsd.validate_history({"schema_version": 4})
     bad = make_history()
     bad["snapshots"]["2026-08-26"]["tabs"]["balanced"][0]["rank"] = 5
     with pytest.raises(ValueError):
@@ -1573,7 +1586,7 @@ def test_build_data_schedules_key():
 
 def test_build_data_emits_schema_version():
     data = bsd.build_data("openrouter/acme/model-a", make_priorities())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
 
 
 def test_row_keys_optional_passthrough():
@@ -1594,4 +1607,230 @@ def test_merge_history_resets_v1():
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 2
+    assert merged["schema_version"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Catalog v3: provider-aware blocks, data.json v2 rows, history v3 reset
+# ---------------------------------------------------------------------------
+
+
+def _v3_entry_blocks():
+    """Realistic schema-v3 additive blocks for one entry (producer shapes)."""
+    return {
+        "endpoints": [
+            {
+                "provider_name": "Z.AI",
+                "tag": "z-ai/fp8",
+                "quantization": "fp8",
+                "pricing": {
+                    "prompt": 0.0000002,
+                    "completion": 0.0000004,
+                    "overrides": None,
+                },
+                "context_length": 262144,
+                "status": 0,
+                "service_tier": None,
+            }
+        ],
+        "default_precision": "fp8",
+        "advertised_pricing": {
+            "input_per_1m": 1.0,
+            "output_per_1m": 2.0,
+            "blended_per_1m": 1.25,
+            "source": "models-api",
+        },
+        "annotations": {
+            "price_spread": 0.5,
+            "cheapest_quantized": {
+                "provider": "DeepInfra",
+                "quantization": "fp4",
+                "price": 0.00000005,
+            },
+            "risk_flag": True,
+            "baseline_context_below_catalog": False,
+        },
+    }
+
+
+def _v3_session_cost():
+    return {
+        "attribution": "Data © OpenRouter, CC BY 4.0",
+        "app_slug": "hermes-agent",
+        "as_of": "2026-10-15T00:00:00Z",
+        "window_days": 30,
+        "window_end_date": "2026-10-12",
+        "medians": {
+            "acme/model-a": {
+                "1-turn": 0.05,
+                "2-9-turns": 0.10,
+                "10-49-turns": 1.74,
+                "50-plus-turns": 9.99,
+            }
+        },
+    }
+
+
+def test_validate_catalog_accepts_v3_blocks():
+    doc = make_catalog()
+    doc["models"][0].update(_v3_entry_blocks())
+    doc["session_cost"] = _v3_session_cost()
+    bsd.validate_catalog(doc)  # must not raise
+    # Keyless degradation shapes the producer emits: blocks null, the
+    # session-cost key absent entirely.
+    bsd.validate_catalog(make_catalog())  # must not raise
+
+
+def test_validate_catalog_rejects_v2_document():
+    doc = make_catalog()
+    doc["schema_version"] = 2
+    with pytest.raises(ValueError, match="schema_version"):
+        bsd.validate_catalog(doc)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda ep: ep.update(status="0"),  # not an int
+        lambda ep: ep.update(quantization="int16"),  # no ladder label, not null
+        lambda ep: ep["pricing"].update(prompt="0.2"),  # price must be numeric
+        lambda ep: ep.update(provider_name=7),
+        lambda ep: ep.update(tag=["z-ai/fp8"]),
+        lambda ep: ep.update(context_length=262144.0),
+        lambda ep: ep.pop("service_tier"),
+        lambda ep: ep["pricing"].pop("completion"),
+    ],
+)
+def test_validate_catalog_rejects_bad_endpoint_entry(mutate):
+    doc = make_catalog()
+    doc["models"][0].update(_v3_entry_blocks())
+    mutate(doc["models"][0]["endpoints"][0])
+    with pytest.raises(ValueError):
+        bsd.validate_catalog(doc)
+
+
+def test_validate_catalog_rejects_bad_default_precision():
+    # "unknown" never leaves the derivation: default_precision is a ladder
+    # key or null, never the sentinel the endpoints themselves may carry.
+    doc = make_catalog()
+    doc["models"][0].update(_v3_entry_blocks())
+    doc["models"][0]["default_precision"] = "unknown"
+    with pytest.raises(ValueError, match="default_precision"):
+        bsd.validate_catalog(doc)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda doc: doc["models"][0]["annotations"].update(price_spread="0.5"),
+        lambda doc: doc["models"][0]["annotations"].update(risk_flag="yes"),
+        lambda doc: doc["models"][0]["annotations"].update(
+            baseline_context_below_catalog=None
+        ),
+        lambda doc: doc["models"][0]["annotations"].update(
+            cheapest_quantized={"provider": "X", "quantization": "fp4"}
+        ),  # no price
+        lambda doc: doc["models"][0]["annotations"].update(
+            cheapest_quantized={"provider": "X", "quantization": "fp4", "price": "5"}
+        ),
+        lambda doc: doc["models"][0]["annotations"].pop("price_spread"),
+        lambda doc: doc["models"][0].update(annotations="garbage"),
+        lambda doc: doc["models"][0]["advertised_pricing"].update(input_per_1m="1.0"),
+        lambda doc: doc["models"][0]["advertised_pricing"].update(source="scrape"),
+        lambda doc: doc["models"][0]["advertised_pricing"].pop("source"),
+        lambda doc: doc["models"][0]["advertised_pricing"].pop("blended_per_1m"),
+        lambda doc: doc["models"][0].update(advertised_pricing=[]),
+    ],
+)
+def test_validate_catalog_rejects_bad_annotation_and_advertised_blocks(mutate):
+    doc = make_catalog()
+    doc["models"][0].update(_v3_entry_blocks())
+    mutate(doc)
+    with pytest.raises(ValueError):
+        bsd.validate_catalog(doc)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda doc: doc["session_cost"].update(window_days=0),
+        lambda doc: doc["session_cost"].update(window_days=1.5),
+        lambda doc: doc["session_cost"].update(window_days="30"),
+        lambda doc: doc["session_cost"].update(as_of=None),
+        lambda doc: doc["session_cost"].update(attribution=""),
+        lambda doc: doc["session_cost"].update(medians="garbage"),
+        lambda doc: doc["session_cost"]["medians"].update({"": {}}),
+        lambda doc: doc["session_cost"]["medians"]["acme/model-a"].update(
+            {"10-49-turns": "1.74"}
+        ),  # median must be numeric
+        lambda doc: doc["session_cost"]["medians"]["acme/model-a"].update(
+            {"100-plus-turns": 1.0}
+        ),  # not one of the dataset's four turn ranges
+    ],
+)
+def test_validate_catalog_rejects_bad_session_cost_block(mutate):
+    doc = make_catalog()
+    doc["models"][0].update(_v3_entry_blocks())
+    doc["session_cost"] = _v3_session_cost()
+    mutate(doc)
+    with pytest.raises(ValueError):
+        bsd.validate_catalog(doc)
+
+
+def test_rows_carry_new_keys_ordered_by_ranking():
+    # data.json v2 rows: the five additive keys survive the projection onto
+    # the catalog rankings (same fence as the pre-existing keys).
+    catalog = _ranked_catalog()
+    by_id = {
+        "acme/a": {
+            "default_precision": "fp8",
+            "risk_flag": False,
+            "price_spread": 0.5,
+            "session_cost_usd": 0.42,
+            "quant_note": None,
+        },
+        "acme/b": {
+            "default_precision": None,
+            "risk_flag": True,
+            "price_spread": None,
+            "session_cost_usd": None,
+            "quant_note": "cheapest non-baseline: fp4 @ DeepInfra",
+        },
+        "acme/c": {
+            "default_precision": "int4",
+            "risk_flag": True,
+            "price_spread": 2.0,
+            "session_cost_usd": 0.9,
+            "quant_note": None,
+        },
+    }
+    rows = {}
+    for priority in bsd.PRIORITIES:
+        scrambled = sorted(catalog["rankings"][priority], reverse=True)
+        rows[priority] = [
+            make_row(
+                model=model_id,
+                opencode_model=f"openrouter/{model_id}",
+                **by_id[model_id],
+            )
+            for model_id in scrambled
+        ]
+    data = bsd.build_data("acme/a", rows, catalog=catalog)
+    assert data["schema_version"] == 2
+    for priority in bsd.PRIORITIES:
+        for row, model_id in zip(
+            data["priorities"][priority], catalog["rankings"][priority]
+        ):
+            for key, value in by_id[model_id].items():
+                assert row[key] == value, (priority, model_id, key)
+
+
+def test_merge_history_resets_on_v2_history():
+    # The live site's pre-bump history (v2) must not be merged into a v3
+    # document: any explicit version but the current one starts fresh.
+    prev = make_history(schema_version=2)
+    merged = bsd.merge_history(
+        prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
+    )
+    assert list(merged["snapshots"]) == ["2026-09-02"]
+    assert merged["schema_version"] == 3
