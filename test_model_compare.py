@@ -1058,6 +1058,71 @@ def test_first_party_author_and_partner():
 
 
 # ---------------------------------------------------------------------------
+# Provider-aware eval: endpoint fetch, parsing, variant + schedule gate
+# ---------------------------------------------------------------------------
+
+
+def _endpoint(**overrides):
+    """One entry of OpenRouter's per-model endpoints list (live shape)."""
+    base = {
+        "provider_name": "Z.AI",
+        "tag": "z-ai/fp8",
+        "quantization": "fp8",
+        "pricing": {"prompt": "0.00000015", "completion": "0.0000005"},
+        "context_length": 262144,
+        "status": 0,
+        "service_tier": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_parse_endpoints_keeps_verified_fields():
+    eps = mc.parse_endpoints({"data": [_endpoint()]})
+    assert eps[0]["provider_name"] == "Z.AI" and eps[0]["status"] == 0
+    assert eps[0]["pricing"]["prompt"] == 0.00000015
+    assert eps[0]["pricing"]["completion"] == 0.0000005
+    assert eps[0]["tag"] == "z-ai/fp8"
+    assert eps[0]["quantization"] == "fp8"
+    assert eps[0]["context_length"] == 262144
+    assert eps[0]["service_tier"] is None
+
+
+def test_variant_detection_marker_and_zero_price():
+    assert mc.is_variant_endpoint(_endpoint(tag="z-ai:free"))
+    assert mc.is_variant_endpoint(_endpoint(tag="z-ai:batch"))  # marker, not price
+    assert mc.is_variant_endpoint(_endpoint(pricing={"prompt": "0", "completion": "0"}))
+    assert not mc.is_variant_endpoint(_endpoint())
+
+
+def test_endpoint_schedule_gate_uses_full_schedule_error():
+    assert mc.endpoint_schedule_ok(_endpoint(), make_args())
+    broken = _endpoint(
+        pricing={
+            "prompt": "0.1",
+            "completion": "0.1",
+            "overrides": [
+                # overrides entries are a LIST (live shape, haiku_pricing());
+                # this one is a malformed window ("25:99" is no valid HHMM)
+                {"utc_days": ["monday"], "utc_start": "25:99", "utc_end": "01:00"}
+            ],
+        }
+    )
+    assert not mc.endpoint_schedule_ok(broken, make_args())
+
+
+def test_load_cache_expired_returns_stale_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    mc.save_cache("k", {"v": 1})
+    path = Path(mc.cache_path("k"))
+    blob = json.loads(path.read_text())
+    blob["fetched_at"] = time.time() - 99999
+    path.write_text(json.dumps(blob))
+    assert mc.load_cache("k", 3600) is None  # past TTL: the fresh load drops it
+    assert mc.load_cache_expired("k") == {"v": 1}  # ...but the stale load keeps it
+
+
+# ---------------------------------------------------------------------------
 # Tiered pricing: CLI display (TIER column, legend, --json keys)
 # ---------------------------------------------------------------------------
 

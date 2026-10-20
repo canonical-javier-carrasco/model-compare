@@ -298,6 +298,120 @@ def save_cache(name: str, payload) -> None:
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter endpoints (per-model provider list)
+# ---------------------------------------------------------------------------
+
+
+OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{id}/endpoints"
+
+
+def load_cache_expired(name: str) -> dict | None:
+    """Return the cached payload regardless of age; None when absent/corrupt.
+
+    load_cache drops payloads past their TTL; this variant serves them anyway
+    so a dropped model's last known endpoint annotations can still be shown
+    (marked stale by the caller). Never used for ranking.
+    """
+    path = cache_path(name)
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            blob = json.load(fh)
+        return blob["payload"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def parse_endpoints(payload) -> list[dict]:
+    """Keep the verified per-endpoint fields of an endpoints response.
+
+    `pricing` keeps prompt/completion (parsed through parse_price) and the
+    raw `overrides` list -- the tiered-pricing machinery parses the entries
+    itself. Fields beyond the verified live shape (brainstorm section 2.1)
+    are dropped, and the parse keeps `status` as-is (the caller filters).
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    endpoints = []
+    for entry in data or []:
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("pricing")
+        raw_pricing = raw if isinstance(raw, dict) else {}
+        endpoints.append(
+            {
+                "provider_name": entry.get("provider_name"),
+                "tag": entry.get("tag"),
+                "quantization": entry.get("quantization"),
+                "pricing": {
+                    "prompt": parse_price(raw_pricing.get("prompt")),
+                    "completion": parse_price(raw_pricing.get("completion")),
+                    "overrides": raw_pricing.get("overrides"),
+                },
+                "context_length": entry.get("context_length"),
+                "status": entry.get("status"),
+                "service_tier": entry.get("service_tier"),
+            }
+        )
+    return endpoints
+
+
+def fetch_model_endpoints(model_id: str, args) -> list[dict]:
+    """Fetch + parse one model's endpoint list, cached per model.
+
+    The cache name flattens the model id ("/" -> "_") to keep the cache
+    files flat. Fetches retry 3 times (4 attempts total) via fetch_json,
+    which raises at once on 4xx and after the retries on 5xx/network
+    errors -- the caller owns the fail-closed policy.
+    """
+    cache_name = f"endpoints:{model_id.replace('/', '_')}"
+    if not args.no_cache:
+        cached = load_cache(cache_name, args.cache_ttl)
+        if cached:
+            return cached
+    payload = fetch_json(
+        OPENROUTER_ENDPOINTS_URL.format(id=model_id), timeout=30, retries=3
+    )
+    endpoints = parse_endpoints(payload)
+    save_cache(cache_name, endpoints)
+    return endpoints
+
+
+def is_variant_endpoint(endpoint) -> bool:
+    """True iff the endpoint is a :free/:batch variant or entirely free.
+
+    Variant iff its slug or tag carries a `:free`/`:batch` marker OR both
+    input and output prices are zero. `:batch` is cheaper-but-restricted,
+    not zero-priced -- only the marker test catches it. Missing or
+    unparseable prices are not zero.
+    """
+    for field in ("slug", "tag"):
+        marker = endpoint.get(field)
+        if isinstance(marker, str) and (":free" in marker or ":batch" in marker):
+            return True
+    pricing = endpoint.get("pricing")
+    prices = pricing if isinstance(pricing, dict) else {}
+    return (
+        parse_price(prices.get("prompt")) == 0.0
+        and parse_price(prices.get("completion")) == 0.0
+    )
+
+
+def endpoint_schedule_ok(endpoint, args) -> bool:
+    """False iff the endpoint's pricing.overrides fails the v2 schedule rule.
+
+    Reuses effective_pricing in full: the gate fires on malformed windows,
+    exactly-one-of utc_start/utc_end pairs, bad utc_days, combined
+    token+time entries and missing inheritance -- not just non-tiling
+    windows. An endpoint without overrides has no schedule to fail.
+    """
+    result = effective_pricing(
+        endpoint.get("pricing"), args.min_context, args.input_share
+    )
+    return not result["schedule_error"]
+
+
+# ---------------------------------------------------------------------------
 # OpenRouter catalog
 # ---------------------------------------------------------------------------
 
