@@ -3,14 +3,17 @@
 // <script> block extracted from web/site/index.html).
 //
 // Only what the script touches at evaluation time: element lookups,
-// tab/expander wiring, and the three fetch() calls (rejected, so the
+// tab/expander wiring, and the four fetch() calls (rejected, so the
 // page ends in its error path and pure helpers stay callable).
 //
 // Limitation: these shims only support evaluating the script's pure
-// helpers (tooltip sentence construction, formatters, guards). Tooltip
-// delivery (the td.title assignment inside render) and DOM wiring are
-// not exercised: fetch() rejects so render() never runs, getElementById
-// hands out a fresh stub per call, and there is no querySelector.
+// helpers (tooltip sentence construction, formatters, guards) plus the
+// built-element shape of endpointRow()/baselineNote() — appendChild
+// records children so a driver can walk the disclosure DOM the script
+// built. Tooltip delivery (the td.title assignment inside render),
+// event wiring, and the live fetch flows are not exercised: fetch()
+// rejects so render() never runs, getElementById hands out a fresh
+// stub per call, and there is no querySelector.
 
 function stubElement() {
   return {
@@ -19,6 +22,9 @@ function stubElement() {
     disabled: false,
     title: "",
     className: "",
+    colSpan: 0,
+    tabIndex: 0,
+    children: [],
     dataset: {},
     style: {},
     classList: {
@@ -27,7 +33,10 @@ function stubElement() {
       remove: function () {},
     },
     addEventListener: function () {},
-    appendChild: function () {},
+    appendChild: function (child) {
+      this.children.push(child);
+      return child;
+    },
     remove: function () {},
     select: function () {},
   };

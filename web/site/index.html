@@ -155,6 +155,17 @@
       #table .na {
         color: var(--muted);
       }
+      #table tbody tr[role="button"] {
+        cursor: pointer;
+      }
+      #table tbody tr[role="button"]:focus {
+        outline: 1px solid var(--flat);
+        outline-offset: -2px;
+      }
+      #table .endpoint-note {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
       #table tr.endpoint-row td {
         padding: 0.5rem 0.75rem 1rem;
         background: var(--row-alt, transparent);
@@ -518,6 +529,10 @@
       var historyData = null;
       var catalogData = null;
       var endpointExpanded = {};
+      // Artifact failures compose into one status line (renderStatus) so
+      // the catalog catch can't clobber a data.json error.
+      var dataError = null;
+      var catalogError = false;
       var current = "balanced";
 
       // NOTE: fmtPrice/fmtContext/fmtAge mirror the fmt_* helpers in
@@ -760,6 +775,10 @@
       var DEFAULT_MAIN_ROWS = 10;
       var DEFAULT_DEAL_ROWS = 5;
       var FULL_DEAL_ROWS = 10;
+      // Column count of the main ranking table; the endpoint disclosure row
+      // spans all of them. Kept in sync with the markup's <th> count by
+      // web/test_site_js.py -- bump both when a column is added.
+      var MAIN_TABLE_COLS = 13;
       var mainExpanded = false;
       var dealsExpanded = false;
 
@@ -820,11 +839,37 @@
         };
       }
 
-      function endpointRow(entry) {
+      // Disclosure note: shown instead of silence when the entry's pricing
+      // scalars fail to pin exactly one baseline endpoint -- ambiguous
+      // (several match) or empty (none do); the "✓" would be a guess either
+      // way. Silent when there is nothing to mark (no endpoints at all).
+      function baselineNote(entry) {
+        if (
+          !entry ||
+          !Array.isArray(entry.endpoints) ||
+          !entry.endpoints.length
+        ) {
+          return null;
+        }
+        var matches = endpointRows(entry).filter(function (r) {
+          return r.isBaseline;
+        }).length;
+        if (matches === 1) return null;
+        return "baseline endpoint ambiguous — no marker";
+      }
+
+      function endpointRow(entry, catalogLoaded) {
         var tr = document.createElement("tr");
         tr.className = "endpoint-row";
         var td = document.createElement("td");
-        td.colSpan = 12;
+        td.colSpan = MAIN_TABLE_COLS;
+        if (!catalogLoaded) {
+          // Artifact-level: catalog.json itself is missing or failed to
+          // load -- distinct from the model-level join miss below.
+          td.textContent = "endpoint details unavailable — catalog fetch failed";
+          tr.appendChild(td);
+          return tr;
+        }
         if (!entry) {
           td.textContent = "No endpoint data for this model.";
           tr.appendChild(td);
@@ -872,6 +917,13 @@
         });
         table.appendChild(tbody);
         td.appendChild(table);
+        var note = baselineNote(entry);
+        if (note) {
+          var p = document.createElement("p");
+          p.className = "endpoint-note";
+          p.textContent = note;
+          td.appendChild(p);
+        }
         tr.appendChild(td);
         return tr;
       }
@@ -961,13 +1013,27 @@
             }
             tr.appendChild(td);
           });
+          // Keyboard-operable disclosure toggle: the row is a button, so
+          // Enter and Space both flip it (Space must not scroll the page).
+          tr.tabIndex = 0;
+          tr.setAttribute("role", "button");
+          tr.setAttribute(
+            "aria-expanded",
+            endpointExpanded[row.model] ? "true" : "false"
+          );
           tr.addEventListener("click", function () {
+            endpointExpanded[row.model] = !endpointExpanded[row.model];
+            render();
+          });
+          tr.addEventListener("keydown", function (ev) {
+            if (ev.key !== "Enter" && ev.key !== " ") return;
+            if (ev.key === " ") ev.preventDefault();
             endpointExpanded[row.model] = !endpointExpanded[row.model];
             render();
           });
           els.tbody.appendChild(tr);
           if (endpointExpanded[row.model]) {
-            els.tbody.appendChild(endpointRow(entry));
+            els.tbody.appendChild(endpointRow(entry, catalogData));
           }
         });
         var model = topModel();
@@ -1096,6 +1162,22 @@
         });
       }
 
+      // Both artifact failures compose into one status line: the catalog
+      // catch must not clobber a data.json error (the fetches are parallel,
+      // so either may reject first).
+      function renderStatus() {
+        var parts = [];
+        if (dataError !== null) {
+          parts.push("Could not load data.json: " + dataError);
+        }
+        if (catalogError) {
+          parts.push("endpoint details unavailable (catalog fetch failed)");
+        }
+        if (!parts.length) return;
+        els.status.textContent = parts.join(" ; ");
+        els.status.hidden = false;
+      }
+
       function init() {
         els.aliasHint.textContent = "alias oc-best='" + CURL_COMMAND + "'";
         els.curlValue.textContent = CURL_COMMAND;
@@ -1151,8 +1233,8 @@
             render();
           })
           .catch(function (err) {
-            els.status.textContent = "Could not load data.json: " + err.message;
-            els.status.hidden = false;
+            dataError = err.message;
+            renderStatus();
           });
 
         fetch("history.json", { cache: "no-cache" })
@@ -1189,10 +1271,8 @@
             render();
           })
           .catch(function () {
-            catalogData = null;
-            els.status.textContent =
-              "Endpoint details unavailable: catalog.json failed to load.";
-            els.status.hidden = false;
+            catalogError = true;
+            renderStatus();
           });
       }
 

@@ -401,10 +401,12 @@ def test_fmt_ctx_caveat_null_when_annotation_false():
 
 
 def test_fmt_ctx_caveat_null_when_no_baseline():
-    # No endpoint matches the entry pricing, so there is no baseline context
-    # to cite -- the caveat is withheld rather than guessing.
+    # Annotation flag is set but no endpoint matches the entry pricing, so
+    # no baseline endpoint can be pinned and there is no context to cite --
+    # the caveat is withheld rather than guessing.
     entry = CATALOG_ENTRY_JS.replace(
-        "baseline_context_below_catalog: true", "baseline_context_below_catalog: false"
+        "pricing: { prompt: 1.25e-6, completion: 10e-6 }",
+        "pricing: { prompt: 9e-6, completion: 90e-6 }",
     )
     assert run_js(f"fmtCtxCaveat({entry}, {{context_tokens: 1048576}})") is None
 
@@ -580,3 +582,81 @@ def test_endpoint_rows_no_match_marks_none():
     """
     out = run_js(f"endpointRows({entry})")
     assert out[0]["isBaseline"] is False
+
+
+# ---------------------------------------------------------------------------
+# Disclosure note (baseline ambiguity), artifact-level vs model-level text,
+# and the MAIN_TABLE_COLS colSpan pin.
+
+
+def test_baseline_note_null_for_single_baseline():
+    # One endpoint matching the entry pricing: one baseline, no note.
+    assert run_js(f"baselineNote({CATALOG_ENTRY_JS})") is None
+
+
+def test_baseline_note_ambiguous():
+    # Two endpoints at the same price: both match the pricing scalars, so
+    # the "✓" would be a guess -- the note says so instead of silence.
+    entry = CATALOG_ENTRY_JS.replace(
+        "endpoints: [",
+        """endpoints: [
+    {
+      provider_name: 'provider-a2',
+      quantization: 'int8',
+      pricing: { prompt: 1.25e-6, completion: 10e-6 },
+      status: 'active',
+      context_length: 163840,
+      service_tier: 'standard'
+    },""",
+    )
+    assert run_js(f"baselineNote({entry})") == "baseline endpoint ambiguous — no marker"
+
+
+def test_baseline_note_no_match():
+    # No endpoint matches: also ambiguous (the pricing scalars fail to pin
+    # exactly one endpoint) -- the note covers the empty case too.
+    entry = CATALOG_ENTRY_JS.replace(
+        "pricing: { prompt: 1.25e-6, completion: 10e-6 }",
+        "pricing: { prompt: 9e-6, completion: 90e-6 }",
+    )
+    assert run_js(f"baselineNote({entry})") == "baseline endpoint ambiguous — no marker"
+
+
+def test_baseline_note_null_without_endpoints():
+    # No endpoint list at all: nothing to mark, silence is honest.
+    assert run_js("baselineNote(null)") is None
+    assert run_js("baselineNote({})") is None
+    assert run_js("baselineNote({endpoints: []})") is None
+
+
+def test_endpoint_row_colspan_pins_header_count():
+    # The disclosure row must span the full main-table width. The count is
+    # a named constant (MAIN_TABLE_COLS) that this test pins to the actual
+    # number of <th> cells in the markup, so the next column addition that
+    # forgets the constant fails here instead of misaligning the table.
+    html = SITE_HTML.read_text()
+    main_table = re.search(r'<table id="table">.*?</table>', html, re.DOTALL).group(0)
+    header_cols = len(re.findall(r"<th[\s>]", main_table))
+    script = SCRIPT_RE.search(html).group(1)
+    assert f"var MAIN_TABLE_COLS = {header_cols};" in script
+    assert "td.colSpan = MAIN_TABLE_COLS;" in script
+    assert "td.colSpan = 12;" not in script
+
+
+def test_endpoint_row_artifact_vs_model_level_text():
+    # Artifact-level failure (catalog.json missing/failed) vs model-level
+    # join miss: two distinct sentences, keyed on the catalogLoaded flag.
+    artifact = run_js(
+        "(function () {"
+        "  var tr = endpointRow(null, false);"
+        "  return { text: tr.children[0].textContent };"
+        "})()"
+    )
+    assert artifact["text"] == ("endpoint details unavailable — catalog fetch failed")
+    model = run_js(
+        "(function () {"
+        "  var tr = endpointRow(null, true);"
+        "  return { text: tr.children[0].textContent };"
+        "})()"
+    )
+    assert model["text"] == "No endpoint data for this model."
