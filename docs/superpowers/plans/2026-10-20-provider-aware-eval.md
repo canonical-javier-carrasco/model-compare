@@ -246,6 +246,22 @@ def test_json_rows_carry_new_additive_keys(): ...
 - [ ] **Step 4: Run to verify they pass** + full suite `python3 -m pytest -q`.
 - [ ] **Step 5: Commit** — `git commit -m "feat: provider-aware endpoint stage with fail-closed drops + steering in --json"`
 
+### Task 6b: CLI/site surface — PREC column, risk marker, quant_note
+
+**Files:**
+- Modify: `model_compare.py` (`print_table` ~:2160, `print_json` ~:2300, new `fmt_quant_note` near the other `fmt_*` helpers :2035)
+- Test: `test_model_compare.py`
+
+**Interfaces:**
+- Produces: `fmt_quant_note(annotations: dict) -> str | None` — None when no non-eligible live endpoint exists; else a terse house-style string like `cheapest non-baseline: fp4 @ open-inference, $0.026/M in (0.17x baseline)` built from `cheapest_quantized` + `price_spread` (the exact format is pinned by the test). `print_table`: new `PREC` header after `DISC`; cell = `default_precision` or `n/a` when None, suffixed `!` when `annotations.risk_flag`; footer legend gains the PREC explanation line (pinned in the test). `print_json`: additive row key `quant_note` = `fmt_quant_note(annotations)` (build_site_data's ROW_KEYS does not require it until Task 9 — emit-first ordering preserves the missing-key check invariant).
+- Consumes: Task 6's candidate keys (`default_precision`, `annotations`). Consumed by: Task 9 (ROW_KEYS gains `quant_note`), Task 11 (site tooltip shows the string verbatim).
+
+- [ ] **Step 1: Write the failing tests** — `test_fmt_quant_note_formats_cheapest_non_baseline` (asserts the exact string from cheapest_quantized {provider, quantization, price} + spread), `test_fmt_quant_note_none_without_non_eligible`, `test_cli_table_shows_prec_column_and_risk_marker` (capsys on a print_table run: PREC column present, `fp8!` on a risk row, `n/a` for null default, footer legend line present), `test_json_rows_carry_quant_note`.
+- [ ] **Step 2: Run to verify they fail** — `python3 -m pytest test_model_compare.py -q -k "quant_note or prec_column"`.
+- [ ] **Step 3: Implement** the formatter, the column, the footer line, the JSON key.
+- [ ] **Step 4: Run to verify they pass** + full suite (`uv run --with pytest pytest -q`).
+- [ ] **Step 5: Commit** — `git commit -m "feat: PREC column + risk marker + quant_note in CLI/JSON output"`
+
 ### Task 7: Session-cost dataset fetch
 
 **Files:**
@@ -285,7 +301,7 @@ def test_json_rows_carry_new_additive_keys(): ...
 - Test: `web/test_build_site_data.py`
 
 **Interfaces:**
-- Produces: `validate_catalog` additionally validates (additive-tolerant style, fail-closed on shape): `endpoints` list entries carry string `provider_name`/`tag`, `quantization` in `QUANTIZATION_ENUM ∪ {None}` (import or duplicate the enum — publish is subprocess-isolated but build_site_data already duplicates catalog constants; duplicate `PRECISION_LADDER`/`QUANTIZATION_ENUM` here), numeric-or-null prices, int `status`; `default_precision` is None or a ladder key; `annotations` keys numeric-or-null / bool; `advertised_pricing` numeric-or-null; top-level `session_cost` (when present) carries string `attribution`/`as_of`/`app_slug`, int `window_days`, `window_end_date`, `medians` mapping ids to 4-turn-range numeric dicts. `ROW_KEYS` += `("default_precision", "risk_flag", "price_spread", "session_cost_usd")` — must match Task 6's `print_json` exactly.
+- Produces: `validate_catalog` additionally validates (additive-tolerant style, fail-closed on shape); `ROW_KEYS` += `("default_precision", "risk_flag", "price_spread", "session_cost_usd", "quant_note")` — five keys, matching Tasks 6/6b's `print_json` exactly: `endpoints` list entries carry string `provider_name`/`tag`, `quantization` in `QUANTIZATION_ENUM ∪ {None}` (import or duplicate the enum — publish is subprocess-isolated but build_site_data already duplicates catalog constants; duplicate `PRECISION_LADDER`/`QUANTIZATION_ENUM` here), numeric-or-null prices, int `status`; `default_precision` is None or a ladder key; `annotations` keys numeric-or-null / bool; `advertised_pricing` numeric-or-null; top-level `session_cost` (when present) carries string `attribution`/`as_of`/`app_slug`, int `window_days`, `window_end_date`, `medians` mapping ids to 4-turn-range numeric dicts.
 - Consumes: Tasks 6–8 outputs.
 
 - [ ] **Step 1: Write the failing tests** — `test_validate_catalog_accepts_v3_blocks`, `test_validate_catalog_rejects_v2_document`, `test_validate_catalog_rejects_bad_endpoint_entry`, `test_rows_carry_new_keys_ordered_by_ranking`, `test_merge_history_resets_on_v2_history` (prev `schema_version: 2` ⇒ fresh).
@@ -318,7 +334,7 @@ def test_json_rows_carry_new_additive_keys(): ...
 
 **Interfaces:**
 - Consumes: data.json v2 rows (`default_precision`, `risk_flag`, `price_spread`, `session_cost_usd`) and a new `catalog.json` fetch for per-endpoint tables (catalog.json is already a deployed artifact).
-- Produces: quantization badge column; risk-flag marker; session-cost column with explicit "not available" state (never zero, never blank-silent); per-model expandable endpoint table (NEW UI pattern — the site has only table-level "Show more" today); baseline-context caveat tooltip.
+- Produces: quantization badge column (PREC: `default_precision` or `n/a`, `!` suffix when `risk_flag`; header tooltip defines both) whose cell tooltip shows `quant_note` verbatim (the CLI-printed string, Task 6b); risk-flag marker is the `!`; session-cost column TASK$ (`session_cost_usd` formatted `$X.XX`, explicit `—` "not available this refresh" state — never zero, never blank-silent; header tooltip cites the session-cost dataset + CC BY 4.0); per-model expandable endpoint table (NEW UI pattern — the site has only table-level "Show more" today) rendering provider, quantization badge, in/out prices, status, context, service tier, ✓ on the baseline row, from a new catalog.json fetch; CTX-cell caveat tooltip when `baseline_context_below_catalog` ("ranked price from a <N>-token endpoint; model supports <M>").
 
 - [ ] **Step 1: Write failing JS-harness tests** for the new pure helpers (badge text from `default_precision`, session-cost formatting + not-available state, spread formatting).
 - [ ] **Step 2: Run to verify they fail** — `python3 -m pytest web/test_site_js.py -q` (skipped cleanly when node absent).
