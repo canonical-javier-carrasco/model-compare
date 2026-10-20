@@ -1777,6 +1777,20 @@ def test_validate_catalog_rejects_bad_session_cost_block(mutate):
         bsd.validate_catalog(doc)
 
 
+def test_validate_catalog_accepts_subset_of_medians():
+    # The OpenRouter session-cost dataset can cover a model for fewer than
+    # all four turn ranges: a medians cell dict carrying only SOME of them
+    # passes validation. Unknown range keys are still rejected (the reject
+    # block above pins that case).
+    doc = make_catalog()
+    doc["models"][0].update(_v3_entry_blocks())
+    doc["session_cost"] = _v3_session_cost()
+    doc["session_cost"]["medians"] = {
+        "acme/model-a": {"1-turn": 0.05, "50-plus-turns": 9.99}
+    }
+    bsd.validate_catalog(doc)  # must not raise
+
+
 def test_rows_carry_new_keys_ordered_by_ranking():
     # data.json v2 rows: the five additive keys survive the projection onto
     # the catalog rankings (same fence as the pre-existing keys).

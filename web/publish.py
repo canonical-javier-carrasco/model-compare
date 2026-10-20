@@ -32,6 +32,17 @@ USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compa
 PRIORITIES = ("balanced", "price", "quality")
 PREV_HISTORY_URL = "https://canonical.github.io/model-compare/history.json"
 PREV_HIGHLIGHTS_URL = "https://canonical.github.io/model-compare/highlights.json"
+# Endpoint-stage failures are normal churn (provider outages, gating), but a
+# mass exodus means the catalog is no longer comparable to previous runs.
+# publish imports nothing from model_compare/build_site_data (subprocess-only
+# by design), so this threshold is pinned here rather than imported.
+MAX_ENDPOINT_DROP_RATE = 0.05
+# The only pool.dropped reasons the endpoint stage itself produces; every
+# other CATALOG_DROP_REASONS entry (malformed id, context, pricing, ...)
+# drops a candidate before the endpoint stage is ever tried. publish
+# imports nothing from model_compare (subprocess-only by design), so the
+# reasons are named here rather than imported.
+ENDPOINT_DROP_REASONS = ("no_baseline_eligible_endpoint", "endpoint_fetch_failed")
 
 
 def run_script(script: Path, args: list[str], out: Path | None = None) -> None:
@@ -93,14 +104,13 @@ def check_stamps(output_dir: Path) -> dict:
     # .get: fail closed with the clean RuntimeError below even if the
     # required tuple above ever stops listing schema_version.
     version = data.get("schema_version")
-    # Strict identity: True and 1.0 compare equal to 1 but are not v1.
-    if type(version) is not int or version != 1:
+    # Strict identity: True and 2.0 compare equal to 2 but are not v2.
+    if type(version) is not int or version != 2:
         # publish imports nothing from build_site_data (subprocess-only by
         # design); the expected data.json version is pinned here, like the
         # opencode id prefix in check_best.
         raise RuntimeError(
-            f"publish: data.json schema_version must be 1, got "
-            f"{version!r}"
+            f"publish: data.json schema_version must be 2, got {version!r}"
         )
     history = _load_artifact(output_dir / "history.json", ("updated_at", "snapshots"))
     stamp = catalog["generated_at"]
@@ -176,6 +186,63 @@ def check_aa_fallback(catalog_path: Path) -> None:
     print(f"publish: AA source mode {aa_sources.get('mode')}, fallback {fallback}")
 
 
+def check_endpoint_drops(catalog_path: Path) -> None:
+    """Fail unless the endpoint stage kept most of the pool it entered.
+
+    `pool.candidates` counts the models that survived the endpoint stage, so
+    the models that entered it are `candidates` plus the stage's own drop
+    reasons: a model dropped before the endpoint stage never reached it, and
+    one that dropped during it is one of these two reasons. A few endpoint
+    failures are normal churn (provider outages, per-key gating), but a mass
+    exodus means the ranking no longer reflects the same candidate pool as
+    previous runs -- fail the publish rather than ship it silently.
+    Publish imports nothing from model_compare (subprocess-only by design),
+    so the reasons are listed here rather than imported.
+    """
+    catalog = _load_artifact(catalog_path, ("generated_at", "pool"))
+    pool = catalog["pool"]
+    if not isinstance(pool, dict):
+        pool = {}
+    dropped = pool.get("dropped")
+    if not isinstance(dropped, dict):
+        dropped = {}
+
+    def _count(value: object, label: str) -> int:
+        # Missing counts default to 0 (an older catalog never recorded
+        # them); a present-but-malformed count is a producer bug, and the
+        # module contract is to fail loudly on any unexpected result.
+        if value is None:
+            return 0
+        if type(value) is not int or value < 0:
+            raise RuntimeError(
+                f"publish: {catalog_path.name} {label} is not a count: {value!r}"
+            )
+        return value
+
+    no_baseline = _count(
+        dropped.get(ENDPOINT_DROP_REASONS[0]),
+        f"pool.dropped.{ENDPOINT_DROP_REASONS[0]}",
+    )
+    fetch_failed = _count(
+        dropped.get(ENDPOINT_DROP_REASONS[1]),
+        f"pool.dropped.{ENDPOINT_DROP_REASONS[1]}",
+    )
+    candidates = _count(pool.get("candidates"), "pool.candidates")
+    dropped_total = no_baseline + fetch_failed
+    entered = candidates + dropped_total
+    if entered == 0:
+        return
+    if dropped_total / entered > MAX_ENDPOINT_DROP_RATE:
+        raise RuntimeError(
+            f"publish: {catalog_path.name} endpoint stage dropped "
+            f"{dropped_total} of {entered} "
+            f"({dropped_total / entered:.0%} > "
+            f"{MAX_ENDPOINT_DROP_RATE:.0%} limit): "
+            f"{ENDPOINT_DROP_REASONS[0]} {no_baseline}, "
+            f"{ENDPOINT_DROP_REASONS[1]} {fetch_failed}"
+        )
+
+
 def build_site(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mc-build-") as tmp:
@@ -188,9 +255,10 @@ def build_site(output_dir: Path) -> None:
         # are never cached, so a later run may fetch different data. That
         # fails loudly (order_rows, check_best) and the next run self-heals.
         run_script(model_compare, ["--catalog"], out=scratch / "catalog.json")
-        # Gate before anything else runs, so a failed AA fallback writes no
-        # publish artifacts to output_dir.
+        # Gates before anything else runs, so a failed AA fallback or an
+        # endpoint-drop exodus writes no publish artifacts to output_dir.
         check_aa_fallback(scratch / "catalog.json")
+        check_endpoint_drops(scratch / "catalog.json")
         run_script(model_compare, ["--best"], out=output_dir / "best.txt")
         for priority in PRIORITIES:
             run_script(

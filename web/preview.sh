@@ -124,6 +124,13 @@ def row(model, q, inp, outp, disc, ctx, age, score):
         "discount_pct": f"{disc:.0%}" if disc else "--",
         "context_tokens": ctx,
         "age_days": age,
+        # data.json v2 row keys (Task 9): the preview stub serves the
+        # degraded pre-endpoint shape -- nulls/false for all five.
+        "default_precision": None,
+        "risk_flag": False,
+        "price_spread": None,
+        "session_cost_usd": None,
+        "quant_note": None,
     }
 
 
@@ -150,7 +157,7 @@ rows = [
     row("moonshotai/kimi-k2.5", 39.0, 0.6, 2.5, 0, 256000, 41, 0.568),
 ]
 data = {
-    "schema_version": 1,
+    "schema_version": 2,
     "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     "best": "openrouter/google/gemini-2.5-pro",
     "priorities": {
@@ -158,7 +165,7 @@ data = {
         "price": sorted(rows, key=lambda r: (r["input_usd_per_m"], -r["score"])),
         "quality": sorted(rows, key=lambda r: -r["quality_index"]),
     },
-    # v1 shape: build_data always emits the key (empty without a catalog)
+    # v2 shape: build_data always emits the key (empty without a catalog)
     "schedules": [],
 }
 with open(sys.argv[1], "w") as fh:

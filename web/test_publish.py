@@ -49,7 +49,7 @@ def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
     must match what the stubbed `--best` run wrote to best.txt.
     """
     docs = {
-        "data.json": {"schema_version": 1, "generated_at": STAMP},
+        "data.json": {"schema_version": 2, "generated_at": STAMP},
         "catalog.json": {
             "generated_at": STAMP,
             "models": [],
@@ -63,9 +63,16 @@ def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
         (out_dir / name).write_text(json.dumps(doc) if text is None else text)
 
 
-# What the stubbed `model_compare.py --catalog` run prints: the AA gate
-# reads it from scratch before any other step runs.
+# What the stubbed `model_compare.py --catalog` run prints: the AA and
+# endpoint-drop gates read it from scratch before any other step runs.
 HEALTHY_AA = {"mode": "openrouter", "fallback": "api"}
+
+# The scratch catalog's pool (Task 8): 20 candidates entered the endpoint
+# stage and none dropped for endpoint reasons -- the healthy happy path.
+HEALTHY_POOL = {
+    "candidates": 20,
+    "dropped": {"no_baseline_eligible_endpoint": 0, "endpoint_fetch_failed": 0},
+}
 
 
 @pytest.fixture(autouse=True)
@@ -80,12 +87,19 @@ def _is_catalog_run(cmd):
 
 
 def _fake_run(
-    calls, simulate_build_site_data=True, overrides=None, best=BEST, aa=HEALTHY_AA
+    calls,
+    simulate_build_site_data=True,
+    overrides=None,
+    best=BEST,
+    aa=HEALTHY_AA,
+    pool=HEALTHY_POOL,
 ):
     def fake_run(cmd, cwd=None, stdout=None, check=True):
         calls.append(cmd)
         if _is_catalog_run(cmd):
-            stdout.write(json.dumps({"generated_at": STAMP, "sources": {"aa": aa}}))
+            stdout.write(
+                json.dumps({"generated_at": STAMP, "sources": {"aa": aa}, "pool": pool})
+            )
         if "--best" in cmd:
             stdout.write(best + "\n")
         if simulate_build_site_data and Path(cmd[1]).name == "build_site_data.py":
@@ -224,6 +238,16 @@ def test_fetch_success_feeds_prev_files_to_generators(tmp_path, monkeypatch):
     seen = {}
 
     def fake_run(cmd, cwd=None, stdout=None, check=True):
+        if _is_catalog_run(cmd):
+            stdout.write(
+                json.dumps(
+                    {
+                        "generated_at": STAMP,
+                        "sources": HEALTHY_AA,
+                        "pool": HEALTHY_POOL,
+                    }
+                )
+            )
         if "--best" in cmd:
             stdout.write("openrouter/x/y\n")
         if Path(cmd[1]).name == "build_site_data.py":
@@ -244,6 +268,16 @@ def test_build_site_fails_when_expected_artifacts_missing(tmp_path, monkeypatch)
 
     def fake_run(cmd, cwd=None, stdout=None, check=True):
         calls.append(cmd)
+        if _is_catalog_run(cmd):
+            stdout.write(
+                json.dumps(
+                    {
+                        "generated_at": STAMP,
+                        "sources": HEALTHY_AA,
+                        "pool": HEALTHY_POOL,
+                    }
+                )
+            )
         if "--best" in cmd:
             stdout.write("openrouter/x/y\n")
         return subprocess.CompletedProcess(cmd, 0)
@@ -257,7 +291,7 @@ def test_build_site_fails_when_expected_artifacts_missing(tmp_path, monkeypatch)
 @pytest.mark.parametrize(
     "name, doc",
     [
-        ("data.json", {"schema_version": 1, "generated_at": "2026-09-27T06:00:00Z"}),
+        ("data.json", {"schema_version": 2, "generated_at": "2026-09-27T06:00:00Z"}),
         ("history.json", {"updated_at": "2026-09-27T06:00:00Z", "snapshots": {}}),
     ],
 )
@@ -294,10 +328,11 @@ def test_build_site_fails_on_malformed_artifact(tmp_path, monkeypatch, name):
         ("history.json", {"updated_at": STAMP}),
         ("data.json", {}),
         ("data.json", {"generated_at": STAMP}),  # missing only schema_version
-        ("data.json", {"schema_version": 2, "generated_at": STAMP}),
-        # strict identity: True == 1 and 1.0 == 1 in Python, neither is v1
+        ("data.json", {"schema_version": 3, "generated_at": STAMP}),
+        # strict identity: 2.0 compares equal to 2 but is not v2; True is a
+        # bool, not an int
         ("data.json", {"schema_version": True, "generated_at": STAMP}),
-        ("data.json", {"schema_version": 1.0, "generated_at": STAMP}),
+        ("data.json", {"schema_version": 2.0, "generated_at": STAMP}),
         ("catalog.json", []),
         # the best.txt gate reads rankings; a catalog without them is broken
         ("catalog.json", {"generated_at": STAMP, "models": []}),
@@ -315,12 +350,83 @@ def test_build_site_requires_data_json_schema_version(tmp_path, monkeypatch):
     # Regression pin for the required-tuple half of the gate: a data.json
     # missing only schema_version must fail at load ("lacks"), not slip
     # through to a later check -- reverting the tuple to ("generated_at",)
-    # must turn this red.
+    # must turn this red. The version VALUE (now 2) is pinned separately in
+    # test_data_json_version_pin_is_2.
     overrides = {"data.json": json.dumps({"generated_at": STAMP})}
     monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=overrides))
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     with pytest.raises(RuntimeError, match="data.json lacks schema_version"):
         publish.build_site(tmp_path / "site")
+
+
+def test_data_json_version_pin_is_2(tmp_path, monkeypatch):
+    # publish imports nothing from build_site_data, so check_stamps pins the
+    # expected data.json version itself: a stale v1 document must fail, the
+    # pinned v2 must pass.
+    overrides = {"data.json": json.dumps({"schema_version": 1, "generated_at": STAMP})}
+    monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=overrides))
+    monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
+    with pytest.raises(RuntimeError, match="data.json schema_version must be 2, got 1"):
+        publish.build_site(tmp_path / "site")
+    # v2 passes: rerun with the happy-path fixtures (no v1 override).
+    monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=None))
+    publish.build_site(tmp_path / "site")
+
+
+def _pool_catalog(candidates=0, no_baseline=0, fetch_failed=0, extra_dropped=None):
+    """A scratch catalog carrying the pool the endpoint-drop gate reads."""
+    dropped = {
+        "no_baseline_eligible_endpoint": no_baseline,
+        "endpoint_fetch_failed": fetch_failed,
+    }
+    dropped.update(extra_dropped or {})
+    return {
+        "generated_at": STAMP,
+        "pool": {"candidates": candidates, "dropped": dropped},
+    }
+
+
+def test_endpoint_drop_rate_gate_passes_under_threshold(tmp_path):
+    # 2% of entered candidates dropped is provider churn, not an exodus;
+    # exactly the 5% threshold passes too (the gate is strict >).
+    path = tmp_path / "catalog.json"
+    path.write_text(
+        json.dumps(_pool_catalog(candidates=98, no_baseline=1, fetch_failed=1))
+    )
+    publish.check_endpoint_drops(path)  # must not raise
+    path.write_text(
+        json.dumps(
+            _pool_catalog(
+                candidates=95,
+                no_baseline=3,
+                fetch_failed=2,
+                extra_dropped={"context": 100},
+            )
+        )
+    )
+    publish.check_endpoint_drops(path)  # must not raise
+
+
+def test_endpoint_drop_rate_gate_fails_over_threshold(tmp_path):
+    path = tmp_path / "catalog.json"
+    path.write_text(
+        json.dumps(_pool_catalog(candidates=94, no_baseline=4, fetch_failed=2))
+    )
+    with pytest.raises(RuntimeError) as exc:
+        publish.check_endpoint_drops(path)
+    message = str(exc.value)
+    assert "dropped 6 of 100" in message
+    assert "6%" in message and "5%" in message
+    assert "no_baseline_eligible_endpoint 4" in message
+    assert "endpoint_fetch_failed 2" in message
+
+
+def test_endpoint_drop_rate_gate_zero_denominator_safe(tmp_path):
+    # Unreachable in a real publish (check_best fails on empty rankings
+    # first) but the gate must still not divide by zero if reached.
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(_pool_catalog()))
+    publish.check_endpoint_drops(path)  # must not raise
 
 
 def _catalog_ranking(balanced):
@@ -504,6 +610,25 @@ def test_build_site_aa_gate_runs_before_any_artifact_is_written(tmp_path, monkey
         publish.build_site(out)
     assert [name for name in PUBLISH_ARTIFACTS if (out / name).exists()] == []
     # nothing after the --catalog run may have started
+    assert len(calls) == 1 and _is_catalog_run(calls[0])
+
+
+def test_build_site_endpoint_gate_runs_before_any_artifact_is_written(
+    tmp_path, monkeypatch
+):
+    # Both gates read the scratch catalog before anything else runs: a
+    # drop-rate exodus must write no publish artifacts to output_dir.
+    exodus = {
+        "candidates": 94,
+        "dropped": {"no_baseline_eligible_endpoint": 4, "endpoint_fetch_failed": 2},
+    }
+    calls = []
+    monkeypatch.setattr(publish.subprocess, "run", _fake_run(calls, pool=exodus))
+    monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
+    out = tmp_path / "site"
+    with pytest.raises(RuntimeError, match="endpoint stage dropped"):
+        publish.build_site(out)
+    assert [name for name in PUBLISH_ARTIFACTS if (out / name).exists()] == []
     assert len(calls) == 1 and _is_catalog_run(calls[0])
 
 
