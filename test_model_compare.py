@@ -65,6 +65,9 @@ def make_args(**overrides):
         no_zdr=False,
         no_cache=True,
         cache_ttl=0,
+        # parse_args always provides this (mirror the production shape);
+        # None means the keyless fast path in fetch_session_cost.
+        openrouter_api_key=None,
     )
     base.update(overrides)
     return Namespace(**base)
@@ -1774,6 +1777,9 @@ def _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id, fail_ids=()):
 
 
 def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
+    # run() now fetches session cost once per invocation (Task 8); pin the
+    # keyless path so the suite never touches the network for it.
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     models = [
         make_model(id="z-ai/glm", name="Z.AI: GLM"),
         make_model(id="acme/plain", name="Acme: Plain"),
@@ -1802,7 +1808,7 @@ def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
     # The fetch succeeded, so the cache written moments ago backs the
     # display annotations, marked stale (the model is not ranked on them).
     assert entry["annotations"]["stale"] is True
-    bsd.validate_catalog(doc)
+    _validate_catalog_interim(monkeypatch, doc)
 
 
 def test_candidate_pricing_replaced_by_baseline(monkeypatch):
@@ -3755,6 +3761,31 @@ def test_parse_iso_datetime_bad():
 # feeds. bsd.CATALOG_ENTRY_KEYS already carries the "aa" trio.
 CATALOG_ENTRY_KEYS = set(bsd.CATALOG_ENTRY_KEYS)
 
+# Schema v3 (Task 8) adds four provider-aware keys to every entry. Task 9's
+# validator bump folds them into bsd.CATALOG_ENTRY_KEYS, collapsing this
+# back to the plain set -- until then the entry-shape guard pins the exact
+# v3 key set instead of loosening to a subset check.
+CATALOG_ENTRY_KEYS_V3 = CATALOG_ENTRY_KEYS | {
+    "endpoints",
+    "default_precision",
+    "advertised_pricing",
+    "annotations",
+}
+
+
+def _validate_catalog_interim(monkeypatch, doc):
+    """bsd.validate_catalog with the schema_version check aligned to the producer.
+
+    INTERIM (Task 8 -> Task 9): the producer emits schema_version 3 while
+    the validator still demands 2 -- the planned one-task window between
+    the two tasks. Pinning the validator's constant to the producer's keeps
+    every structural check of the drift guard active; Task 9 bumps
+    bsd.CATALOG_SCHEMA_VERSION to 3 and every call site collapses back to
+    plain bsd.validate_catalog(doc).
+    """
+    monkeypatch.setattr(bsd, "CATALOG_SCHEMA_VERSION", mc.CATALOG_SCHEMA_VERSION)
+    bsd.validate_catalog(doc)
+
 
 def catalog_pool(**overrides):
     """Run the real pipeline over a small fixed pool and hand back everything
@@ -3843,7 +3874,7 @@ def build_doc(**overrides):
 
 def test_catalog_envelope():
     doc = build_doc()
-    assert doc["schema_version"] == 2
+    assert doc["schema_version"] == 3
     assert doc["tool"] == "model-compare"
     datetime.fromisoformat(doc["generated_at"])  # ISO with offset, raises if not
     p = doc["parameters"]
@@ -3868,7 +3899,14 @@ def test_catalog_envelope():
         },
         "zdr": "ok",
         "discounts": "ok",
+        # Task 8's additive source states: the endpoint stage always ran
+        # before build_catalog, and direct build_catalog calls (this
+        # fixture) take the default keyless mode.
+        "endpoints": "ok",
+        "session_cost": "skipped",
     }
+    # Default parameters carry no envelope: the block is omitted, not null.
+    assert "session_cost" not in doc
     assert doc["pool"]["listed"] == 3
     assert doc["pool"]["candidates"] == 2
     assert doc["pool"]["dropped"]["context"] == 1
@@ -3880,7 +3918,7 @@ def test_catalog_entry_shape():
     doc = build_doc()
     assert {e["id"] for e in doc["models"]} == {"acme/model-a", "acme/model-b"}
     for entry in doc["models"]:
-        assert set(entry) == CATALOG_ENTRY_KEYS
+        assert set(entry) == CATALOG_ENTRY_KEYS_V3
         assert set(entry["pricing"]) == {
             "input_per_1m",
             "output_per_1m",
@@ -4272,11 +4310,11 @@ def test_catalog_rankings_deterministic_across_builds_and_input_order():
     assert mc.catalog_rankings(list(reversed(candidates)), weights) == first
 
 
-def test_cli_json_rows_project_cleanly_onto_catalog_rankings(capsys):
+def test_cli_json_rows_project_cleanly_onto_catalog_rankings(monkeypatch, capsys):
     # Cross-program check: real --json rows (top 2) per priority and the real
     # catalog pass the site's order_rows / validate_catalog / build_snapshot.
     doc = _inverting_catalog()
-    bsd.validate_catalog(doc)
+    _validate_catalog_interim(monkeypatch, doc)
     priorities = {}
     for priority in mc.PRIORITY_WEIGHTS:
         args, models, zdr, quality_by_id = inverting_pool()
@@ -4303,10 +4341,10 @@ def test_catalog_deterministic_modulo_generated_at():
     assert doc1 == doc2
 
 
-def test_catalog_document_passes_site_validator():
+def test_catalog_document_passes_site_validator(monkeypatch):
     # drift between the producer and the site validator must fail the
     # suite here, not the publish
-    bsd.validate_catalog(build_doc())  # must not raise
+    _validate_catalog_interim(monkeypatch, build_doc())  # must not raise
 
     # mixed provenance (OR benchmarks + AA api fallback) must survive too
     args, models, candidates, dropped, filtered, discounts, _, _, aa_by_id = (
@@ -4337,7 +4375,7 @@ def test_catalog_document_passes_site_validator():
         "matched": 2,
         "matched_openrouter": 1,
     }
-    bsd.validate_catalog(doc)  # must not raise
+    _validate_catalog_interim(monkeypatch, doc)  # must not raise
 
 
 def test_catalog_aa_block_carries_or_trio():
@@ -4404,6 +4442,9 @@ def test_catalog_rejects_removed_scrape_source():
 
 
 def test_catalog_no_zdr_marks_skipped(monkeypatch, capsys):
+    # run() now fetches session cost once per invocation (Task 8); pin the
+    # keyless path so the suite never touches the network for it.
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
         mc, "fetch_openrouter_frontend", lambda args: ({}, set(), {}, set())
     )
@@ -4729,14 +4770,14 @@ def test_catalog_aa_fallback_tracks_aa_source(aa_source, fallback):
     assert doc["sources"]["aa"]["fallback"] == fallback
 
 
-def test_catalog_aa_fallback_not_masked_by_openrouter_matches():
+def test_catalog_aa_fallback_not_masked_by_openrouter_matches(monkeypatch):
     # Regression: the publish gate read mode alone, and any OpenRouter
     # match turned a failed AA API into mode "openrouter".
     doc = build_doc(aa_source=None)
     assert doc["sources"]["aa"]["matched_openrouter"] > 0
     assert doc["sources"]["aa"]["mode"] == "openrouter"
     assert doc["sources"]["aa"]["fallback"] == "none"
-    bsd.validate_catalog(doc)  # must not raise
+    _validate_catalog_interim(monkeypatch, doc)  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -4889,3 +4930,164 @@ def test_session_cost_shape_and_attribution(monkeypatch):
         f"{mc.SESSION_COST_URL}?app_slug=hermes-agent&limit=500&offset=0"
     )
     assert mc.SESSION_COST_DISPLAY_TURN_RANGE == "10-49-turns"
+
+
+# ---------------------------------------------------------------------------
+# Provider-aware eval: catalog v3 (schema bump + additive blocks)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_v3_doc(
+    monkeypatch, capsys, models, endpoints_by_id, *, api_key=None, session_cost=None
+):
+    """Run --catalog through the stubbed offline pipeline; return the document.
+
+    Same pattern as _stub_endpoint_pipeline (Task 6): every fetcher is
+    stubbed, so the run touches no network. The session-cost fetch is
+    stubbed only when a key is configured -- keyless runs take
+    fetch_session_cost's own fast no-key path (None, no network), which is
+    exactly the guard the --best-cheap pin relies on.
+    """
+    _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id)
+    if api_key is None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    else:
+        monkeypatch.setattr(mc, "fetch_session_cost", lambda args: session_cost)
+    args = make_args(min_context=0, catalog=True, openrouter_api_key=api_key)
+    assert mc.run(args, models, False) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_catalog_schema_version_3(monkeypatch, capsys):
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    doc = _catalog_v3_doc(
+        monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
+    )
+    assert doc["schema_version"] == 3
+
+
+def test_catalog_entry_carries_endpoint_blocks(monkeypatch, capsys):
+    eps = _endpoint_stage_eps()
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    doc = _catalog_v3_doc(monkeypatch, capsys, models, {"z-ai/glm": eps})
+    (entry,) = doc["models"]
+    assert entry["id"] == "z-ai/glm"
+    # The parsed endpoint list, verbatim from the stage.
+    assert entry["endpoints"] == eps
+    assert entry["default_precision"] == "fp8"
+    # The annotations dict (design section 4.6), same values the --json row
+    # surfaces (Task 6 pinned risk_flag/price_spread for this fixture).
+    assert set(entry["annotations"]) == {
+        "price_spread",
+        "cheapest_quantized",
+        "risk_flag",
+        "baseline_context_below_catalog",
+    }
+    assert entry["annotations"]["risk_flag"] is True
+    assert entry["annotations"]["price_spread"] == pytest.approx(0.5)
+    # Fourth block of the brief's pinned quartet; its exact shape is test
+    # test_catalog_pricing_block_is_baseline_endpoint's job.
+    assert entry["advertised_pricing"]["source"] == "models-api"
+    # The endpoint stage always ran before build_catalog is reached, so the
+    # source state is deterministic "ok" (failures surface as pool.dropped
+    # counts, not source state).
+    assert doc["sources"]["endpoints"] == "ok"
+
+
+def test_catalog_session_cost_block_omitted_keyless(monkeypatch, capsys):
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    doc = _catalog_v3_doc(
+        monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
+    )
+    # Omitted entirely -- consumers branch on key presence, not null shape.
+    assert "session_cost" not in doc
+    assert doc["sources"]["session_cost"] == "skipped"
+
+
+def test_catalog_session_cost_block_present_with_key(monkeypatch, capsys):
+    envelope = {
+        "attribution": "Data © OpenRouter, CC BY 4.0",
+        "app_slug": "hermes-agent",
+        "as_of": "2026-10-15T00:00:00Z",
+        "window_days": 30,
+        "window_end_date": "2026-10-12",
+        "medians": {"z-ai/glm": {"10-49-turns": 0.42}},
+    }
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    doc = _catalog_v3_doc(
+        monkeypatch,
+        capsys,
+        models,
+        {"z-ai/glm": _endpoint_stage_eps()},
+        api_key="sk-or",
+        session_cost=envelope,
+    )
+    # The envelope verbatim, medians duplication included.
+    assert doc["session_cost"] == envelope
+    assert doc["sources"]["session_cost"] == "ok"
+
+
+def test_catalog_session_cost_unavailable_with_failed_fetch(monkeypatch, capsys):
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    doc = _catalog_v3_doc(
+        monkeypatch,
+        capsys,
+        models,
+        {"z-ai/glm": _endpoint_stage_eps()},
+        api_key="sk-or",
+        session_cost=None,  # a configured key whose fetch failed
+    )
+    assert "session_cost" not in doc
+    assert doc["sources"]["session_cost"] == "unavailable"
+
+
+def test_catalog_pricing_block_is_baseline_endpoint(monkeypatch, capsys):
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    doc = _catalog_v3_doc(
+        monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
+    )
+    (entry,) = doc["models"]
+    pricing = entry["pricing"]
+    # Baseline endpoint (z-ai/fp8) effective prices per-1M -- NOT the
+    # models-API scalars the candidate carried before the stage (1.0/2.0).
+    assert pricing["input_per_1m"] == pytest.approx(0.2)
+    assert pricing["output_per_1m"] == pytest.approx(0.4)
+    assert pricing["blended_per_1m"] == pytest.approx(0.75 * 0.2 + 0.25 * 0.4)
+    assert pricing["base"]["input_per_1m"] == pytest.approx(0.2)
+    assert pricing["base"]["output_per_1m"] == pytest.approx(0.4)
+    # The advertised block preserves exactly those models-API scalars.
+    # Entry-level key (sibling of pricing), per the brief's pinned shapes.
+    advertised = entry["advertised_pricing"]
+    assert advertised["source"] == "models-api"
+    assert advertised["input_per_1m"] == pytest.approx(1.0)
+    assert advertised["output_per_1m"] == pytest.approx(2.0)
+    assert advertised["blended_per_1m"] == pytest.approx(1.25)
+
+
+def test_json_rows_carry_session_cost_usd(monkeypatch, capsys):
+    envelope = {
+        "attribution": "Data © OpenRouter, CC BY 4.0",
+        "app_slug": "hermes-agent",
+        "as_of": "2026-10-15T00:00:00Z",
+        "window_days": 30,
+        "window_end_date": "2026-10-12",
+        "medians": {"z-ai/glm": {"10-49-turns": 0.42}},
+    }
+    models = [
+        make_model(id="z-ai/glm", name="Z.AI: GLM"),
+        make_model(id="acme/plain", name="Acme: Plain"),
+    ]
+    endpoints = _endpoint_stage_eps()
+    _stub_endpoint_pipeline(
+        monkeypatch,
+        models,
+        {"z-ai/glm": endpoints, "acme/plain": _endpoint_stage_eps()},
+    )
+    monkeypatch.setattr(mc, "fetch_session_cost", lambda args: envelope)
+    args = make_args(min_context=0, json=True, openrouter_api_key="sk-or")
+    assert mc.run(args, models, False) == 0
+    rows = {row["model"]: row for row in json.loads(capsys.readouterr().out)}
+    # The display turn range cell, via the pinned constant's value.
+    assert rows["z-ai/glm"]["session_cost_usd"] == pytest.approx(0.42)
+    # A model the dataset does not cover degrades to None.
+    assert rows["acme/plain"]["session_cost_usd"] is None

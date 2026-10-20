@@ -87,7 +87,7 @@ PRIORITY_WEIGHTS = {
     "quality": {"quality": 0.60, "price": 0.20, "context": 0.10, "age": 0.10},
 }
 
-CATALOG_SCHEMA_VERSION = 2
+CATALOG_SCHEMA_VERSION = 3
 
 # The drop-reason keys build_candidates counts, verbatim -- keep in sync with
 # its drop() call sites. pool.dropped lists all of them zero-filled so the
@@ -2472,15 +2472,20 @@ def print_json(top):
             "age_days": round(cand["age_days"], 1)
             if cand["age_days"] is not None
             else None,
-            # Additive endpoint-stage keys (Task 9's ROW_KEYS extension
-            # pins this exact key set and order). Risk/spread come from the
-            # annotations block; session_cost_usd stays None until Task 7
-            # fills it. Candidates that never went through the endpoint
-            # stage (historical test paths) degrade to null.
+            # Additive keys (Task 9's ROW_KEYS extension pins this exact
+            # key set and order). Risk/spread come from the annotations
+            # block; session_cost_usd is run()'s per-candidate slice of the
+            # Task 7 envelope, shown for the display turn range (run()
+            # attaches it before any output path). Candidates that never
+            # went through either stage (historical test paths) degrade to
+            # null, as does a model the dataset covers only in other turn
+            # ranges.
             "default_precision": cand.get("default_precision"),
             "risk_flag": (cand.get("annotations") or {}).get("risk_flag"),
             "price_spread": (cand.get("annotations") or {}).get("price_spread"),
-            "session_cost_usd": None,
+            "session_cost_usd": (cand.get("session_cost") or {}).get(
+                SESSION_COST_DISPLAY_TURN_RANGE
+            ),
             # The cheapest-sub-default note, exactly as the CLI prints it
             # (Task 11 shows it verbatim). Emit-first: Task 9's ROW_KEYS
             # pins this key last; pre-endpoint candidates degrade to None.
@@ -2502,6 +2507,8 @@ def build_catalog(
     aa_source,
     aa_by_id,
     quality_source_by_id,
+    session_cost=None,
+    session_cost_mode="skipped",
 ):
     """Assemble the full-catalog document (see README "Catalog output").
 
@@ -2509,6 +2516,11 @@ def build_catalog(
     component scores) and never mutates them. Deterministic apart from
     generated_at: models sort by (-overall.balanced, id), filtered by id,
     and age uses date precision so two runs in the same UTC day match.
+
+    session_cost is the Task 7 fetch envelope (verbatim, medians included)
+    or None; session_cost_mode is run()'s resolution of the key-presence
+    fact ("ok" / "unavailable" / "skipped") -- build_catalog stays pure and
+    never fetches or inspects the environment itself.
     """
     now = datetime.now(timezone.utc)
     weights = catalog_weights(candidates, quality_by_id)
@@ -2622,6 +2634,15 @@ def build_catalog(
                 "quality": cand["quality"],
                 "quality_match": quality_source_by_id.get(cand["id"]),
                 "scores": {**scores, "overall": overall},
+                # Additive provider-aware blocks (schema v3), verbatim from
+                # the candidate. Candidates that never went through the
+                # endpoint stage (historical test paths) degrade to null --
+                # .get() with null defaults for these NEW keys only; the
+                # pre-existing keys above stay direct-indexed.
+                "endpoints": cand.get("endpoints"),
+                "default_precision": cand.get("default_precision"),
+                "advertised_pricing": cand.get("advertised_pricing"),
+                "annotations": cand.get("annotations"),
             }
         )
     entries.sort(key=lambda e: (-e["scores"]["overall"]["balanced"], e["id"]))
@@ -2659,7 +2680,19 @@ def build_catalog(
             },
             "zdr": "skipped" if args.no_zdr else "ok",
             "discounts": "ok" if discounts else "unavailable",
+            # The endpoint stage always ran before build_catalog is reached;
+            # its failures surface as pool.dropped counts
+            # (endpoint_fetch_failed / no_baseline_eligible_endpoint), never
+            # as source state -- so this is deterministic "ok".
+            "endpoints": "ok",
+            # "ok" (envelope fetched) / "unavailable" (key configured, fetch
+            # failed) / "skipped" (no key) -- resolved in run().
+            "session_cost": session_cost_mode,
         },
+        # Per-task session-cost medians (Task 7), verbatim from the fetch
+        # envelope. Omitted entirely when unavailable: consumers branch on
+        # key presence, never on a null shape.
+        **({"session_cost": session_cost} if session_cost is not None else {}),
         "pool": {
             "listed": len(models),
             "candidates": len(candidates),
@@ -2850,6 +2883,24 @@ def run(args, models, or_cached) -> int:
     )
     weights = compute_scores(candidates, args, quality_by_id)
 
+    # Per-task session-cost medians (Task 7): one fetch per invocation,
+    # shared by every output path (--catalog block, --json rows; publish
+    # runs --json per priority, so the cache makes the repeat cost free).
+    # Keyless, fetch_session_cost returns None before any network or cache
+    # access, keeping scripting paths cheap.
+    session_cost = fetch_session_cost(args)
+    # The key-presence fact distinguishes "skipped" from "unavailable";
+    # same expression fetch_session_cost uses for its own guard.
+    session_cost_mode = (
+        "skipped"
+        if not (args.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY"))
+        else ("ok" if session_cost else "unavailable")
+    )
+    # run() owns the per-candidate attachment (build_catalog stays pure);
+    # print_json reads it for the session_cost_usd display cell.
+    for cand in candidates:
+        cand["session_cost"] = (session_cost or {}).get("medians", {}).get(cand["id"])
+
     if args.catalog:
         print_catalog(
             build_catalog(
@@ -2863,6 +2914,8 @@ def run(args, models, or_cached) -> int:
                 aa_source,
                 aa_by_id,
                 quality_source_by_id,
+                session_cost,
+                session_cost_mode,
             )
         )
         return 0
