@@ -5,6 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-21
+
+### Added
+
+- Provider-aware ranking: models are now priced at their cheapest live
+  baseline-eligible endpoint at default precision (the maker's own
+  quantization when disclosed, else the best available; a pinned precision
+  ladder plus a first-party/partner carve-out with live-verified aliases),
+  instead of the models-API advertised scalar. The advertised scalars are
+  retained as documentation-only `advertised_pricing`.
+- Quantization annotations per model (`price_spread`, `cheapest_quantized`,
+  `risk_flag`, `baseline_context_below_catalog`), a PREC column in the CLI
+  and the site (with `!` risk marker and a `quant_note` tooltip), and a CTX
+  caveat tooltip when the baseline endpoint's context is below the catalog
+  context.
+- OpenRouter `provider` steering block (`order`, `ignore`, `quantizations`,
+  `allow_fallbacks`) in `--json` rows and catalog entries for callers such
+  as the model-compare-opencode-plugin that pin routing explicitly.
+- Per-task cost dimension from OpenRouter's `session-cost` dataset: catalog
+  `session_cost` block (all four turn ranges, `as_of`/window metadata,
+  "Data © OpenRouter, CC BY 4.0" attribution) and a TASK$ site column —
+  outside the weighted score, "—" (never zero) when unavailable.
+- Site: per-model expandable endpoint table rendered from a new
+  `catalog.json` fetch.
+- Two machine-readable drop reasons (`no_baseline_eligible_endpoint`,
+  `endpoint_fetch_failed`; stale cached annotations ride dropped models'
+  `filtered` entries) and a publish gate that fails the run when more than
+  5% of the entered pool is dropped for an endpoint-derived reason.
+
+### Changed
+
+- Catalog `schema_version` 3 — the per-model `pricing` block now describes
+  the baseline endpoint's price structure in full; `data.json` 2 (five new
+  row keys); `history.json` 3.
+- **History resets at the v3 cutover**: old snapshots describe old price
+  semantics (advertised scalars) and are not mixed with baseline-endpoint
+  prices. The 7-day movement arrows and the weekly highlights diff degrade
+  to their no-baseline state until seven days of fresh snapshots accumulate.
+- Ranked prices change value as well as meaning: 9 Google Gemini models are
+  repriced onto newly-eligible maker endpoints (gemini-3.7-flash and
+  gemini-3.8-flash prices halve, 0.75 → 0.375).
+- The strict downstream consumer is the model-compare-opencode-plugin
+  (npm 0.1.1 rejects `schema_version` != 2); a v3-accepting plugin release
+  must land before or with the first v3 publish.
+
 ## [0.3.3] - 2026-10-14
 
 ### Added

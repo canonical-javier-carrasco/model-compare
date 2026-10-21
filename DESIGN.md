@@ -240,7 +240,8 @@ trio `intelligence_index`/`coding_index`/`agentic_index`, each possibly
 the four component scores plus
 `overall` for all three priorities, so downstream consumers never re-run
 the scorer — and the v3 additive per-model blocks `endpoints`,
-`default_precision`, `advertised_pricing` and `annotations`.
+`default_precision`, `advertised_pricing`, `annotations` (plus `steering`,
+below).
 
 **The `pricing` block describes the baseline endpoint.** The baseline is the
 cheapest live (status-0) baseline-eligible endpoint at the model's default
@@ -304,9 +305,10 @@ The other per-model additive blocks:
   live non-eligible endpoint, variants included), `quantizations` (known
   quantizations ≥ default; omitted entirely when `default_precision` is
   `null` — never an empty list) and `allow_fallbacks`. The endpoint stage
-  attaches it per candidate; neither the catalog document nor the `--json`
-  rows publish it today — the plugin, which vendors this script, reaches it
-  through its own integration (design §7). The plugin decides
+  attaches it per candidate; both the `--json` rows and the catalog `models`
+  entries publish it (an optional entry key — pre-endpoint documents may
+  lack it, and candidates that skipped the stage carry `null`). The plugin,
+  which vendors this script, reads it from either surface and decides
   `require_parameters`/`zdr`/`data_collection` policy itself.
 
 `filtered` entries are `{"id", "name", "reasons"}` plus optional additive

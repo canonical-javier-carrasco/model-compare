@@ -1695,6 +1695,9 @@ def test_validate_catalog_rejects_v2_document():
     [
         lambda ep: ep.update(status="0"),  # not an int
         lambda ep: ep.update(quantization="int16"),  # no ladder label, not null
+        lambda ep: ep.update(
+            quantization={"a": 1}
+        ),  # unhashable: ValueError, not TypeError
         lambda ep: ep["pricing"].update(prompt="0.2"),  # price must be numeric
         lambda ep: ep.update(provider_name=7),
         lambda ep: ep.update(tag=["z-ai/fp8"]),
@@ -1717,6 +1720,11 @@ def test_validate_catalog_rejects_bad_default_precision():
     doc = make_catalog()
     doc["models"][0].update(_v3_entry_blocks())
     doc["models"][0]["default_precision"] = "unknown"
+    with pytest.raises(ValueError, match="default_precision"):
+        bsd.validate_catalog(doc)
+    # Unhashable values must hit the same ValueError contract (a TypeError
+    # would escape the "error: invalid catalog" handler as a traceback).
+    doc["models"][0]["default_precision"] = ["fp8"]
     with pytest.raises(ValueError, match="default_precision"):
         bsd.validate_catalog(doc)
 
@@ -1825,6 +1833,10 @@ def test_validate_catalog_accepts_steering():
         lambda st: st["provider"].update(tag="acme/fp8"),  # key outside the allowed set
         lambda st: st["provider"]["order"].append(42),  # order entry not a string
         lambda st: st["provider"].update(allow_fallbacks="yes"),  # non-bool
+        lambda st: st["provider"].update(quantizations=[{}]),  # unhashable: ValueError
+        lambda st: st.update(
+            extra="junk"
+        ),  # unknown top-level key (docstring contract)
     ],
 )
 def test_validate_catalog_rejects_bad_steering(mutate):

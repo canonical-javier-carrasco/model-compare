@@ -466,6 +466,38 @@ def test_endpoint_rows_null_status_is_non_live():
     assert out[0]["status"] == "non-live"
 
 
+def test_endpoint_rows_live_status_zero_is_live():
+    # The real catalog carries status as an INTEGER: 0 is live (the falsy
+    # value a `|| "non-live"` guard would swallow). Regression pin: the
+    # string fixtures above never exercised the live case.
+    entry = """
+    {
+      pricing: { input_per_1m: 1.0, output_per_1m: 10.0 },
+      endpoints: [
+        {
+          provider_name: 'p',
+          quantization: 'fp8',
+          pricing: { prompt: 1e-6, completion: 10e-6 },
+          status: 0,
+          context_length: 1000,
+          service_tier: 'standard'
+        },
+        {
+          provider_name: 'q',
+          quantization: 'fp8',
+          pricing: { prompt: 2e-6, completion: 20e-6 },
+          status: -2,
+          context_length: 1000,
+          service_tier: 'standard'
+        }
+      ]
+    }
+    """
+    out = run_js(f"endpointRows({entry})")
+    assert out[0]["status"] == "live"
+    assert out[1]["status"] == -2
+
+
 def test_endpoint_rows_null_service_tier():
     entry = """
     {

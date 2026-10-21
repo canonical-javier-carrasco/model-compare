@@ -4647,7 +4647,7 @@ def test_version_flag():
         check=True,
     )
     # Literal pin: a release that forgets to bump VERSION fails here.
-    assert proc.stdout.strip() == "model-compare 0.3.3"
+    assert proc.stdout.strip() == "model-compare 0.4.0"
 
 
 # ---------------------------------------------------------------------------
@@ -5058,6 +5058,49 @@ def test_session_cost_shape_and_attribution(monkeypatch):
         f"{mc.SESSION_COST_URL}?app_slug=hermes-agent&limit=500&offset=0"
     )
     assert mc.SESSION_COST_DISPLAY_TURN_RANGE == "10-49-turns"
+
+
+def test_session_cost_meta_malformed_returns_none(monkeypatch, capsys):
+    """Dataset meta drift degrades to None -- never a block the catalog
+    validator would reject (design section 4.8: session cost must never
+    fail the publish)."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    base = _cost_payload([_cost_cell("acme/model-a", "1-turn", 0.10)])
+    for bad_meta in (
+        {**base["meta"], "as_of": None},
+        {**base["meta"], "window_end_date": ""},
+        {**base["meta"], "window_days": "30"},
+        {**base["meta"], "window_days": 30.0},
+        {**base["meta"], "window_days": 0},
+        {"as_of": "2026-10-15T00:00:00Z"},  # window fields missing entirely
+    ):
+        payload = {**base, "meta": bad_meta}
+        monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
+        assert mc.fetch_session_cost(make_args(openrouter_api_key=None)) is None
+        assert "malformed meta" in capsys.readouterr().err
+
+
+def test_session_cost_drops_unknown_turn_ranges(monkeypatch):
+    """A dataset-side new turn range is dropped, never published -- the
+    catalog contract's range set is closed (the validator would otherwise
+    reject the whole document over a session-cost cell)."""
+    payload = _cost_payload(
+        [
+            _cost_cell("acme/model-a", "10-49-turns", 0.25),
+            _cost_cell("acme/model-a", "100-plus-turns", 9.99),
+        ]
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    result = mc.fetch_session_cost(make_args(openrouter_api_key=None))
+    assert result["medians"] == {"acme/model-a": {"10-49-turns": 0.25}}
+    # Everything kept is inside the pinned set the validator accepts.
+    assert set(mc.SESSION_COST_TURN_RANGES) == {
+        "1-turn",
+        "2-9-turns",
+        "10-49-turns",
+        "50-plus-turns",
+    }
 
 
 # ---------------------------------------------------------------------------

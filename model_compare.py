@@ -68,7 +68,7 @@ OPENROUTER_ZDR_URL = "https://openrouter.ai/api/v1/endpoints/zdr"
 # (legacy endpoints 410 after 2026-11-04; see
 # https://artificialanalysis.ai/data-api/migrate-v2-data).
 AA_API_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
-VERSION = "0.3.3"
+VERSION = "0.4.0"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
 # opencode expects provider-qualified model ids: openrouter/<provider/model>.
@@ -1051,9 +1051,13 @@ def apply_endpoint_pricing(candidates, args, filtered):
 
 SESSION_COST_URL = "https://openrouter.ai/api/v1/datasets/session-cost"
 SESSION_COST_HARNESS_SLUG = "hermes-agent"
-# The turn range the catalog/CLI surfaces (Task 8); the fetch itself keeps
-# every turn range the dataset returns.
+# The turn range the catalog/CLI surfaces (Task 8).
 SESSION_COST_DISPLAY_TURN_RANGE = "10-49-turns"
+# The dataset's four turn ranges (brainstorm section 2.6) -- the catalog
+# contract's closed set (web/build_site_data.py pins the same tuple).
+# Cells naming anything else are dropped: an unknown range is dataset
+# drift, and the block must never fail the publish (design section 4.8).
+SESSION_COST_TURN_RANGES = ("1-turn", "2-9-turns", "10-49-turns", "50-plus-turns")
 SESSION_COST_ATTRIBUTION = "Data © OpenRouter, CC BY 4.0"
 
 
@@ -1133,6 +1137,11 @@ def fetch_session_cost(args) -> dict | None:
             and turn_range
         ):
             continue
+        # Closed contract set: a cell naming a new turn range is dropped,
+        # never published (the catalog validator rejects unknown ranges,
+        # and session cost must never fail the publish).
+        if turn_range not in SESSION_COST_TURN_RANGES:
+            continue
         # Non-finite medians would serialize as NaN and poison the catalog.
         if not isinstance(raw, (int, float)) or isinstance(raw, bool):
             continue
@@ -1156,12 +1165,31 @@ def fetch_session_cost(args) -> dict | None:
     if not isinstance(meta, dict):
         warn("session-cost dataset returned an unexpected response shape")
         return None
+    as_of = meta.get("as_of")
+    window_days = meta.get("window_days")
+    window_end_date = meta.get("window_end_date")
+    # The catalog validator demands non-empty as_of/window_end_date strings
+    # and a positive integer window_days; anything else is dataset drift.
+    # Degrade to None (block omitted, "not available this refresh") rather
+    # than emit a block the validator would reject -- session cost must
+    # never fail the publish (design section 4.8).
+    if not (
+        isinstance(as_of, str)
+        and as_of
+        and isinstance(window_end_date, str)
+        and window_end_date
+        and isinstance(window_days, int)
+        and not isinstance(window_days, bool)
+        and window_days > 0
+    ):
+        warn("session-cost dataset returned malformed meta; omitting the block")
+        return None
     result = {
         "attribution": SESSION_COST_ATTRIBUTION,
         "app_slug": SESSION_COST_HARNESS_SLUG,
-        "as_of": meta.get("as_of"),
-        "window_days": meta.get("window_days"),
-        "window_end_date": meta.get("window_end_date"),
+        "as_of": as_of,
+        "window_days": window_days,
+        "window_end_date": window_end_date,
         "medians": medians,
     }
     save_cache("session-cost", result)

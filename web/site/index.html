@@ -658,7 +658,15 @@
             badge: endpoint.quantization || "unknown",
             priceIn: prompt === null ? "-" : fmtPrice(prompt * 1e6),
             priceOut: completion === null ? "-" : fmtPrice(completion * 1e6),
-            status: endpoint.status || "non-live",
+            // status 0 is LIVE -- it is falsy, so `|| "non-live"` used to
+            // mislabel every live endpoint. Null/undefined (not recorded)
+            // renders "non-live"; anything else is the raw status code.
+            status:
+              endpoint.status === null || endpoint.status === undefined
+                ? "non-live"
+                : endpoint.status === 0
+                  ? "live"
+                  : endpoint.status,
             context: endpoint.context_length,
             tier: endpoint.service_tier || "-",
             isBaseline: isBaseline,

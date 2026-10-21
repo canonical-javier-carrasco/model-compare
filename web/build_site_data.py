@@ -283,7 +283,11 @@ def _validate_catalog_endpoints(endpoints, label) -> None:
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"{sub} {key} must be a string or null")
         quantization = endpoint["quantization"]
-        if quantization is not None and quantization not in QUANTIZATION_ENUM:
+        if quantization is not None and (
+            # isinstance guard first: an unhashable value must fail the
+            # ValueError contract, never escape as a TypeError traceback.
+            not isinstance(quantization, str) or quantization not in QUANTIZATION_ENUM
+        ):
             raise ValueError(f"{sub} has unknown quantization: {quantization!r}")
         pricing = endpoint["pricing"]
         if not isinstance(pricing, dict) or any(
@@ -384,6 +388,11 @@ def _validate_catalog_steering(steering, label) -> None:
         return
     if not isinstance(steering, dict):
         raise ValueError(f"{label} is not an object")
+    # Unknown keys fail at the top level too -- the docstring's contract
+    # (the site and the plugin read this shape verbatim).
+    unknown_top = [key for key in steering if key not in ("model", "provider")]
+    if unknown_top:
+        raise ValueError(f"{label} has unknown keys: " + ", ".join(unknown_top))
     model = steering.get("model")
     if not isinstance(model, str) or not model:
         raise ValueError(f"{label} model must be a non-empty string")
@@ -407,7 +416,10 @@ def _validate_catalog_steering(steering, label) -> None:
     if "quantizations" in provider:
         quants = provider["quantizations"]
         if not isinstance(quants, list) or any(
-            quant not in PRECISION_LADDER for quant in quants
+            # isinstance guard first: unhashable entries must raise the
+            # ValueError contract, not a TypeError.
+            not isinstance(quant, str) or quant not in PRECISION_LADDER
+            for quant in quants
         ):
             raise ValueError(
                 f"{label} provider.quantizations must be precision-ladder keys"
@@ -653,7 +665,12 @@ def validate_catalog(document) -> None:
         # the candidate skipped the endpoint stage); the shapes downstream
         # consumers index into are pinned here.
         default_precision = entry["default_precision"]
-        if default_precision is not None and default_precision not in PRECISION_LADDER:
+        if default_precision is not None and (
+            # isinstance guard first: an unhashable value must fail the
+            # ValueError contract, never escape as a TypeError traceback.
+            not isinstance(default_precision, str)
+            or default_precision not in PRECISION_LADDER
+        ):
             raise ValueError(
                 f"models[{i}] default_precision must be a precision-ladder key "
                 f"or null: {default_precision!r}"
