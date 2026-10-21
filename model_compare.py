@@ -158,12 +158,24 @@ FIRST_PARTY_HOSTS = frozenset(
     {"bedrock", "azure", "vertex", "azure-ai", "google-vertex", "aws-bedrock"}
 )
 
-# Explicit provider-name aliases that normalization alone cannot bridge.
-# Empty initially: add entries only once verified against live data. Keys
-# are canonical maker slugs, values the recorded provider names; alias
-# VALUES are compared normalized, exactly like FIRST_PARTY_HOSTS entries,
-# and a match makes the provider first-party under both criteria.
-FIRST_PARTY_ALIASES: dict[str, str] = {}
+# Explicit first-party alias pairs that normalization alone cannot bridge
+# (design §4.2): makers that self-name differently than their OpenRouter
+# author slug. Key = the exact live provider_name string, value = the
+# author slug the pair is first-party FOR; both sides are compared
+# normalized (case/punctuation variants match), and the alias only fires
+# when the model's author equals the value. Verified against live data
+# 2026-10-20 (task-13-fix-report.md section 8b; endpoints fetched fresh,
+# every endpoint quantization "unknown", status 0):
+#   ("Amazon Bedrock", "amazon")   -- amazon/nova-2-lite-v1, 2 endpoints
+#   ("Google AI Studio", "google") -- google/gemini-2.5-pro-preview, 3 endpoints
+#   ("Mistral", "mistralai")       -- mistralai/mistral-large-4-0, 3 endpoints
+# Add entries only after the same live verification -- never pin an
+# unverified string.
+FIRST_PARTY_ALIASES: dict[str, str] = {
+    "Amazon Bedrock": "amazon",
+    "Google AI Studio": "google",
+    "Mistral": "mistralai",
+}
 
 
 def warn(msg: str) -> None:
@@ -193,16 +205,22 @@ def is_first_party(provider_name: str, author: str) -> bool:
     """True iff the provider is the model's own maker or a partner host.
 
     Criterion 1: the normalized provider name equals the normalized author
-    slug. Criterion 2: it matches a normalized FIRST_PARTY_HOSTS entry or a
-    normalized FIRST_PARTY_ALIASES value. Everything else is third-party.
+    slug. Criterion 2: it matches a normalized FIRST_PARTY_HOSTS entry, or
+    a FIRST_PARTY_ALIASES key whose value equals the normalized author slug
+    (the §4.2 alias pairs: a maker self-naming differently than its author
+    slug is first-party only for that author). Everything else is
+    third-party.
     """
     provider = normalize_provider(provider_name)
     if provider == normalize_provider(author):
         return True
     if provider in {normalize_provider(host) for host in FIRST_PARTY_HOSTS}:
         return True
+    author_slug = normalize_provider(author)
     return any(
-        provider == normalize_provider(alias) for alias in FIRST_PARTY_ALIASES.values()
+        provider == normalize_provider(alias_provider)
+        and author_slug == normalize_provider(alias_author)
+        for alias_provider, alias_author in FIRST_PARTY_ALIASES.items()
     )
 
 

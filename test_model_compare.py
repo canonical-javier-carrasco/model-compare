@@ -1061,6 +1061,66 @@ def test_first_party_author_and_partner():
     assert not is_first_party("OpenInference", "z-ai")
 
 
+@pytest.mark.parametrize(
+    ("provider_name", "author"),
+    [
+        ("Amazon Bedrock", "amazon"),
+        ("Google AI Studio", "google"),
+        ("Mistral", "mistralai"),
+    ],
+)
+def test_first_party_alias_matches_verified_live_names(provider_name, author):
+    # Live-verified §4.2 pairs (2026-10-20, task-13-fix-report.md 8b): these
+    # makers self-name differently than their author slugs -- normalization
+    # alone cannot bridge "Amazon Bedrock" to "amazon". The alias pair does.
+    assert is_first_party(provider_name, author)
+    # Both sides compare normalized, so case/punctuation variants match.
+    assert is_first_party(provider_name.upper(), author.upper())
+    assert is_first_party(provider_name.lower(), author.replace("-", "_"))
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "author"),
+    [
+        ("Amazon Bedrock", "google"),
+        ("Google AI Studio", "mistralai"),
+        ("Mistral", "amazon"),
+    ],
+)
+def test_first_party_alias_requires_author_match(provider_name, author):
+    # The alias binds a provider name to ONE author slug: the same provider
+    # name stays third-party for every other author (an alias must never
+    # hand a model a first-party carve-out it did not verify for).
+    assert not is_first_party(provider_name, author)
+
+
+def test_default_precision_derivation_uses_alias():
+    # The live amazon/nova-2-lite-v1 shape, offline: an all-unknown-quant
+    # maker endpoint gets default_precision None (nothing ranks) and is
+    # ineligible for a third-party author -- but eligible through the
+    # carve-out for the alias-matched author, becoming the baseline.
+    args = make_args()
+    eps = mc.parse_endpoints(
+        {
+            "data": {
+                "endpoints": [
+                    _endpoint(
+                        provider_name="Amazon Bedrock",
+                        tag="amazon-bedrock",
+                        quantization="unknown",
+                    )
+                ]
+            }
+        }
+    )
+    assert mc.derive_default_precision(eps, "amazon") is None
+    # A different author gets no carve-out from this provider.
+    assert not mc.baseline_eligible(eps[0], None, "acme", args)
+    # The alias-matched author does, and the endpoint is the only baseline.
+    assert mc.baseline_eligible(eps[0], None, "amazon", args)
+    assert mc.pick_baseline(eps, [True], args)["tag"] == "amazon-bedrock"
+
+
 # ---------------------------------------------------------------------------
 # Provider-aware eval: endpoint fetch, parsing, variant + schedule gate
 # ---------------------------------------------------------------------------
