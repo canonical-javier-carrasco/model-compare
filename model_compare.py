@@ -113,6 +113,14 @@ CATALOG_DROP_REASONS = (
     "endpoint_fetch_failed",
 )
 
+# The only reasons the endpoint stage itself produces (the last two
+# CATALOG_DROP_REASONS entries) -- the empty-pool warning keys on them;
+# web/publish.py keeps its own copy of this tuple by design.
+ENDPOINT_DROP_REASONS = (
+    "no_baseline_eligible_endpoint",
+    "endpoint_fetch_failed",
+)
+
 PAREN_RE = re.compile(r"\([^)]*\)")
 PROVIDER_PREFIX_RE = re.compile(r"^[^:\s]{1,30}:\s*")
 
@@ -333,14 +341,25 @@ def load_cache_expired(name: str) -> dict | None:
 def parse_endpoints(payload) -> list[dict]:
     """Keep the verified per-endpoint fields of an endpoints response.
 
-    `pricing` keeps prompt/completion (parsed through parse_price) and the
-    raw `overrides` list -- the tiered-pricing machinery parses the entries
-    itself. Fields beyond the verified live shape (brainstorm section 2.1)
-    are dropped, and the parse keeps `status` as-is (the caller filters).
+    The live GET /api/v1/models/{id}/endpoints response nests the list one
+    level below the usual envelope: `data` is the model object (id, name,
+    architecture, ...) and the per-provider entries live in
+    `data["endpoints"]`. `pricing` keeps prompt/completion (parsed through
+    parse_price) and the raw `overrides` list -- the tiered-pricing
+    machinery parses the entries itself. Fields beyond the verified
+    per-entry shape are dropped, and the parse keeps `status` as-is (the
+    caller filters).
     """
+    # Task 13 lesson: the first unit fixtures fed the models/find shape
+    # ({"data": [entry, ...]}) -- a list directly under "data" -- so the
+    # suite stayed green while every live parse returned [] and the whole
+    # pool died as no_baseline_eligible_endpoint. Pin the live envelope:
+    # the list is read ONLY from data["endpoints"], and every other shape
+    # parses to [] (no compat branch for the wrong fixture shape).
     data = payload.get("data") if isinstance(payload, dict) else None
+    entries = data.get("endpoints") if isinstance(data, dict) else None
     endpoints = []
-    for entry in data or []:
+    for entry in entries or []:
         if not isinstance(entry, dict):
             continue
         raw = entry.get("pricing")
@@ -2886,10 +2905,19 @@ def run(args, models, or_cached) -> int:
     candidates, extra_dropped = apply_endpoint_pricing(candidates, args, filtered)
     dropped.update(extra_dropped)
     if not candidates:
-        warn(
-            f"no models satisfy the filters (min-context={args.min_context}, "
-            f"tools={'off' if args.no_require_tools else 'required'}); relax them and retry"
-        )
+        # When the endpoint stage wiped the pool, naming the filter knobs is
+        # misleading (they passed; the drops came after) -- warn with the
+        # endpoint-stage drop counts instead (both reasons, zero-filled).
+        counts = {r: extra_dropped.get(r, 0) for r in ENDPOINT_DROP_REASONS}
+        if any(counts.values()):
+            bits = ", ".join(f"{k}={v}" for k, v in counts.items())
+            warn(f"no models after the endpoint stage: {bits}")
+        else:
+            warn(
+                f"no models satisfy the filters (min-context={args.min_context}, "
+                f"tools={'off' if args.no_require_tools else 'required'}); "
+                "relax them and retry"
+            )
         return 2
 
     quality_by_id, quality_source_by_id = resolve_quality(

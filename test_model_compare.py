@@ -1082,7 +1082,18 @@ def _endpoint(**overrides):
 
 
 def test_parse_endpoints_keeps_verified_fields():
-    eps = mc.parse_endpoints({"data": [_endpoint()]})
+    # Live envelope (Task 13 lesson): the list lives ONLY at data.endpoints.
+    # The first fixtures fed the models/find shape (a bare list under
+    # "data"), so the suite stayed green while every live parse returned []
+    # and the whole pool died as no_baseline_eligible_endpoint. No
+    # shape-compat: every other shape keeps parsing to [] (fail closed).
+    assert mc.parse_endpoints({"data": [_endpoint()]}) == []
+    assert mc.parse_endpoints({"data": {"models": [{"slug": "acme/a"}]}}) == []
+    assert mc.parse_endpoints({"data": None}) == []
+    assert mc.parse_endpoints({}) == []
+    assert mc.parse_endpoints([]) == []
+    assert mc.parse_endpoints(None) == []
+    eps = mc.parse_endpoints({"data": {"endpoints": [_endpoint()]}})
     assert eps[0]["provider_name"] == "Z.AI" and eps[0]["status"] == 0
     assert eps[0]["pricing"]["prompt"] == 0.00000015
     assert eps[0]["pricing"]["completion"] == 0.0000005
@@ -1133,7 +1144,7 @@ def test_fetch_model_endpoints_round_trip(monkeypatch):
     read (refetches) but still writes; a second call serves from the cache
     without hitting the network again.
     """
-    payload = {"data": [_endpoint()]}
+    payload = {"data": {"endpoints": [_endpoint()]}}
     calls = []
 
     def fake_fetch_json(url, headers=None, timeout=30, retries=1):
@@ -1746,20 +1757,22 @@ def _endpoint_stage_eps():
     """
     return mc.parse_endpoints(
         {
-            "data": [
-                _endpoint(
-                    provider_name="Z.AI",
-                    tag="z-ai/fp8",
-                    quantization="fp8",
-                    pricing={"prompt": "0.0000002", "completion": "0.0000004"},
-                ),
-                _endpoint(
-                    provider_name="DeepInfra",
-                    tag="deepinfra/fp4",
-                    quantization="fp4",
-                    pricing={"prompt": "0.0000001", "completion": "0.0000002"},
-                ),
-            ]
+            "data": {
+                "endpoints": [
+                    _endpoint(
+                        provider_name="Z.AI",
+                        tag="z-ai/fp8",
+                        quantization="fp8",
+                        pricing={"prompt": "0.0000002", "completion": "0.0000004"},
+                    ),
+                    _endpoint(
+                        provider_name="DeepInfra",
+                        tag="deepinfra/fp4",
+                        quantization="fp4",
+                        pricing={"prompt": "0.0000001", "completion": "0.0000002"},
+                    ),
+                ]
+            }
         }
     )
 
@@ -1819,6 +1832,35 @@ def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
     # display annotations, marked stale (the model is not ranked on them).
     assert entry["annotations"]["stale"] is True
     bsd.validate_catalog(doc)
+
+
+def test_empty_pool_after_endpoint_drops_warns_with_drop_counts(monkeypatch, capsys):
+    # The pre-endpoint "no models satisfy the filters" wording would point
+    # at filters that already passed; when the endpoint stage wipes the
+    # pool, the warning must name the endpoint drop counts instead (Task
+    # 13 fix: 73 no_baseline_eligible_endpoint used to print as a filter
+    # complaint). The message is the operator's diagnosis entry point.
+    models = [
+        make_model(id="z-ai/glm", name="Z.AI: GLM"),
+        make_model(id="acme/plain", name="Acme: Plain"),
+    ]
+    endpoints_by_id = {
+        "z-ai/glm": [
+            _endpoint(provider_name="Relace", tag="relace/x", quantization="unknown")
+        ],
+        "acme/plain": [
+            _endpoint(provider_name="Relace", tag="relace/x", quantization="unknown")
+        ],
+    }
+    _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id)
+    args = make_args(min_context=0, catalog=True)
+    assert mc.run(args, models, False) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""  # no document
+    assert (
+        "no models after the endpoint stage: "
+        "no_baseline_eligible_endpoint=2, endpoint_fetch_failed=0" in captured.err
+    )
 
 
 def test_candidate_pricing_replaced_by_baseline(monkeypatch):
