@@ -1596,7 +1596,9 @@ def test_row_keys_optional_passthrough():
     rows["balanced"][0]["sched_detail"] = None
     data = bsd.build_data("openrouter/acme/model-a", rows)
     assert data["priorities"]["balanced"][0]["tier_note"] == ">100k"
-    # rows without the new keys validate fine (make_priorities default)
+    # data.json v2: the missing-key check demands the new keys on every row;
+    # make_priorities' default fixture carries them null-valued (the
+    # producer's pre-endpoint degradation), so validation passes.
     bsd.build_data("openrouter/acme/model-a", make_priorities())
 
 

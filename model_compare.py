@@ -913,9 +913,12 @@ def apply_endpoint_pricing(candidates, args, filtered):
 
     A baseline whose prices are missing/non-finite counts as unusable
     (pick_baseline's blended-price skip is authoritative for the top-level
-    effective prices; the same finiteness bar applies to the base prices the
-    mutation would publish). Returns (surviving candidates in the original
-    order, dropped counts for the two new reasons).
+    effective prices). The same bar applies to the base prices the mutation
+    would publish: parse_price returns float | None, so a None base price
+    (tier-over-None-base endpoint) is reachable -- the isinstance(..., float)
+    half of the guard is load-bearing for None, not a redundant type check.
+    Returns (surviving candidates in the original order, dropped counts for
+    the two new reasons).
     """
     extra_dropped: dict[str, int] = {}
     if not candidates:

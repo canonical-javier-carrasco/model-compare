@@ -1,7 +1,7 @@
 # model-compare — the picks site
 
 [canonical.github.io/model-compare](https://canonical.github.io/model-compare/)
-is a static GitHub Pages site, rebuilt from scratch every 6 hours by the
+is a static GitHub Pages site, rebuilt from scratch every 3 hours by the
 `publish` workflow (plus manual runs). Everything it needs lives in this
 directory; the ranking itself always comes from the standalone
 [`model_compare.py`](../model_compare.py) at the repo root, invoked as a
@@ -12,7 +12,7 @@ subprocess.
 | file | what it is |
 |------|------------|
 | `index.html` | the picks page: top-20 table per priority tab (10 shown, "Show more" expands) with copy buttons, a 7-day movement column, the TIER column and the Off-peak deals table (dark theme by default, light when the system or browser reports light) |
-| `data.json` | the rendered rows: per-priority top 20 plus the current best id and the off-peak `schedules` rows; schema-versioned (`schema_version`, currently 1) |
+| `data.json` | the rendered rows: per-priority top 20 plus the current best id and the off-peak `schedules` rows; schema-versioned (`schema_version`, currently 2) |
 | `best.txt` | the current *balanced* #1 as a plain `opencode --model`-ready id |
 | `catalog.json` | the full `--catalog` document (stable contract, see [DESIGN.md](../DESIGN.md)) |
 | `history.json` | rolling 10-day snapshot history feeding the 7-day column |
@@ -55,9 +55,11 @@ highlights.
 - **7-day column** — each row is compared against the history snapshot dated
   exactly one week back: `▴N` if the model climbed, `▾N` if it slipped, `•` if
   it held rank, `new` if it was not in the top 20 then. Blank during the first
-  week of data collection — also deliberately true for one week after the
-  catalog-v2 deploy, which reset history so base-tier baselines could not be
-  diffed against effective-tier prices.
+  week of data collection — also deliberately true for one week after each
+  history reset: the catalog-v2 deploy (old snapshots priced at base-tier
+  baselines not diffable against effective-tier prices) and the history-v3
+  cutover (old snapshots priced at advertised models-API scalars not diffable
+  against baseline-endpoint prices).
 - **Off-peak deals** — the second table lists the top 10 models with
   scheduled discount windows (sub-1% discounts excluded), ranked by discount size; prices shown are the discounted
   off-peak rates. It is built from the catalog's `schedules` index, which is

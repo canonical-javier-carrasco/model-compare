@@ -54,7 +54,7 @@ No dependencies beyond Python 3.10+ (stdlib only). Exit codes: `0` success,
 ## Published picks
 
 No need to run anything: a [GitHub Actions workflow](web/README.md) refreshes
-[the picks](https://canonical.github.io/model-compare/) every 6 hours, and
+[the picks](https://canonical.github.io/model-compare/) every 3 hours, and
 `best.txt` always serves the current *balanced* #1 as a plain model id:
 
 ```console
