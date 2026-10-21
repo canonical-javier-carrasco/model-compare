@@ -370,6 +370,54 @@ def _validate_catalog_annotations(annotations, label) -> None:
             raise ValueError(f"{label} {key} must be a boolean")
 
 
+def _validate_catalog_steering(steering, label) -> None:
+    """Schema v3 steering block (design section 4.7): null, or the
+    OpenRouter provider routing object the plugin contract reads.
+
+    build_steering emits {"model": id, "provider": {order, ignore,
+    quantizations?, allow_fallbacks}} -- provider's keys are a subset of
+    the four the design pins, with quantizations OMITTED entirely when
+    default_precision is null (never an empty list), so it is optional
+    here. Unknown keys fail: the site reads these shapes verbatim.
+    """
+    if steering is None:
+        return
+    if not isinstance(steering, dict):
+        raise ValueError(f"{label} is not an object")
+    model = steering.get("model")
+    if not isinstance(model, str) or not model:
+        raise ValueError(f"{label} model must be a non-empty string")
+    provider = steering.get("provider")
+    if not isinstance(provider, dict):
+        raise ValueError(f"{label} provider is not an object")
+    allowed = ("order", "ignore", "quantizations", "allow_fallbacks")
+    unknown = [key for key in provider if key not in allowed]
+    if unknown:
+        raise ValueError(f"{label} provider has unknown keys: " + ", ".join(unknown))
+    for key in ("order", "ignore"):
+        if key not in provider:
+            continue
+        tags = provider[key]
+        if not isinstance(tags, list) or any(
+            not isinstance(tag, str) or not tag for tag in tags
+        ):
+            raise ValueError(
+                f"{label} provider.{key} must be a list of non-empty strings"
+            )
+    if "quantizations" in provider:
+        quants = provider["quantizations"]
+        if not isinstance(quants, list) or any(
+            quant not in PRECISION_LADDER for quant in quants
+        ):
+            raise ValueError(
+                f"{label} provider.quantizations must be precision-ladder keys"
+            )
+    if "allow_fallbacks" in provider and not isinstance(
+        provider["allow_fallbacks"], bool
+    ):
+        raise ValueError(f"{label} provider.allow_fallbacks must be a boolean")
+
+
 def _validate_catalog_session_cost(session_cost) -> None:
     """Top-level session-cost envelope (Task 7), present only when the
     fetch succeeded: harness attribution, window meta and per-model medians
@@ -615,6 +663,9 @@ def validate_catalog(document) -> None:
             entry["advertised_pricing"], f"models[{i}] advertised_pricing"
         )
         _validate_catalog_annotations(entry["annotations"], f"models[{i}] annotations")
+        # Steering is optional here (old fixtures lack it; not in CATALOG_ENTRY_KEYS).
+        if "steering" in entry:
+            _validate_catalog_steering(entry["steering"], f"models[{i}] steering")
     # ids double as the document's primary key for downstream consumers:
     # unique within models, and never also present in filtered.
     model_ids = [entry["id"] for entry in models]

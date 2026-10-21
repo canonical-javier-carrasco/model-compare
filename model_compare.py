@@ -2493,6 +2493,13 @@ def print_json(top):
             # (Task 11 shows it verbatim). Emit-first: Task 9's ROW_KEYS
             # pins this key last; pre-endpoint candidates degrade to None.
             "quant_note": fmt_quant_note(cand.get("annotations")),
+            # One extra row key AFTER quant_note -- steering is NOT in
+            # ROW_KEYS. build_site_data's row check is missing-key-only, so
+            # extras pass through (tier_note precedent) and the site
+            # ignores it. The OpenRouter provider routing object (design
+            # section 4.7) the plugin contract reads; pre-endpoint
+            # candidates degrade to None.
+            "steering": cand.get("steering"),
         }
         for cand in top
     ]
@@ -2646,6 +2653,10 @@ def build_catalog(
                 "default_precision": cand.get("default_precision"),
                 "advertised_pricing": cand.get("advertised_pricing"),
                 "annotations": cand.get("annotations"),
+                # The OpenRouter provider routing object (design section
+                # 4.7) the plugin contract reads -- same null-default
+                # degradation shape as the blocks above.
+                "steering": cand.get("steering"),
             }
         )
     entries.sort(key=lambda e: (-e["scores"]["overall"]["balanced"], e["id"]))

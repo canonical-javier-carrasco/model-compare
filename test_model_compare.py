@@ -1930,14 +1930,17 @@ def test_json_rows_carry_new_additive_keys(monkeypatch, capsys):
     (row,) = json.loads(capsys.readouterr().out)
     # The missing-key check build_site_data does still passes, and the five
     # new keys close the row in the exact order Task 9's ROW_KEYS extension
-    # pins (quant_note trails: Task 6b appended it after Task 6's four).
+    # pins (quant_note trails: Task 6b appended it after Task 6's four) --
+    # with Task 12b's steering trailing them all (an extra key NOT in
+    # ROW_KEYS; the row check is missing-key-only, so it passes through).
     assert all(key in row for key in bsd.ROW_KEYS)
-    assert list(row)[-5:] == [
+    assert list(row)[-6:] == [
         "default_precision",
         "risk_flag",
         "price_spread",
         "session_cost_usd",
         "quant_note",
+        "steering",
     ]
     assert row["default_precision"] == "fp8"
     assert row["risk_flag"] is True
@@ -2087,10 +2090,43 @@ def test_json_rows_carry_quant_note(monkeypatch, capsys):
     (row,) = json.loads(capsys.readouterr().out)
     # Appended after Task 6's four keys; Task 9's ROW_KEYS extension pins
     # quant_note as the fifth (emit-first keeps the missing-key check green).
-    assert list(row)[-1] == "quant_note"
+    # Task 12b's steering trails it as an extra key NOT in ROW_KEYS.
+    assert list(row)[-2:] == ["quant_note", "steering"]
     assert row["quant_note"] == (
         "cheapest non-baseline: fp4 @ DeepInfra, $0.125/M in (0.50x baseline)"
     )
+
+
+def test_json_rows_carry_steering_block(monkeypatch, capsys):
+    args = make_args(min_context=0)
+    monkeypatch.setattr(
+        mc, "fetch_model_endpoints", lambda mid, a: _endpoint_stage_eps()
+    )
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    candidates, _ = mc.build_candidates(models, args, {}, {"z-ai/glm"}, [])
+    candidates, _ = mc.apply_endpoint_pricing(candidates, args, [])
+    mc.compute_scores(candidates, args, {})
+    mc.print_json(candidates)
+    (row,) = json.loads(capsys.readouterr().out)
+    # The build_steering output shape (design section 4.7), verbatim from
+    # the endpoint stage's attachment: the baseline-eligible fp8 endpoint
+    # first in order, the live-but-ineligible fp4 endpoint ignored, and
+    # quantizations at or above the fp8 default.
+    assert row["steering"] == {
+        "model": "z-ai/glm",
+        "provider": {
+            "order": ["z-ai/fp8"],
+            "ignore": ["deepinfra/fp4"],
+            "quantizations": ["fp8"],
+            "allow_fallbacks": True,
+        },
+    }
+    # Pre-endpoint candidates (historical test paths) degrade to None --
+    # the same pattern as the other additive row keys.
+    mc.print_json(_scored_candidates())
+    by_model = {r["model"]: r for r in json.loads(capsys.readouterr().out)}
+    assert by_model["acme/tiered"]["steering"] is None
+    assert by_model["acme/plain"]["steering"] is None
 
 
 def test_endpoint_stage_applies_results_in_candidate_order(monkeypatch):
@@ -3904,7 +3940,11 @@ def test_catalog_entry_shape():
     doc = build_doc()
     assert {e["id"] for e in doc["models"]} == {"acme/model-a", "acme/model-b"}
     for entry in doc["models"]:
-        assert set(entry) == CATALOG_ENTRY_KEYS
+        # Task 12b's steering is an extra entry key NOT in CATALOG_ENTRY_KEYS:
+        # the producer emits it on every entry, but validate_catalog must
+        # keep accepting pre-endpoint-shaped documents that lack it, so it
+        # stays optional (outside the required set).
+        assert set(entry) == CATALOG_ENTRY_KEYS | {"steering"}
         assert set(entry["pricing"]) == {
             "input_per_1m",
             "output_per_1m",
@@ -4978,6 +5018,33 @@ def test_catalog_entry_carries_endpoint_blocks(monkeypatch, capsys):
     # source state is deterministic "ok" (failures surface as pool.dropped
     # counts, not source state).
     assert doc["sources"]["endpoints"] == "ok"
+
+
+def test_catalog_entry_carries_steering_block(monkeypatch, capsys):
+    eps = _endpoint_stage_eps()
+    models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
+    doc = _catalog_v3_doc(monkeypatch, capsys, models, {"z-ai/glm": eps})
+    (entry,) = doc["models"]
+    # The build_steering output shape (design section 4.7), the same dict
+    # the --json row carries.
+    assert entry["steering"] == {
+        "model": "z-ai/glm",
+        "provider": {
+            "order": ["z-ai/fp8"],
+            "ignore": ["deepinfra/fp4"],
+            "quantizations": ["fp8"],
+            "allow_fallbacks": True,
+        },
+    }
+    # Pre-endpoint-shaped fixtures (candidates that never went through the
+    # endpoint stage) degrade to null -- the same .get() pattern as the
+    # other additive entry keys. _scored_candidates() yields two, both
+    # pre-endpoint.
+    args = make_args(min_context=0, catalog=True)
+    doc = mc.build_catalog(
+        args, models, _scored_candidates(), {}, [], {}, {}, None, {}, {}
+    )
+    assert all(entry["steering"] is None for entry in doc["models"])
 
 
 def test_catalog_session_cost_block_omitted_keyless(monkeypatch, capsys):

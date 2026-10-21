@@ -1793,6 +1793,48 @@ def test_validate_catalog_accepts_subset_of_medians():
     bsd.validate_catalog(doc)  # must not raise
 
 
+def _v3_steering_block():
+    """A well-formed schema-v3 steering block (producer shape)."""
+    return {
+        "model": "acme/model-a",
+        "provider": {
+            "order": ["acme/fp8"],
+            "ignore": ["acme/fp4"],
+            "quantizations": ["fp8"],
+            "allow_fallbacks": True,
+        },
+    }
+
+
+def test_validate_catalog_accepts_steering():
+    doc = make_catalog()
+    doc["models"][0]["steering"] = _v3_steering_block()
+    bsd.validate_catalog(doc)  # must not raise
+    # The null-default degradation shape the producer emits for
+    # pre-endpoint candidates.
+    doc["models"][0]["steering"] = None
+    bsd.validate_catalog(doc)  # must not raise
+    # Old fixtures (pre-endpoint-shaped documents) lack the key entirely:
+    # the missing-key-only check tolerates its absence.
+    bsd.validate_catalog(make_catalog())  # must not raise
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda st: st["provider"].update(tag="acme/fp8"),  # key outside the allowed set
+        lambda st: st["provider"]["order"].append(42),  # order entry not a string
+        lambda st: st["provider"].update(allow_fallbacks="yes"),  # non-bool
+    ],
+)
+def test_validate_catalog_rejects_bad_steering(mutate):
+    doc = make_catalog()
+    doc["models"][0]["steering"] = _v3_steering_block()
+    mutate(doc["models"][0]["steering"])
+    with pytest.raises(ValueError):
+        bsd.validate_catalog(doc)
+
+
 def test_rows_carry_new_keys_ordered_by_ranking():
     # data.json v2 rows: the five additive keys survive the projection onto
     # the catalog rankings (same fence as the pre-existing keys).
