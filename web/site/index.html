@@ -515,7 +515,9 @@
     </div>
 
     <footer>
-      data generated <span id="generated">—</span> · source:
+      data generated <span id="generated">—</span><span id="rev-block" hidden>
+        · rev <a id="rev-link" href="#">—</a></span
+      > · source:
       <a href="https://github.com/canonical/model-compare"
         >canonical/model-compare</a
       >
@@ -532,6 +534,8 @@
         status: document.getElementById("status"),
         generated: document.getElementById("generated"),
         generatedTop: document.getElementById("generated-top"),
+        revBlock: document.getElementById("rev-block"),
+        revLink: document.getElementById("rev-link"),
         copyModel: document.getElementById("copy-model"),
         copyCommand: document.getElementById("copy-command"),
         copyCurl: document.getElementById("copy-curl"),
@@ -1253,6 +1257,13 @@
             var stamp = new Date(data.generated_at).toLocaleString();
             els.generated.textContent = stamp;
             els.generatedTop.textContent = stamp;
+            if (data.source_revision) {
+              els.revBlock.hidden = false;
+              els.revLink.href =
+                "https://github.com/canonical/model-compare/commit/" +
+                data.source_revision;
+              els.revLink.textContent = data.source_revision;
+            }
             render();
           })
           .catch(function (err) {

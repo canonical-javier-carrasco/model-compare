@@ -45,6 +45,31 @@ MAX_ENDPOINT_DROP_RATE = 0.05
 ENDPOINT_DROP_REASONS = ("no_baseline_eligible_endpoint", "endpoint_fetch_failed")
 
 
+def resolve_revision() -> str:
+    """Return the revision that built the site (short commit hash).
+
+    CI sets GITHUB_SHA; locally, fall back to the checkout's git HEAD.
+    The revision is stamped into data.json so the site is always
+    traceable to the code that produced it, without versioning the web
+    itself. Fails loudly when unresolvable: an unattributable deploy is
+    treated like any other unexpected result.
+    """
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha[:7]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"publish: cannot resolve site revision: {exc}") from exc
+    return result.stdout.strip()
+
+
 def run_script(script: Path, args: list[str], out: Path | None = None) -> None:
     """Run a repo script, optionally redirecting stdout into `out`."""
     cmd = [sys.executable, str(script), *args]
@@ -305,6 +330,8 @@ def build_site(output_dir: Path) -> None:
                 str(scratch / "history-prev.json"),
                 "--highlights-file",
                 str(scratch / "highlights-new.json"),
+                "--revision",
+                resolve_revision(),
                 *priority_args,
             ],
         )

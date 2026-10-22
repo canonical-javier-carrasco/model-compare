@@ -38,6 +38,8 @@ class _TruncatedResp:
 
 STAMP = "2026-09-28T06:00:00Z"
 BEST = "openrouter/z-ai/glm-5.3-flash"
+# What resolve_revision's git rev-parse stub answers in pipeline tests.
+STUB_REV = "deadbee"
 
 
 def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
@@ -94,7 +96,12 @@ def _fake_run(
     aa=HEALTHY_AA,
     pool=HEALTHY_POOL,
 ):
-    def fake_run(cmd, cwd=None, stdout=None, check=True):
+    def fake_run(cmd, cwd=None, stdout=None, check=True, **kwargs):
+        if Path(cmd[0]).name == "git":
+            # resolve_revision's git rev-parse (capture_output, no stdout
+            # file): never part of the recorded pipeline, it only supplies
+            # the data.json stamp value.
+            return subprocess.CompletedProcess(cmd, 0, stdout=STUB_REV + "\n")
         calls.append(cmd)
         if _is_catalog_run(cmd):
             stdout.write(
@@ -167,7 +174,8 @@ def test_build_site_pipeline_order_and_assembly(tmp_path, monkeypatch):
     assert bsd_paths[0] == out / "best.txt"
     assert bsd_paths[1] == out / "data.json"
     assert bsd_paths[2].parent == gh_paths[0].parent  # shared scratch dir
-    priority_values = bsd_cmd[13::2]
+    assert bsd_cmd[12:14] == ["--revision", STUB_REV]
+    priority_values = bsd_cmd[15::2]
     assert [p.split("=", 1)[0] for p in priority_values] == [
         "balanced",
         "price",
@@ -237,7 +245,9 @@ def test_fetch_prev_returns_none_on_error(monkeypatch):
 def test_fetch_success_feeds_prev_files_to_generators(tmp_path, monkeypatch):
     seen = {}
 
-    def fake_run(cmd, cwd=None, stdout=None, check=True):
+    def fake_run(cmd, cwd=None, stdout=None, check=True, **kwargs):
+        if Path(cmd[0]).name == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=STUB_REV + "\n")
         if _is_catalog_run(cmd):
             stdout.write(
                 json.dumps(
@@ -266,7 +276,9 @@ def test_fetch_success_feeds_prev_files_to_generators(tmp_path, monkeypatch):
 def test_build_site_fails_when_expected_artifacts_missing(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run(cmd, cwd=None, stdout=None, check=True):
+    def fake_run(cmd, cwd=None, stdout=None, check=True, **kwargs):
+        if Path(cmd[0]).name == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=STUB_REV + "\n")
         calls.append(cmd)
         if _is_catalog_run(cmd):
             stdout.write(
@@ -646,3 +658,47 @@ def test_main_output_dir_default(monkeypatch):
     rc = publish.main([])
     assert rc == 0
     assert seen["out"] == publish.REPO_ROOT / "_site"
+
+
+# ---------------------------------------------------------------------------
+# resolve_revision: the site's source stamp (GITHUB_SHA, else git HEAD)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_revision_prefers_github_sha(monkeypatch):
+    # CI's checkout SHA wins over the local HEAD, and only the first 7
+    # characters are kept (the short-hash form stamped into data.json).
+    monkeypatch.setenv("GITHUB_SHA", "fedcba9876543210fedcba9876543210fedcba98")
+    assert publish.resolve_revision() == "fedcba9"
+
+
+def test_resolve_revision_falls_back_to_git_head(monkeypatch):
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+
+    def fake_run(cmd, cwd, check, capture_output, text):
+        assert cmd == ["git", "rev-parse", "--short", "HEAD"]
+        assert cwd == publish.REPO_ROOT
+        return subprocess.CompletedProcess(cmd, 0, stdout=STUB_REV + "\n")
+
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    assert publish.resolve_revision() == STUB_REV
+
+
+def test_resolve_revision_fails_loudly_when_git_unavailable(monkeypatch):
+    # An unattributable deploy is treated like any other unexpected
+    # result: the run must fail before anything is published.
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+    monkeypatch.setattr(
+        publish.subprocess,
+        "run",
+        _raise(OSError("git: not found")),
+    )
+    with pytest.raises(RuntimeError, match="cannot resolve site revision"):
+        publish.resolve_revision()
+
+
+def _raise(exc):
+    def _run(*args, **kwargs):
+        raise exc
+
+    return _run

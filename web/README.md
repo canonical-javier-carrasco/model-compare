@@ -1,8 +1,9 @@
 # model-compare — the picks site
 
 [canonical.github.io/model-compare](https://canonical.github.io/model-compare/)
-is a static GitHub Pages site, rebuilt from scratch every 3 hours by the
-`publish` workflow (plus manual runs). Everything it needs lives in this
+is a static GitHub Pages site, rebuilt from scratch on every push to `main`
+by the `publish` workflow (plus 3-hour cron refreshes and manual runs).
+Everything it needs lives in this
 directory; the ranking itself always comes from the standalone
 [`model_compare.py`](../model_compare.py) at the repo root, invoked as a
 subprocess.
@@ -12,7 +13,7 @@ subprocess.
 | file | what it is |
 |------|------------|
 | `index.html` | the picks page: top-20 table per priority tab (10 shown, "Show more" expands) with copy buttons, a 7-day movement column, the TIER column and the Off-peak deals table (dark theme by default, light when the system or browser reports light) |
-| `data.json` | the rendered rows: per-priority top 20 plus the current best id and the off-peak `schedules` rows; schema-versioned (`schema_version`, currently 2) |
+| `data.json` | the rendered rows: per-priority top 20 plus the current best id and the off-peak `schedules` rows; schema-versioned (`schema_version`, currently 2) and stamped with the `source_revision` (short commit hash) that built it — the footer links it to the exact commit |
 | `best.txt` | the current *balanced* #1 as a plain `opencode --model`-ready id |
 | `catalog.json` | the full `--catalog` document (stable contract, see [DESIGN.md](../DESIGN.md)) |
 | `history.json` | rolling 10-day snapshot history feeding the 7-day column |

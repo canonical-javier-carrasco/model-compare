@@ -1141,6 +1141,46 @@ def test_build_data_defaults_generated_at_to_now():
     assert data["generated_at"] == "2026-09-16T00:00:05+00:00"
 
 
+# ---------------------------------------------------------------------------
+# source_revision: the web's traceability stamp (no web versioning)
+# ---------------------------------------------------------------------------
+
+
+def test_build_data_stamps_source_revision():
+    data = bsd.build_data("acme/model-a", make_priorities(), revision="abc1234")
+    assert data["source_revision"] == "abc1234"
+
+
+def test_build_data_strips_source_revision():
+    data = bsd.build_data("acme/model-a", make_priorities(), revision="  abc1234  ")
+    assert data["source_revision"] == "abc1234"
+
+
+def test_build_data_omits_source_revision_when_absent():
+    data = bsd.build_data("acme/model-a", make_priorities())
+    assert "source_revision" not in data
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 42, ["abc1234"]])
+def test_build_data_rejects_malformed_revision(bad):
+    with pytest.raises(ValueError, match="revision"):
+        bsd.build_data("acme/model-a", make_priorities(), revision=bad)
+
+
+def test_main_stamps_source_revision(tmp_path):
+    argv, out = catalog_argv(tmp_path)
+    assert bsd.main([*argv, "--revision", "abc1234"]) == 0
+    written = json.loads(out.read_text())
+    assert written["source_revision"] == "abc1234"
+
+
+def test_main_omits_source_revision_without_flag(tmp_path):
+    argv, out = catalog_argv(tmp_path)
+    assert bsd.main(argv) == 0
+    written = json.loads(out.read_text())
+    assert "source_revision" not in written
+
+
 def test_main_stamps_data_json_with_catalog_generated_at(tmp_path):
     # Catalog made just before UTC midnight, data.json built just after: the
     # site's D-7 baseline must use the catalog date that keys the history.

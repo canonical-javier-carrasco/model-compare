@@ -1044,7 +1044,9 @@ def project_schedules(catalog) -> list:
     return [item[2] for item in decorated[:10]]
 
 
-def build_data(best, priorities, now=None, generated_at=None, catalog=None) -> dict:
+def build_data(
+    best, priorities, now=None, generated_at=None, catalog=None, revision=None
+) -> dict:
     """Validate the rows and wrap them into the data.json document.
 
     generated_at, when given, is used verbatim (main passes the catalog's
@@ -1053,10 +1055,18 @@ def build_data(best, priorities, now=None, generated_at=None, catalog=None) -> d
     catalog, when given (already validated), is the ranking authority: each
     priority's rows are reordered to catalog["rankings"] via order_rows.
     Without it the rows pass through verbatim.
+    revision, when given, is the short commit hash of the source that built
+    this document; it is stamped as source_revision (an additive field, the
+    contract stays at schema_version 2) so the site is traceable to the code
+    that produced it without versioning the web itself. Omitted when absent.
     """
     if not isinstance(best, str) or not MODEL_ID_RE.fullmatch(best.strip()):
         raise ValueError(f"best model id looks wrong: {best!r}")
     best = best.strip()
+    if revision is not None:
+        if not isinstance(revision, str) or not revision.strip():
+            raise ValueError(f"revision must be a non-empty string: {revision!r}")
+        revision = revision.strip()
     if generated_at is not None:
         if not isinstance(generated_at, str) or not generated_at:
             raise ValueError(
@@ -1089,13 +1099,16 @@ def build_data(best, priorities, now=None, generated_at=None, catalog=None) -> d
                 )
             except ValueError as exc:
                 raise ValueError(f"priority {name!r}: {exc}") from None
-    return {
+    document = {
         "schema_version": DATA_SCHEMA_VERSION,
         "generated_at": generated_at,
         "best": best,
         "priorities": rows_by_priority,
         "schedules": project_schedules(catalog) if catalog is not None else [],
     }
+    if revision is not None:
+        document["source_revision"] = revision
+    return document
 
 
 def parse_priority_pair(pair):
@@ -1136,6 +1149,11 @@ def main(argv=None) -> int:
         metavar="NAME=FILE",
         help="priority name and its model_compare.py --json output file",
     )
+    parser.add_argument(
+        "--revision",
+        help="short commit hash of the source that built this document; "
+        "stamped into data.json as source_revision (omitted when not given)",
+    )
     args = parser.parse_args(argv)
     catalog = None
     if args.catalog_file:
@@ -1171,6 +1189,7 @@ def main(argv=None) -> int:
             priorities,
             generated_at=catalog["generated_at"] if catalog is not None else None,
             catalog=catalog,
+            revision=args.revision,
         )
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
