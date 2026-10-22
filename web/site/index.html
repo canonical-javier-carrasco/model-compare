@@ -45,9 +45,10 @@
           -apple-system,
           "Segoe UI",
           sans-serif;
-        max-width: 60rem;
+        max-width: 120rem;
+        width: calc(100% - 2 * clamp(1rem, 4vw, 4rem));
         margin: 2rem auto;
-        padding: 0 1rem;
+        padding: 0.5rem clamp(1rem, 2vw, 2rem);
         line-height: 1.45;
         background: var(--bg);
         color: var(--text);
@@ -358,10 +359,24 @@
       rate once the prompt outgrows their cheap short-context tier.
     </p>
     <p class="hint">
-      <span class="tier">TIER</span> marks how prices vary: a token threshold is
-      the prompt size above which the higher rate applies; a percentage is a
-      scheduled off-peak discount (price shown: the standard rate); SCHED marks
-      a schedule whose discount is under 1%. Hover a cell for details.
+      <strong><span class="tier">TIER</span></strong> marks how prices vary: a
+      token threshold is the prompt size above which the higher rate applies; a
+      percentage is a scheduled off-peak discount (price shown: the standard
+      rate); <strong>SCHED</strong> marks a schedule whose discount is under
+      1%. Hover a cell for details.
+    </p>
+    <p class="hint">
+      <strong>PREC</strong> (precision) is how many bits the model uses to store
+      its parameters — a technique called quantization. Lower precision makes a
+      model faster and smaller to run, but can slightly reduce answer quality.
+      Best-to-cheapest precision levels: <strong>FP32</strong>,
+      <strong>BF16/FP16</strong>, <strong>FP8</strong>, <strong>FP6</strong>,
+      <strong>INT8</strong>, <strong>FP4</strong>, <strong>INT4</strong>
+      (highest to lowest quality).
+    </p>
+    <p class="hint">
+      <strong>TASK$</strong> is the estimated median cost (in USD) of running a
+      typical task with this model, helping you budget for the operation.
     </p>
 
     <div id="deals-section">
