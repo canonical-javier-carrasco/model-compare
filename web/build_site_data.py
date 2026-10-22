@@ -48,6 +48,13 @@ MODEL_ID_RE = re.compile(
     r"^(?:[a-zA-Z0-9_.-]+/)?[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+"
     r"(?::[a-zA-Z0-9_.-]+)?$"
 )
+# A git commit hash in short (7) to full (40) lowercase hex form -- the
+# source_revision stamp the site footer links to. Mirrors publish.py's
+# REVISION_RE (build_site_data is subprocess-isolated from publish by
+# convention, so the contract is duplicated here like the constants
+# above): whatever is stamped into data.json must be a hash, never
+# arbitrary text that would ship a dead footer link.
+REVISION_RE = re.compile(r"[0-9a-f]{7,40}")
 
 CATALOG_SCHEMA_VERSION = 3
 
@@ -1058,14 +1065,18 @@ def build_data(
     revision, when given, is the short commit hash of the source that built
     this document; it is stamped as source_revision (an additive field, the
     contract stays at schema_version 2) so the site is traceable to the code
-    that produced it without versioning the web itself. Omitted when absent.
+    that produced it without versioning the web itself. Validated against
+    REVISION_RE -- the site footer links straight to it, so arbitrary text
+    must never reach the document. Omitted when absent.
     """
     if not isinstance(best, str) or not MODEL_ID_RE.fullmatch(best.strip()):
         raise ValueError(f"best model id looks wrong: {best!r}")
     best = best.strip()
     if revision is not None:
-        if not isinstance(revision, str) or not revision.strip():
-            raise ValueError(f"revision must be a non-empty string: {revision!r}")
+        if not isinstance(revision, str) or not REVISION_RE.fullmatch(revision.strip()):
+            raise ValueError(
+                f"revision must be a 7-40 char lowercase hex commit hash: {revision!r}"
+            )
         revision = revision.strip()
     if generated_at is not None:
         if not isinstance(generated_at, str) or not generated_at:

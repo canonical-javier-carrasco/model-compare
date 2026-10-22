@@ -9,10 +9,13 @@ comment and has regressed before -- parity is enforced here, and the
 pure helpers (tooltip sentence construction, formatters, guards) get
 real tests instead of code reading.
 
-Limitation: only those pure helpers are exercised. Tooltip delivery
-(the td.title assignment inside render) and DOM wiring are not: the
-fetch stub rejects so render() never runs, and the stubs hand out a
-fresh element per getElementById call with no querySelector support.
+Limitation: the pure helpers and the named render helpers that mutate
+captured elements (renderFooter's revision/stamp flow) are exercised;
+tooltip delivery (the td.title assignment inside render), event wiring,
+and the fetch-driven flow are not: the fetch stub rejects so init()'s
+render() never runs and there is no querySelector support. The stubs
+cache one element per id, so a driver can read back what a helper wrote
+through els or document.getElementById.
 """
 
 import json
@@ -692,3 +695,61 @@ def test_endpoint_row_artifact_vs_model_level_text():
         "})()"
     )
     assert model["text"] == "No endpoint data for this model."
+
+
+# ---------------------------------------------------------------------------
+# Footer: the data.json stamps and source-revision link (renderFooter)
+
+
+def test_render_footer_links_source_revision():
+    out = run_js(
+        "(function () {"
+        # Start from the markup's initial hidden state: the assertion
+        # must prove renderFooter UNHID the block, not that the stub
+        # default already matched.
+        "  document.getElementById('rev-block').hidden = true;"
+        "  renderFooter({generated_at: '2026-09-28T06:00:00Z',"
+        "                source_revision: 'abc1234'});"
+        "  return {"
+        "    text: document.getElementById('rev-link').textContent,"
+        "    href: document.getElementById('rev-link').href,"
+        "    hidden: document.getElementById('rev-block').hidden,"
+        "  };"
+        "})()"
+    )
+    assert out == {
+        "text": "abc1234",
+        "href": "https://github.com/canonical/model-compare/commit/abc1234",
+        "hidden": False,
+    }
+
+
+def test_render_footer_hides_revision_block_without_source_revision():
+    out = run_js(
+        "(function () {"
+        # The markup ships with rev-block hidden (the hidden attribute);
+        # a document without source_revision must leave it hidden and
+        # the link untouched: no dead href, no placeholder text swap.
+        "  var block = document.getElementById('rev-block');"
+        "  var link = document.getElementById('rev-link');"
+        "  block.hidden = true;"
+        "  renderFooter({generated_at: '2026-09-28T06:00:00Z'});"
+        "  return {hidden: block.hidden, text: link.textContent,"
+        "          hasHref: 'href' in link};"
+        "})()"
+    )
+    assert out == {"hidden": True, "text": "", "hasHref": False}
+
+
+def test_render_footer_stamps_generated_time():
+    out = run_js(
+        "(function () {"
+        "  renderFooter({generated_at: '2026-09-28T06:00:00Z'});"
+        "  return {"
+        "    generated: document.getElementById('generated').textContent,"
+        "    generatedTop: document.getElementById('generated-top').textContent,"
+        "  };"
+        "})()"
+    )
+    assert isinstance(out["generated"], str) and out["generated"]
+    assert isinstance(out["generatedTop"], str) and out["generatedTop"]

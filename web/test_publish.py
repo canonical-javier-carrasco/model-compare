@@ -51,7 +51,11 @@ def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
     must match what the stubbed `--best` run wrote to best.txt.
     """
     docs = {
-        "data.json": {"schema_version": 2, "generated_at": STAMP},
+        "data.json": {
+            "schema_version": 2,
+            "generated_at": STAMP,
+            "source_revision": STUB_REV,
+        },
         "catalog.json": {
             "generated_at": STAMP,
             "models": [],
@@ -82,6 +86,16 @@ def _no_aa_key(monkeypatch):
     # The AA gate depends on AA_API_KEY; keep the suite hermetic. Gate tests
     # set the key explicitly.
     monkeypatch.delenv("AA_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_github_sha(monkeypatch):
+    # Same hermeticity for the ambient CI environment: resolve_revision
+    # prefers GITHUB_SHA over the stubbed `git rev-parse`, so a leaked
+    # runner SHA would replace STUB_REV in the pipeline's --revision
+    # argument and reroute resolve_revision away from the git stubs. The
+    # resolve_revision tests set GITHUB_SHA explicitly.
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
 
 
 def _is_catalog_run(cmd):
@@ -303,7 +317,14 @@ def test_build_site_fails_when_expected_artifacts_missing(tmp_path, monkeypatch)
 @pytest.mark.parametrize(
     "name, doc",
     [
-        ("data.json", {"schema_version": 2, "generated_at": "2026-09-27T06:00:00Z"}),
+        (
+            "data.json",
+            {
+                "schema_version": 2,
+                "generated_at": "2026-09-27T06:00:00Z",
+                "source_revision": STUB_REV,
+            },
+        ),
         ("history.json", {"updated_at": "2026-09-27T06:00:00Z", "snapshots": {}}),
     ],
 )
@@ -339,12 +360,30 @@ def test_build_site_fails_on_malformed_artifact(tmp_path, monkeypatch, name):
         ("history.json", {"snapshots": {}}),
         ("history.json", {"updated_at": STAMP}),
         ("data.json", {}),
-        ("data.json", {"generated_at": STAMP}),  # missing only schema_version
-        ("data.json", {"schema_version": 3, "generated_at": STAMP}),
+        (
+            "data.json",
+            {"generated_at": STAMP, "source_revision": STUB_REV},
+        ),  # missing only schema_version
+        # missing only source_revision
+        ("data.json", {"schema_version": 2, "generated_at": STAMP}),
+        (
+            "data.json",
+            {"schema_version": 3, "generated_at": STAMP, "source_revision": STUB_REV},
+        ),
         # strict identity: 2.0 compares equal to 2 but is not v2; True is a
         # bool, not an int
-        ("data.json", {"schema_version": True, "generated_at": STAMP}),
-        ("data.json", {"schema_version": 2.0, "generated_at": STAMP}),
+        (
+            "data.json",
+            {
+                "schema_version": True,
+                "generated_at": STAMP,
+                "source_revision": STUB_REV,
+            },
+        ),
+        (
+            "data.json",
+            {"schema_version": 2.0, "generated_at": STAMP, "source_revision": STUB_REV},
+        ),
         ("catalog.json", []),
         # the best.txt gate reads rankings; a catalog without them is broken
         ("catalog.json", {"generated_at": STAMP, "models": []}),
@@ -364,10 +403,26 @@ def test_build_site_requires_data_json_schema_version(tmp_path, monkeypatch):
     # through to a later check -- reverting the tuple to ("generated_at",)
     # must turn this red. The version VALUE (now 2) is pinned separately in
     # test_data_json_version_pin_is_2.
-    overrides = {"data.json": json.dumps({"generated_at": STAMP})}
+    overrides = {
+        "data.json": json.dumps({"generated_at": STAMP, "source_revision": STUB_REV})
+    }
     monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=overrides))
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     with pytest.raises(RuntimeError, match="data.json lacks schema_version"):
+        publish.build_site(tmp_path / "site")
+
+
+def test_build_site_requires_data_json_source_revision(tmp_path, monkeypatch):
+    # Regression pin for the required-tuple half of the gate: a data.json
+    # missing only source_revision must fail at load ("lacks"), not slip
+    # through to a later check -- reverting the tuple to
+    # ("schema_version", "generated_at") must turn this red. _load_artifact
+    # names every absent key at once, so the exact one-key message proves
+    # the other two were present.
+    overrides = {"data.json": json.dumps({"schema_version": 2, "generated_at": STAMP})}
+    monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=overrides))
+    monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
+    with pytest.raises(RuntimeError, match="data.json lacks source_revision"):
         publish.build_site(tmp_path / "site")
 
 
@@ -375,7 +430,11 @@ def test_data_json_version_pin_is_2(tmp_path, monkeypatch):
     # publish imports nothing from build_site_data, so check_stamps pins the
     # expected data.json version itself: a stale v1 document must fail, the
     # pinned v2 must pass.
-    overrides = {"data.json": json.dumps({"schema_version": 1, "generated_at": STAMP})}
+    overrides = {
+        "data.json": json.dumps(
+            {"schema_version": 1, "generated_at": STAMP, "source_revision": STUB_REV}
+        )
+    }
     monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=overrides))
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     with pytest.raises(RuntimeError, match="data.json schema_version must be 2, got 1"):
@@ -672,16 +731,41 @@ def test_resolve_revision_prefers_github_sha(monkeypatch):
     assert publish.resolve_revision() == "fedcba9"
 
 
+def test_resolve_revision_rejects_malformed_github_sha(monkeypatch):
+    # Garbage must fail before the git fallback is consulted: in CI the
+    # fallback would silently attribute the deploy to whatever the
+    # runner's checkout HEAD happens to be. The raiser proves the fallback
+    # never runs -- consulting it would surface "cannot resolve site
+    # revision" from the OSError instead of the hash verdict.
+    monkeypatch.setenv("GITHUB_SHA", "not-a-hash")
+    monkeypatch.setattr(publish.subprocess, "run", _raise(OSError("git: not found")))
+    with pytest.raises(RuntimeError, match="not a hex commit hash"):
+        publish.resolve_revision()
+
+
 def test_resolve_revision_falls_back_to_git_head(monkeypatch):
     monkeypatch.delenv("GITHUB_SHA", raising=False)
 
     def fake_run(cmd, cwd, check, capture_output, text):
-        assert cmd == ["git", "rev-parse", "--short", "HEAD"]
+        assert cmd == ["git", "rev-parse", "--short=7", "HEAD"]
         assert cwd == publish.REPO_ROOT
         return subprocess.CompletedProcess(cmd, 0, stdout=STUB_REV + "\n")
 
     monkeypatch.setattr(publish.subprocess, "run", fake_run)
     assert publish.resolve_revision() == STUB_REV
+
+
+def test_resolve_revision_rejects_malformed_git_output(monkeypatch):
+    # The fallback's stdout is validated like GITHUB_SHA: anything that is
+    # not a hex commit hash must fail rather than stamp a dead footer link.
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+
+    def fake_run(cmd, cwd, check, capture_output, text):
+        return subprocess.CompletedProcess(cmd, 0, stdout="not-a-hash\n")
+
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="not a hex commit hash"):
+        publish.resolve_revision()
 
 
 def test_resolve_revision_fails_loudly_when_git_unavailable(monkeypatch):
@@ -693,6 +777,27 @@ def test_resolve_revision_fails_loudly_when_git_unavailable(monkeypatch):
         "run",
         _raise(OSError("git: not found")),
     )
+    with pytest.raises(RuntimeError, match="cannot resolve site revision"):
+        publish.resolve_revision()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(OSError("git: not found"), id="git-missing"),
+        pytest.param(
+            subprocess.CalledProcessError(
+                128, ["git", "rev-parse", "--short=7", "HEAD"]
+            ),
+            id="git-exit-128",
+        ),
+    ],
+)
+def test_resolve_revision_fails_loudly_on_any_git_failure(monkeypatch, exc):
+    # Every git failure mode (binary absent, non-zero exit) funnels into
+    # the same RuntimeError so the deploy fails before anything publishes.
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+    monkeypatch.setattr(publish.subprocess, "run", _raise(exc))
     with pytest.raises(RuntimeError, match="cannot resolve site revision"):
         publish.resolve_revision()
 

@@ -16,6 +16,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,11 @@ MAX_ENDPOINT_DROP_RATE = 0.05
 # imports nothing from model_compare (subprocess-only by design), so the
 # reasons are named here rather than imported.
 ENDPOINT_DROP_REASONS = ("no_baseline_eligible_endpoint", "endpoint_fetch_failed")
+# A git commit hash in short (7) to full (40) lowercase hex form. Both
+# revision sources (GITHUB_SHA, `git rev-parse` output) are validated
+# against it: whatever lands in data.json is what the site footer links
+# to, so garbage must fail the publish rather than ship a dead link.
+REVISION_RE = re.compile(r"[0-9a-f]{7,40}")
 
 
 def resolve_revision() -> str:
@@ -51,15 +57,21 @@ def resolve_revision() -> str:
     CI sets GITHUB_SHA; locally, fall back to the checkout's git HEAD.
     The revision is stamped into data.json so the site is always
     traceable to the code that produced it, without versioning the web
-    itself. Fails loudly when unresolvable: an unattributable deploy is
-    treated like any other unexpected result.
+    itself. Fails loudly when unresolvable or not a hex commit hash: an
+    unattributable deploy is treated like any other unexpected result.
     """
     sha = os.environ.get("GITHUB_SHA")
     if sha:
+        sha = sha.strip()
+        if not REVISION_RE.fullmatch(sha):
+            raise RuntimeError(
+                "publish: cannot resolve site revision: "
+                f"GITHUB_SHA {sha!r} is not a hex commit hash"
+            )
         return sha[:7]
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "--short=7", "HEAD"],
             cwd=REPO_ROOT,
             check=True,
             capture_output=True,
@@ -67,7 +79,13 @@ def resolve_revision() -> str:
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"publish: cannot resolve site revision: {exc}") from exc
-    return result.stdout.strip()
+    rev = result.stdout.strip()
+    if not REVISION_RE.fullmatch(rev):
+        raise RuntimeError(
+            "publish: cannot resolve site revision: "
+            f"git rev-parse output {rev!r} is not a hex commit hash"
+        )
+    return rev
 
 
 def run_script(script: Path, args: list[str], out: Path | None = None) -> None:
@@ -122,10 +140,15 @@ def check_stamps(output_dir: Path) -> dict:
     it and merge_history sets updated_at to the newest snapshot's stamp,
     which is today's catalog. highlights.json is deliberately excluded --
     its generated_at is its own writing time (the 24h LLM-reuse window).
-    Returns the loaded catalog (which must carry rankings) for check_best.
+    data.json must also carry source_revision: the site footer links to
+    the commit that produced it, so an unattributable document is as
+    broken as one with a wrong stamp. Returns the loaded catalog (which
+    must carry rankings) for check_best.
     """
     catalog = _load_artifact(output_dir / "catalog.json", ("generated_at", "rankings"))
-    data = _load_artifact(output_dir / "data.json", ("schema_version", "generated_at"))
+    data = _load_artifact(
+        output_dir / "data.json", ("schema_version", "generated_at", "source_revision")
+    )
     # .get: fail closed with the clean RuntimeError below even if the
     # required tuple above ever stops listing schema_version.
     version = data.get("schema_version")

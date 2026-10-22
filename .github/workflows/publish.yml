@@ -15,7 +15,10 @@ permissions:
 
 concurrency:
   group: github-pages
-  cancel-in-progress: true
+  # Never cancel an in-flight deploy: cancelling mid-deploy can leave
+  # Pages in an unknown state (a half-published site, a lost deployment
+  # record). Deployment workflows should let each run finish and queue.
+  cancel-in-progress: false
 
 jobs:
   publish:

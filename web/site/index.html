@@ -1205,6 +1205,22 @@
         els.status.hidden = false;
       }
 
+      // Footer stamps: the data.json generation time and the source
+      // revision link. Extracted from the fetch chain so the flow is
+      // unit-testable (web/test_site_js.py drives it under node).
+      function renderFooter(data) {
+        var stamp = new Date(data.generated_at).toLocaleString();
+        els.generated.textContent = stamp;
+        els.generatedTop.textContent = stamp;
+        if (data.source_revision) {
+          els.revBlock.hidden = false;
+          els.revLink.href =
+            "https://github.com/canonical/model-compare/commit/" +
+            data.source_revision;
+          els.revLink.textContent = data.source_revision;
+        }
+      }
+
       function init() {
         els.aliasHint.textContent = "alias oc-best='" + CURL_COMMAND + "'";
         els.curlValue.textContent = CURL_COMMAND;
@@ -1254,16 +1270,7 @@
           })
           .then(function (payload) {
             data = payload;
-            var stamp = new Date(data.generated_at).toLocaleString();
-            els.generated.textContent = stamp;
-            els.generatedTop.textContent = stamp;
-            if (data.source_revision) {
-              els.revBlock.hidden = false;
-              els.revLink.href =
-                "https://github.com/canonical/model-compare/commit/" +
-                data.source_revision;
-              els.revLink.textContent = data.source_revision;
-            }
+            renderFooter(data);
             render();
           })
           .catch(function (err) {

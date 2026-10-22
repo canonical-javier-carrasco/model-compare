@@ -7,13 +7,15 @@
 // page ends in its error path and pure helpers stay callable).
 //
 // Limitation: these shims only support evaluating the script's pure
-// helpers (tooltip sentence construction, formatters, guards) plus the
+// helpers (tooltip sentence construction, formatters, guards), the
 // built-element shape of endpointRow()/baselineNote() — appendChild
 // records children so a driver can walk the disclosure DOM the script
-// built. Tooltip delivery (the td.title assignment inside render),
+// built — and named mutations like renderFooter() (getElementById hands
+// out the same stub per id, so a driver can read back what the script
+// wrote). Tooltip delivery (the td.title assignment inside render),
 // event wiring, and the live fetch flows are not exercised: fetch()
-// rejects so render() never runs, getElementById hands out a fresh
-// stub per call, and there is no querySelector.
+// rejects so render() never runs from init(), and there is no
+// querySelector.
 
 function stubElement() {
   return {
@@ -42,10 +44,17 @@ function stubElement() {
   };
 }
 
+// One stub per element id: the script captures its elements once (the
+// els object) and later mutations must stay observable through both els
+// and re-lookups via document.getElementById.
+var stubsById = {};
 var window = { location: { href: "http://127.0.0.1:8734/index.html" } };
 var document = {
-  getElementById: function () {
-    return stubElement();
+  getElementById: function (id) {
+    if (!Object.prototype.hasOwnProperty.call(stubsById, id)) {
+      stubsById[id] = stubElement();
+    }
+    return stubsById[id];
   },
   createElement: function () {
     return stubElement();

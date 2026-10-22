@@ -1161,7 +1161,23 @@ def test_build_data_omits_source_revision_when_absent():
     assert "source_revision" not in data
 
 
-@pytest.mark.parametrize("bad", ["", "   ", 42, ["abc1234"]])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "   ",
+        42,
+        ["abc1234"],
+        # The stamp is what the site footer links to: only lowercase hex
+        # commit hashes (the form git emits) may reach data.json -- any
+        # other text would ship a dead footer link.
+        "not-a-hash",
+        "ABC1234",
+        "abc xyz",
+        "../../x",
+        "<script>",
+    ],
+)
 def test_build_data_rejects_malformed_revision(bad):
     with pytest.raises(ValueError, match="revision"):
         bsd.build_data("acme/model-a", make_priorities(), revision=bad)
