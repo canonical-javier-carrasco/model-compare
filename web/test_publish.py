@@ -71,7 +71,7 @@ def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
 
 # What the stubbed `model_compare.py --catalog` run prints: the AA and
 # endpoint-drop gates read it from scratch before any other step runs.
-HEALTHY_AA = {"mode": "openrouter", "fallback": "api"}
+HEALTHY_AA = {"mode": "openrouter", "fallback": "aa"}
 
 # The scratch catalog's pool (Task 8): 20 candidates entered the endpoint
 # stage and none dropped for endpoint reasons -- the healthy happy path.
@@ -582,11 +582,11 @@ PUBLISH_ARTIFACTS = (
 @pytest.mark.parametrize(
     "mode, fallback",
     [
-        ("api", "api"),
+        ("aa", "aa"),
         # "openrouter" is what healthy runs publish whenever OpenRouter
         # benchmarks cover a matched model -- the gate must not
         # false-positive on it while the AA API works.
-        ("openrouter", "api"),
+        ("openrouter", "aa"),
     ],
 )
 def test_build_site_aa_gate_passes_live_fallback(tmp_path, monkeypatch, mode, fallback):

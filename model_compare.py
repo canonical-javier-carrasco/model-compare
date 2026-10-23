@@ -68,6 +68,10 @@ OPENROUTER_ZDR_URL = "https://openrouter.ai/api/v1/endpoints/zdr"
 # (legacy endpoints 410 after 2026-11-04; see
 # https://artificialanalysis.ai/data-api/migrate-v2-data).
 AA_API_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
+# Cache key for the AA API entries envelope. v3 adds the per-fetch `as_of`
+# timestamp on every entry and the envelope's intelligence_index_version;
+# payloads under the pre-v3 keys predate those fields and must never be read.
+AA_ENTRIES_CACHE = "aa-intelligence-v3"
 VERSION = "0.4.0"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
@@ -1767,7 +1771,7 @@ def parse_iso_datetime(value):
 # ---------------------------------------------------------------------------
 
 
-def aa_api_entries(api_key: str) -> list:
+def aa_api_entries(api_key: str) -> tuple[list, float | int | None]:
     """Intelligence entries from AA's V2 language models endpoint.
 
     Documented envelope: {tier, intelligence_index_version, pagination,
@@ -1778,8 +1782,16 @@ def aa_api_entries(api_key: str) -> list:
     has_more/total_pages contract with a 25-page hard cap; a failure past
     page 1 is best-effort (warn, keep earlier pages), a page-1 failure
     propagates.
+
+    Returns (entries, version): version is the envelope's
+    intelligence_index_version (number-or-null) -- provenance for the whole
+    fetch. Every surviving entry carries `as_of`, one ISO fetch timestamp
+    shared by the whole fetch, so the cache and any downstream record can
+    date the data even after the envelope's version is lost.
     """
     entries = {}
+    version = None
+    as_of = datetime.now(timezone.utc).isoformat()
     page = 1
     while page <= 25:  # hard cap: halt after processing page 25
         try:
@@ -1794,6 +1806,15 @@ def aa_api_entries(api_key: str) -> list:
             warn(f"AA API page {page} failed ({exc}); using entries collected so far")
             break
         data = payload.get("data") if isinstance(payload, dict) else None
+        # The envelope's version is one provenance fact for the whole
+        # fetch; the last page's value wins (they are identical in practice).
+        raw_version = (
+            payload.get("intelligence_index_version")
+            if isinstance(payload, dict)
+            else None
+        )
+        if isinstance(raw_version, (int, float)) and not isinstance(raw_version, bool):
+            version = raw_version
         for item in data if isinstance(data, list) else []:
             if not isinstance(item, dict):
                 continue
@@ -1826,6 +1847,10 @@ def aa_api_entries(api_key: str) -> list:
                     "key": key,
                     "name": name if isinstance(name, str) and name else key,
                     "index": index,
+                    # One fetch timestamp for the whole fetch: every entry
+                    # from this run shares it, so the cache payload and any
+                    # downstream record can date the data exactly.
+                    "as_of": as_of,
                 },
             )
         pag = payload.get("pagination") if isinstance(payload, dict) else None
@@ -1837,37 +1862,53 @@ def aa_api_entries(api_key: str) -> list:
         if isinstance(total_pages, int) and page >= total_pages:
             break
         page += 1
-    return list(entries.values())
+    return list(entries.values()), version
 
 
 def fetch_aa_entries(args):
     """AA intelligence entries from the keyed AA API v2, or nothing.
 
-    Returns (entries, source, cached). With a key, an API failure or an
-    empty result warns and yields ([], None, False). Without a key this is
-    silent and yields ([], None, False): OpenRouter's benchmarks are the
-    primary source and the catalog records the absence (sources.aa).
+    Returns (entries, source, cached, index_version). With a key, an API
+    failure or an empty result warns and yields ([], None, False, None).
+    Without a key this is silent and yields ([], None, False, None):
+    OpenRouter's benchmarks cover what they cover and the catalog records
+    the absence (sources.aa).
+
+    `index_version` is the envelope's intelligence_index_version (number
+    or null) -- provenance for the whole fetch. Entries carry `as_of`, one
+    ISO fetch timestamp for the whole fetch; a cache hit reuses the
+    stamped payload verbatim so cached rows stay dated exactly like fresh
+    ones.
     """
     if not args.no_cache:
-        # v2: entries cached under the old key predate the V2 endpoint
-        # migration and must never be read. Only AA API entries are read;
-        # build_catalog rejects any other source as unknown.
-        cached = load_cache("aa-intelligence-v2", args.cache_ttl)
+        # v3: payloads cached under earlier keys predate the as_of stamp and
+        # the intelligence_index_version capture and must never be read.
+        # Only AA API entries are read; build_catalog rejects any other
+        # source as unknown.
+        cached = load_cache(AA_ENTRIES_CACHE, args.cache_ttl)
         if isinstance(cached, dict) and cached.get("source") == "AA API v2":
-            return cached.get("entries", []), cached.get("source"), True
+            return (
+                cached.get("entries", []),
+                cached.get("source"),
+                True,
+                cached.get("version"),
+            )
     api_key = args.aa_api_key or os.environ.get("AA_API_KEY")
     if not api_key:
-        return [], None, False
+        return [], None, False, None
     try:
-        entries = aa_api_entries(api_key)
+        entries, version = aa_api_entries(api_key)
     except Exception as exc:
         warn(f"AA API request failed ({exc})")
-        return [], None, False
+        return [], None, False, None
     if not entries:
         warn("AA API returned no intelligence scores")
-        return [], None, False
-    save_cache("aa-intelligence-v2", {"entries": entries, "source": "AA API v2"})
-    return entries, "AA API v2", False
+        return [], None, False, None
+    save_cache(
+        AA_ENTRIES_CACHE,
+        {"entries": entries, "source": "AA API v2", "version": version},
+    )
+    return entries, "AA API v2", False, version
 
 
 # ---------------------------------------------------------------------------
@@ -1876,6 +1917,13 @@ def fetch_aa_entries(args):
 
 
 def build_aa_lookup(entries):
+    """Index the AA entries into exact and fuzzy lookup maps.
+
+    Values are (index, as_of) pairs, not bare floats: the as_of travels
+    with the match so resolve_quality can date every AA-sourced record
+    without re-scanning the raw entry list. Entries without a usable key
+    or a finite numeric index are skipped.
+    """
     exact = {}
     fuzzy = []
     for entry in entries:
@@ -1888,11 +1936,12 @@ def build_aa_lookup(entries):
         # Non-finite indexes would serialize as NaN and poison quality.
         if not math.isfinite(index):
             continue
+        as_of = entry.get("as_of") if isinstance(entry.get("as_of"), str) else None
 
         def put(tier, raw):
             normalized = norm_key(raw)
             if normalized:
-                exact.setdefault((tier, normalized), index)
+                exact.setdefault((tier, normalized), (index, as_of))
 
         if "/" in key:
             put(0, key)
@@ -1903,11 +1952,17 @@ def build_aa_lookup(entries):
         put(3, PAREN_RE.sub(" ", name))
         tokens = set(norm_key(key).split()) | set(norm_key(name).split())
         if tokens:
-            fuzzy.append((tokens, index))
+            fuzzy.append((tokens, (index, as_of)))
     return exact, fuzzy
 
 
 def match_quality(model, exact, fuzzy, allow_fuzzy=False):
+    """Match a candidate to an AA entry; exact tiers only unless fuzzy is on.
+
+    Returns the winning entry's (index, as_of) pair, or None when no tier
+    matches. Values come straight out of build_aa_lookup's maps, so the
+    as_of is the entry's own fetch stamp, never a re-lookup.
+    """
     model_id = model["id"]
     name = model.get("name") or ""
     display = PROVIDER_PREFIX_RE.sub("", name).strip()
@@ -1930,14 +1985,14 @@ def match_quality(model, exact, fuzzy, allow_fuzzy=False):
     own = set(norm_key(base).split()) | set(norm_key(display).split())
     if own:
         best = 0.0
-        best_index = None
-        for tokens, index in fuzzy:
+        best_match = None
+        for tokens, match in fuzzy:
             overlap = len(own & tokens) / len(own | tokens)
             if overlap > best:
                 best = overlap
-                best_index = index
-        if best >= 0.5 and best_index is not None:
-            return best_index
+                best_match = match
+        if best >= 0.5 and best_match is not None:
+            return best_match
     return None
 
 
@@ -2053,28 +2108,76 @@ def build_aa_benchmarks(benchmarks, models=None) -> dict:
     return aa_by_id
 
 
-def resolve_quality(candidates, aa_by_id, exact, fuzzy, aa_source):
-    """Per-candidate quality: OR benchmarks first, AA exact fallback, else None.
+def resolve_quality(
+    candidates, aa_by_id, exact, fuzzy, aa_source, catalog_quality=None
+):
+    """Per-candidate quality records: AA API primary, catalog next, OR last.
 
-    OR's per-slug values cannot mispair; the AA fallback is exact-tier only
-    (match_quality's fuzzy tier is the proven variant-conflation bug and
-    stays off in production). Source values match the catalog contract:
-    "openrouter", "api".
+    Resolution order per candidate (inverted from the pre-reconciliation
+    behavior where OpenRouter's benchmarks won):
+      1. AA API entries -- match_quality's exact tiers (fuzzy stays off in
+         production: it is the proven variant-conflation bug).
+      2. catalog_quality -- explicit overrides, None until wired.
+      3. OpenRouter's benchmark trio -- per-slug, matched via
+         base_model_id, so a :variant suffix inherits its base's trio.
+      4. No match -- the candidate stays quality-blind downstream.
+
+    Every winner is a record {"index", "source", "as_of", "drift",
+    "or_index", "or_as_of"}; compute_scores and build_schedules read
+    record["index"], so cand["quality"] stays the float index they already
+    expect. Drift is computed only when the winner is NOT OpenRouter: the
+    OR trio for the same base model acts as the check value, and a
+    disagreement of >= 3.0 points flags the record. When the winner IS
+    OpenRouter (or no OR value exists) the drift pair is None -- there is
+    no second source to disagree with.
     """
-    fallback_source = {"AA API v2": "api"}.get(aa_source)
     quality_by_id = {}
     source_by_id = {}
     for cand in candidates:
-        bench = aa_by_id.get(base_model_id(cand["id"]))
-        intelligence = bench.get("intelligence_index") if bench else None
-        if intelligence is not None:
-            quality_by_id[cand["id"]] = intelligence
-            source_by_id[cand["id"]] = "openrouter"
+        record = None
+        # Tier 1: AA API exact match. match_quality returns the winning
+        # entry's (index, as_of) pair.
+        match = match_quality({"id": cand["id"], "name": cand["name"]}, exact, fuzzy)
+        if match is not None:
+            index, as_of = match
+            record = {"index": index, "source": "aa", "as_of": as_of}
+        # Tier 2: catalog override (None until a later task wires it in).
+        if record is None and catalog_quality is not None:
+            catalog_index = catalog_quality.get(cand["id"])
+            if catalog_index is not None:
+                record = {"index": catalog_index, "source": "catalog", "as_of": None}
+        # Tier 3: OpenRouter's per-slug benchmark trio (last resort).
+        if record is None:
+            bench = aa_by_id.get(base_model_id(cand["id"]))
+            intelligence = bench.get("intelligence_index") if bench else None
+            if intelligence is not None:
+                record = {
+                    "index": intelligence,
+                    "source": "openrouter",
+                    "as_of": bench.get("as_of"),
+                }
+        if record is None:
             continue
-        index = match_quality({"id": cand["id"], "name": cand["name"]}, exact, fuzzy)
-        if index is not None:
-            quality_by_id[cand["id"]] = index
-            source_by_id[cand["id"]] = fallback_source
+
+        # Drift: only meaningful when the winner is not OpenRouter itself.
+        bench = aa_by_id.get(base_model_id(cand["id"])) or {}
+        or_intelligence = bench.get("intelligence_index")
+        if (
+            record["source"] in ("aa", "catalog")
+            and isinstance(or_intelligence, (int, float))
+            and not isinstance(or_intelligence, bool)
+            and math.isfinite(or_intelligence)
+        ):
+            record["or_index"] = or_intelligence
+            record["or_as_of"] = bench.get("as_of")
+            record["drift"] = abs(record["index"] - or_intelligence) >= 3.0
+        else:
+            record["or_index"] = None
+            record["or_as_of"] = None
+            record["drift"] = None
+
+        quality_by_id[cand["id"]] = record
+        source_by_id[cand["id"]] = record["source"]
     return quality_by_id, source_by_id
 
 
@@ -2131,7 +2234,10 @@ def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
             continue
         peak = max(windows, key=lambda window: window["blended"])
         offpeak = min(windows, key=lambda window: window["blended"])
-        quality = quality_by_id.get(model_id)
+        # quality_by_id values are records {"index", "source", ...}; the
+        # schedule row keeps the bare float index verbatim (never a dict).
+        record = quality_by_id.get(model_id)
+        quality = record["index"] if isinstance(record, dict) else record
         if quality is None:
             benchmark = aa_by_id.get(base_model_id(model_id)) or {}
             quality = benchmark.get("intelligence_index")
@@ -2351,11 +2457,19 @@ def compute_scores(candidates, args, quality_by_id):
                 0.0, min(1.0, 1.0 - (math.log10(price + 0.01) - low) / price_span)
             )
         quality = quality_by_id.get(cand["id"])
-        cand["quality"] = quality
-        if quality is None:
+        # quality_by_id values are records {"index", "source", ...}; the
+        # candidate keeps the bare float index (that is what ranking_key,
+        # build_catalog's quality field and print_json's quality_index all
+        # expect) and the full record travels alongside for provenance.
+        record = quality if isinstance(quality, dict) else None
+        cand["quality"] = record["index"] if record else quality
+        cand["quality_record"] = record
+        if cand["quality"] is None:
             cand["quality_score"] = 0.0
         else:
-            cand["quality_score"] = max(0.0, min(1.0, quality / args.quality_ref))
+            cand["quality_score"] = max(
+                0.0, min(1.0, cand["quality"] / args.quality_ref)
+            )
         context = cand["context"]
         cand["context_score"] = (
             max(0.0, min(1.0, math.log(context / floor_ctx) / ctx_span))
@@ -2580,6 +2694,15 @@ def print_json(top):
             "name": cand["name"],
             "score": round(cand["score"], 4),
             "quality_index": cand["quality"],
+            # Provenance block, verbatim from the quality record resolved
+            # in compute_scores: the winning tier's source and as_of plus
+            # the drift check against OpenRouter's benchmarks. Rows without
+            # a record (pre-endpoint test paths) degrade to None.
+            "quality_source": (cand.get("quality_record") or {}).get("source"),
+            "quality_as_of": (cand.get("quality_record") or {}).get("as_of"),
+            "quality_drift": (cand.get("quality_record") or {}).get("drift"),
+            "quality_or_index": (cand.get("quality_record") or {}).get("or_index"),
+            "quality_or_as_of": (cand.get("quality_record") or {}).get("or_as_of"),
             "input_usd_per_m": round(cand["price_in"], 6),
             "output_usd_per_m": round(cand["price_out"], 6),
             "blended_usd_per_m": round(cand["blended"], 6),
@@ -2665,7 +2788,7 @@ def build_catalog(
     """
     now = datetime.now(timezone.utc)
     weights = catalog_weights(candidates, quality_by_id)
-    aa_modes = {"AA API v2": "api"}
+    aa_modes = {"AA API v2": "aa"}
     if aa_source is not None and aa_source not in aa_modes:
         # Never claim mode "none" for a source we do not know: the document
         # would contradict itself (mode none with matched quality scores).
@@ -3007,7 +3130,7 @@ def run(args, models, or_cached) -> int:
             "(--no-zdr to override)"
         )
         return 1
-    aa_entries, aa_source, aa_cached = fetch_aa_entries(args)
+    aa_entries, aa_source, aa_cached, aa_index_version = fetch_aa_entries(args)
     exact, fuzzy = build_aa_lookup(aa_entries)
 
     filtered = []
@@ -3097,10 +3220,12 @@ def run(args, models, or_cached) -> int:
         matched_aa = len(quality_by_id) - matched_or
         unmatched = len(candidates) - len(quality_by_id)
         bits = []
-        if matched_or:
-            bits.append(f"OpenRouter benchmarks ({matched_or})")
+        # The note lists tiers in precedence order: AA API is primary,
+        # OpenRouter's benchmarks are the last-resort fallback.
         if matched_aa:
             bits.append(f"{aa_source} exact ({matched_aa})")
+        if matched_or:
+            bits.append(f"OpenRouter benchmarks ({matched_or})")
         if bits:
             quality_note = (
                 f"quality via {' + '.join(bits)}: matched "

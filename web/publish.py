@@ -202,7 +202,7 @@ def check_best(output_dir: Path, catalog: dict) -> None:
         )
 
 
-AA_FALLBACKS_LIVE = ("api",)
+AA_FALLBACKS_LIVE = ("aa",)
 
 
 def check_aa_fallback(catalog_path: Path) -> None:
@@ -210,9 +210,9 @@ def check_aa_fallback(catalog_path: Path) -> None:
 
     sources.aa.mode "openrouter" means at least one candidate's AA data came
     from OpenRouter; it says nothing about whether the AA API worked.
-    sources.aa.fallback records that ("api" or "none"; the page scrape that
+    sources.aa.fallback records that ("aa" or "none"; the page scrape that
     could also yield "scrape" was removed), so the gate reads fallback and
-    requires "api": a rejected key yields "none" and fails. A missing or
+    requires "aa": a rejected key yields "none" and fails. A missing or
     unknown value fails closed. Without a key AA data comes only from
     OpenRouter, so the gate never raises.
     """

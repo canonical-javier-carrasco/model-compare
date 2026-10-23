@@ -150,9 +150,9 @@ CATALOG_SCHEDULE_ENTRY_KEYS = (
 CATALOG_SCORE_KEYS = ("price", "quality", "context", "age")
 CATALOG_OVERALL_KEYS = ("balanced", "price", "quality")
 CATALOG_AA_KEYS = ("intelligence_index", "coding_index", "agentic_index")
-CATALOG_QUALITY_MATCH_VALUES = ("openrouter", "api")
-CATALOG_AA_MODES = ("openrouter", "api", "none")
-CATALOG_AA_FALLBACKS = ("api", "none")
+CATALOG_QUALITY_MATCH_VALUES = ("aa", "catalog", "openrouter")
+CATALOG_AA_MODES = ("openrouter", "aa", "none")
+CATALOG_AA_FALLBACKS = ("aa", "none")
 
 
 def _is_score(value) -> bool:

@@ -379,7 +379,7 @@ def make_catalog():
             "openrouter": "ok",
             "aa": {
                 "mode": "openrouter",
-                "fallback": "api",
+                "fallback": "aa",
                 "matched": 1,
                 "matched_openrouter": 1,
             },
@@ -419,7 +419,7 @@ def test_validate_catalog_happy_path():
     bsd.validate_catalog(make_catalog())  # must not raise
 
 
-@pytest.mark.parametrize("fallback", ["api", "none"])
+@pytest.mark.parametrize("fallback", ["aa", "none"])
 def test_validate_catalog_accepts_aa_fallback(fallback):
     doc = make_catalog()
     doc["sources"]["aa"]["fallback"] = fallback
@@ -434,7 +434,7 @@ def test_validate_catalog_accepts_aa_fallback(fallback):
         # "openrouter" is a mode, never a fallback
         lambda aa: aa.update(fallback="openrouter"),
         lambda aa: aa.update(fallback=None),
-        lambda aa: aa.update(fallback=["api"]),
+        lambda aa: aa.update(fallback=["aa"]),
         # the AA page scrape was removed; it can no longer be produced
         lambda aa: aa.update(fallback="scrape"),
     ],
@@ -461,9 +461,9 @@ def test_validate_catalog_accepts_null_aa_fields_and_all_provenances():
         "matched_openrouter": 0,
     }
     bsd.validate_catalog(doc)  # must not raise
-    doc["models"][0]["quality_match"] = "api"
+    doc["models"][0]["quality_match"] = "aa"
     doc["sources"]["aa"].update(
-        mode="api", fallback="api", matched=1, matched_openrouter=0
+        mode="aa", fallback="aa", matched=1, matched_openrouter=0
     )
     bsd.validate_catalog(doc)  # must not raise
 
@@ -1255,7 +1255,7 @@ def _invariant_catalog():
     doc["pool"] = {"listed": 6, "candidates": 5, "dropped": {"context": 1}}
     doc["sources"]["aa"] = {
         "mode": "openrouter",
-        "fallback": "api",
+        "fallback": "aa",
         "matched": 3,
         "matched_openrouter": 3,
     }
