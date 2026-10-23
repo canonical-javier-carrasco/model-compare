@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Site: a favicon. `web/site/favicon.svg` draws the mark — two congruent
+  triangles (green #00BD00 pointing up and sitting higher, red #BD0000
+  pointing down and sitting lower) on a rounded tile — and adapts the tile
+  background to the browser theme via a `prefers-color-scheme` media query:
+  cream (#f6f3ec) on dark chrome, dark (#181a1b) on light chrome (the
+  dark tile is the base rule, so no-preference browsers match the site's
+  dark-by-default pages). Static
+  PNG fallbacks for SVG-intolerant browsers (Safari, iOS home screens) keep
+  the dark tile (#181a1b) baked in with the rounded corners cut out as real
+  transparency, and are rendered by `web/make_favicon.py`
+  (deterministic, stdlib-only; `--check` fails on stale committed output);
+  `publish.py` copies all four files into the deploy directory and
+  `index.html` links them, with `img-src 'self'` added to the CSP so the
+  icon loads under the existing policy.
 - Site: Simple/Expert layout toggle for the ranked table. Expert stays the
   default full 13-column layout; Simple shows only rank, 7-day, model,
   quality, in, out, discount and age, spells its headers out

@@ -13,6 +13,7 @@ subprocess.
 | file | what it is |
 |------|------------|
 | `index.html` | the picks page: top-20 table per priority tab (10 shown, "Show more" expands) with copy buttons, a 7-day movement column, the TIER column and the Off-peak deals table (dark theme by default, light when the system or browser reports light) |
+| `favicon.svg` + `favicon-16x16.png` / `favicon-32x32.png` / `apple-touch-icon.png` | the icon: the SVG adapts its tile background to the browser theme (`prefers-color-scheme` inside the file — cream tile on dark chrome, dark tile on light chrome, and engines that skip the media query fall back to the dark base rule, matching the site's dark-by-default pages); the static PNGs are Safari/iOS fallbacks with the dark tile (#181a1b) baked in and the rounded corners cut out as real transparency, re-renderable with `web/make_favicon.py` (run it with `--check` to fail on stale committed output) |
 | `data.json` | the rendered rows: per-priority top 20 plus the current best id, the off-peak `schedules` rows, and `generated_at` (ISO timestamp shown as "last refresh: …" between the tab and layout toggles); schema-versioned (`schema_version`, currently 2) and stamped with the `source_revision` (short commit hash) that built it — the footer links it to the exact commit |
 | `best.txt` | the current *balanced* #1 as a plain `opencode --model`-ready id |
 | `catalog.json` | the full `--catalog` document (stable contract, see [DESIGN.md](../DESIGN.md)) |

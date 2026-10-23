@@ -169,6 +169,8 @@ def test_build_site_pipeline_order_and_assembly(tmp_path, monkeypatch):
     assert (out / "index.html").is_file()
     assert (out / "style.css").is_file()
     assert (out / "app.js").is_file()
+    for name in FAVICON_FILES:
+        assert (out / name).is_file()
 
     # Downstream argument wiring is the riskiest surface: pin it exactly.
     gh_cmd = next(cmd for cmd in calls if Path(cmd[1]).name == "generate_highlights.py")
@@ -576,6 +578,19 @@ PUBLISH_ARTIFACTS = (
     "index.html",
     "style.css",
     "app.js",
+    "favicon.svg",
+    "favicon-16x16.png",
+    "favicon-32x32.png",
+    "apple-touch-icon.png",
+)
+
+# The favicon set copies with the site assets; pinned here and in
+# publish.build_site so a renamed icon fails the publish, not the tab.
+FAVICON_FILES = (
+    "favicon.svg",
+    "favicon-16x16.png",
+    "favicon-32x32.png",
+    "apple-touch-icon.png",
 )
 
 

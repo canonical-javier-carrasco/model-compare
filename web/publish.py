@@ -4,8 +4,8 @@
 Runs the standalone model_compare.py, then the web-side generators
 (generate_highlights.py, build_site_data.py), and assembles the deploy
 directory: data.json, catalog.json, history.json, highlights.json,
-best.txt, index.html and its style.css/app.js assets. Fails loudly on
-any unexpected result -- including
+best.txt, index.html and its style.css/app.js/favicon assets. Fails
+loudly on any unexpected result -- including
 data.json/history.json stamps that disagree with catalog.json's
 generated_at, or a best.txt that is not catalog.json's balanced rank 1 --
 so a broken run never deploys a broken site.
@@ -359,7 +359,15 @@ def build_site(output_dir: Path) -> None:
             ],
         )
 
-        for name in ("index.html", "style.css", "app.js"):
+        for name in (
+            "index.html",
+            "style.css",
+            "app.js",
+            "favicon.svg",
+            "favicon-16x16.png",
+            "favicon-32x32.png",
+            "apple-touch-icon.png",
+        ):
             shutil.copyfile(WEB_DIR / "site" / name, output_dir / name)
 
     artifacts = (
@@ -371,6 +379,10 @@ def build_site(output_dir: Path) -> None:
         "index.html",
         "style.css",
         "app.js",
+        "favicon.svg",
+        "favicon-16x16.png",
+        "favicon-32x32.png",
+        "apple-touch-icon.png",
     )
     missing = [name for name in artifacts if not (output_dir / name).is_file()]
     if missing:
