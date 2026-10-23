@@ -72,6 +72,18 @@ AA_API_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
 # timestamp on every entry and the envelope's intelligence_index_version;
 # payloads under the pre-v3 keys predate those fields and must never be read.
 AA_ENTRIES_CACHE = "aa-intelligence-v3"
+# The repo's own published catalog.json -- built by keyed CI runs, hydrated
+# by unkeyed local runs (design: quality source reconciliation, source 2).
+# The github.io host 301s to plain http://model-compare.dev/catalog.json, an
+# unauthenticated downgrade on ranking-critical data; the https direct URL is
+# verified 200 application/json. Do not point this back at github.io.
+QUALITY_CATALOG_URL = "https://model-compare.dev/catalog.json"
+# Cache key for the hydration envelope {"by_id", "generated_at",
+# "schema_version"}. Only usable (non-empty by_id) results are ever written.
+QUALITY_CATALOG_CACHE = "published-catalog"
+# A published catalog generated more than this many days ago is stale:
+# warn but use -- the records' as_of makes the staleness visible downstream.
+QUALITY_CATALOG_MAX_AGE_DAYS = 14
 VERSION = "0.4.0"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
@@ -1197,6 +1209,173 @@ def fetch_session_cost(args) -> dict | None:
         "medians": medians,
     }
     save_cache("session-cost", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Published catalog quality (hydration for unkeyed runs)
+# ---------------------------------------------------------------------------
+
+
+# Pre-reconciliation published catalogs (schema v3, written before the AA
+# tier was relabeled) record the AA tier as "api"; hydration normalizes it
+# to the final "aa" label. Every other recorded label passes through as-is.
+_QUALITY_SOURCE_NORMALIZATION = {"api": "aa"}
+
+
+def catalog_quality_by_id(doc) -> dict:
+    """Pure parser: a published catalog document -> {id: quality record}.
+
+    No fetch, no cache, no args object -- the fetcher owns transport and
+    freshness; this owns shape. Records are {"index", "source", "as_of"}
+    and feed resolve_quality's catalog_quality parameter on unkeyed runs;
+    the values were produced by a keyed CI run, so hydration is an exact
+    catalog-id join with no re-matching.
+
+    Gates (design: failure modes):
+    - schema_version must be an int >= 3; anything older warns
+      "published catalog schema vX, expected >= 3; skipping hydration"
+      and yields {}. Accepting v3 is the deploy-day skew case: the live
+      artifact predates the v4 per-row quality_as_of.
+    - Any shape surprise -- a non-dict document, a non-int schema_version,
+      a non-list models, a row without a usable id, or a matched row whose
+      quality is not a finite number or whose quality_match is not a
+      non-empty string -- warns and yields {} for the WHOLE artifact.
+      Never a partial hydration, never a raise: the catalog is
+      machine-generated, so one malformed row means this is not the
+      artifact we think it is.
+    - Rows with quality None and quality_match None are legitimate
+      unmatched models; they are skipped silently (nothing to hydrate).
+
+    Normalization: v3 rows map quality_match "api" -> "aa" and date every
+    row with the catalog's generated_at -- the live v3 artifact carries
+    quality_as_of: null, which must be ignored, not passed through.
+    v4+ rows keep their recorded quality_as_of (None when absent) and
+    source label as-is.
+    """
+    if not isinstance(doc, dict):
+        warn("published catalog returned an unexpected response shape")
+        return {}
+    schema_version = doc.get("schema_version")
+    if type(schema_version) is not int:
+        warn("published catalog returned an unexpected response shape")
+        return {}
+    if schema_version < 3:
+        warn(
+            f"published catalog schema v{schema_version}, expected >= 3; "
+            "skipping hydration"
+        )
+        return {}
+    models = doc.get("models")
+    if not isinstance(models, list):
+        warn("published catalog returned an unexpected response shape")
+        return {}
+    generated_at = doc.get("generated_at")
+    v3_as_of = generated_at if isinstance(generated_at, str) and generated_at else None
+    by_id: dict = {}
+    for entry in models:
+        if not isinstance(entry, dict):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        model_id = entry.get("id")
+        if not (isinstance(model_id, str) and model_id):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        quality = entry.get("quality")
+        match = entry.get("quality_match")
+        if match is None and quality is None:
+            continue  # legitimate unmatched row: nothing to hydrate
+        if not (isinstance(match, str) and match):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        if not isinstance(quality, (int, float)) or isinstance(quality, bool):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        try:
+            index = float(quality)  # huge ints raise OverflowError
+        except OverflowError:
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        # Non-finite indexes would serialize as NaN and poison quality.
+        if not math.isfinite(index):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        if schema_version == 3:
+            as_of = v3_as_of
+        else:
+            recorded = entry.get("quality_as_of")
+            as_of = recorded if isinstance(recorded, str) and recorded else None
+        by_id[model_id] = {
+            "index": index,
+            "source": _QUALITY_SOURCE_NORMALIZATION.get(match, match),
+            "as_of": as_of,
+        }
+    return by_id
+
+
+def fetch_quality_catalog(args) -> dict | None:
+    """Quality records from the published catalog.json, or None.
+
+    The third quality source (design: source 2): the repo's own published
+    catalog artifact, built by keyed CI runs and hydrated by unkeyed local
+    runs. Never called on keyed runs -- a CI/site build hydrating from the
+    published catalog would consume its own output (self-reference loop);
+    Task 4 owns that wiring.
+
+    Returns None only on TRANSPORT failure (after fetch_json's retries);
+    otherwise the envelope {"by_id": {id: record}, "generated_at":
+    str|None, "schema_version": int}. An empty by_id means
+    fetched-but-unusable (schema gate fail, malformed shape) -- Task 4's
+    footer treats None and empty by_id identically ("catalog unavailable").
+
+    The envelope is cached under QUALITY_CATALOG_CACHE with the standard
+    TTL, and only a usable (non-empty by_id) result is ever written: a
+    degraded payload must self-heal on the next run. --no-cache neither
+    reads nor writes. Staleness: generated_at older than
+    QUALITY_CATALOG_MAX_AGE_DAYS warns but uses -- as_of makes the
+    staleness visible downstream (the check runs only when rows actually
+    hydrate -- warning about the age of a catalog we are not using is
+    noise); an unusable generated_at warns that
+    staleness cannot be checked and still uses the rows (their as_of then
+    shows None rather than a wrong date).
+    """
+    if not args.no_cache:
+        cached = load_cache(QUALITY_CATALOG_CACHE, args.cache_ttl)
+        if isinstance(cached, dict) and isinstance(cached.get("by_id"), dict):
+            return cached
+    try:
+        doc = fetch_json(QUALITY_CATALOG_URL, timeout=30, retries=3)
+    except Exception as exc:
+        warn(f"published catalog request failed ({exc})")
+        return None
+    by_id = catalog_quality_by_id(doc)
+    generated_at = doc.get("generated_at") if isinstance(doc, dict) else None
+    if not isinstance(generated_at, str):
+        generated_at = None
+    schema_version = doc.get("schema_version") if isinstance(doc, dict) else 0
+    if type(schema_version) is not int:
+        schema_version = 0
+    result = {
+        "by_id": by_id,
+        "generated_at": generated_at,
+        "schema_version": schema_version,
+    }
+    if by_id:
+        generated = parse_iso_datetime(generated_at)
+        if generated is None:
+            warn(
+                "published catalog generated_at is missing or unparseable; "
+                "cannot check staleness"
+            )
+        else:
+            age_days = (datetime.now(timezone.utc) - generated).total_seconds() / 86400
+            if age_days > QUALITY_CATALOG_MAX_AGE_DAYS:
+                warn(
+                    f"published catalog is stale (generated {generated_at}, "
+                    f"{age_days:.0f} days old); using it anyway"
+                )
+        if not args.no_cache:
+            save_cache(QUALITY_CATALOG_CACHE, result)
     return result
 
 

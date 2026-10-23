@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from argparse import Namespace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -4235,6 +4235,225 @@ def test_print_json_rows_carry_quality_source_and_as_of(capsys):
     assert row["quality_drift"] is False
     assert row["quality_or_index"] == 57.5
     assert row["quality_or_as_of"] == "20260915"
+
+
+# ---------------------------------------------------------------------------
+# published catalog hydration (pure parser + fetcher; Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_doc(models, schema_version=3, generated_at="2026-10-23T13:15:07+00:00"):
+    """Minimal published catalog.json: only the fields hydration reads."""
+    return {
+        "schema_version": schema_version,
+        "generated_at": generated_at,
+        "models": models,
+    }
+
+
+def test_catalog_quality_by_id_v4_passthrough(capsys):
+    """v4 rows keep their recorded quality_as_of and source label verbatim;
+    unmatched rows (no value, no label) are skipped without a warning."""
+    doc = _catalog_doc(
+        [
+            {
+                "id": "acme/model-a",
+                "quality": 45.1,
+                "quality_match": "aa",
+                "quality_as_of": "2026-10-23T13:15:07+00:00",
+            },
+            {
+                "id": "acme/model-b",
+                "quality": 39.5,
+                "quality_match": "openrouter",
+                "quality_as_of": "2026-10-17T00:00:00+00:00",
+            },
+            {"id": "acme/model-c", "quality": None, "quality_match": None},
+        ],
+        schema_version=4,
+    )
+    assert mc.catalog_quality_by_id(doc) == {
+        "acme/model-a": {
+            "index": 45.1,
+            "source": "aa",
+            "as_of": "2026-10-23T13:15:07+00:00",
+        },
+        "acme/model-b": {
+            "index": 39.5,
+            "source": "openrouter",
+            "as_of": "2026-10-17T00:00:00+00:00",
+        },
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_catalog_quality_by_id_v3_normalized(capsys):
+    """Deploy-day skew: v3 rows normalize (quality_match "api" -> "aa") and
+    date every row with the catalog's generated_at -- the live v3 artifact
+    carries quality_as_of: null, which must be ignored, not passed through."""
+    doc = _catalog_doc(
+        [
+            {
+                "id": "acme/model-a",
+                "quality": 45.1,
+                "quality_match": "api",
+                "quality_as_of": None,
+            },
+            {"id": "acme/model-b", "quality": 39.5, "quality_match": "openrouter"},
+        ],
+        schema_version=3,
+        generated_at="2026-10-23T13:15:07+00:00",
+    )
+    assert mc.catalog_quality_by_id(doc) == {
+        "acme/model-a": {
+            "index": 45.1,
+            "source": "aa",
+            "as_of": "2026-10-23T13:15:07+00:00",
+        },
+        "acme/model-b": {
+            "index": 39.5,
+            "source": "openrouter",
+            "as_of": "2026-10-23T13:15:07+00:00",
+        },
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_catalog_quality_by_id_schema_mismatch_skipped(capsys):
+    """schema_version < 3: warn + skip the whole artifact (empty by_id)."""
+    doc = _catalog_doc(
+        [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}],
+        schema_version=2,
+    )
+    assert mc.catalog_quality_by_id(doc) == {}
+    err = capsys.readouterr().err
+    assert "published catalog schema v2, expected >= 3" in err
+    assert "skipping hydration" in err
+
+
+def test_catalog_quality_by_id_malformed_never_raises(capsys):
+    """Any shape surprise warns and yields an empty map -- never an exception,
+    never a partial hydration (fail closed on the whole artifact)."""
+    good_row = {"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}
+    bad_docs = [
+        None,
+        ["not", "a", "dict"],
+        {"models": [good_row]},  # schema_version missing entirely
+        {**_catalog_doc([good_row]), "schema_version": "3"},
+        {**_catalog_doc([good_row]), "models": None},
+        {**_catalog_doc([good_row]), "models": {"0": good_row}},
+        _catalog_doc(["not a dict"]),
+        _catalog_doc([{"quality": 45.1, "quality_match": "api"}]),  # id missing
+        _catalog_doc([{"id": "", "quality": 45.1, "quality_match": "api"}]),
+        _catalog_doc(
+            [{"id": "acme/model-a", "quality": "45.1", "quality_match": "api"}]
+        ),
+        _catalog_doc([{"id": "acme/model-a", "quality": True, "quality_match": "api"}]),
+        _catalog_doc([{"id": "acme/model-a", "quality": None, "quality_match": "api"}]),
+        _catalog_doc([{"id": "acme/model-a", "quality": 45.1, "quality_match": None}]),
+    ]
+    for doc in bad_docs:
+        assert mc.catalog_quality_by_id(doc) == {}
+        assert "unexpected response shape" in capsys.readouterr().err
+
+
+def test_fetch_quality_catalog_stale_generated_at_warns_but_uses(monkeypatch, capsys):
+    """>14 days old: warn but use -- staleness stays visible via as_of, and
+    the hydration is not thrown away over display-only provenance."""
+    stale = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+    doc = _catalog_doc(
+        [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}],
+        generated_at=stale,
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
+    result = mc.fetch_quality_catalog(make_args())
+    assert result["by_id"] == {
+        "acme/model-a": {"index": 45.1, "source": "aa", "as_of": stale}
+    }
+    assert result["schema_version"] == 3
+    assert "stale" in capsys.readouterr().err
+    # A fresh catalog hydrates without the staleness warning.
+    fresh = _catalog_doc(
+        [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}],
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: fresh)
+    result = mc.fetch_quality_catalog(make_args())
+    assert result["by_id"]
+    assert "stale" not in capsys.readouterr().err
+
+
+def test_fetch_quality_catalog_fetch_failure_returns_none(monkeypatch, capsys):
+    """Transport failure -> None (the caller's "catalog unavailable" signal);
+    a fetched-but-unusable payload is NOT None -- it comes back as an
+    envelope with an empty by_id. The None/empty distinction is pinned here."""
+
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(mc, "fetch_json", boom)
+    assert mc.fetch_quality_catalog(make_args()) is None
+    assert "published catalog request failed" in capsys.readouterr().err
+    # Fetched but unusable (schema gate fail): an envelope, never None.
+    monkeypatch.setattr(
+        mc, "fetch_json", lambda *a, **k: _catalog_doc([], schema_version=2)
+    )
+    result = mc.fetch_quality_catalog(make_args())
+    assert result is not None
+    assert result["by_id"] == {}
+    assert result["schema_version"] == 2
+    # A payload that is not even an object: same envelope, unknown schema.
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: ["not", "a", "dict"])
+    result = mc.fetch_quality_catalog(make_args())
+    assert result == {"by_id": {}, "generated_at": None, "schema_version": 0}
+
+
+def test_fetch_quality_catalog_respects_no_cache_and_ttl(monkeypatch, tmp_path):
+    """Cache write/read roundtrip under QUALITY_CATALOG_CACHE; --no-cache
+    neither reads nor writes; an expired entry is fetched again; only a
+    usable (non-empty by_id) result is ever written."""
+    calls = []
+    doc = _catalog_doc(
+        [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}]
+    )
+
+    def fake_fetch(url, headers=None, timeout=30, retries=1):
+        calls.append(url)
+        return doc
+
+    monkeypatch.setattr(mc, "fetch_json", fake_fetch)
+    args = make_args(no_cache=False, cache_ttl=3600)
+    first = mc.fetch_quality_catalog(args)
+    assert calls == [mc.QUALITY_CATALOG_URL]
+    cache_file = tmp_path / "model-compare" / f"{mc.QUALITY_CATALOG_CACHE}.json"
+    assert cache_file.exists()
+    second = mc.fetch_quality_catalog(args)
+    assert len(calls) == 1  # served from cache, no second request
+    assert second == first
+    # An entry past its TTL is fetched again.
+    blob = json.loads(cache_file.read_text())
+    blob["fetched_at"] = time.time() - 7200
+    cache_file.write_text(json.dumps(blob))
+    mc.fetch_quality_catalog(args)
+    assert len(calls) == 2
+    # A fetched-but-unusable payload is never cached (self-heals next run):
+    # with no cached envelope present the v2 doc is fetched, degrades to an
+    # empty by_id, and leaves no cache file behind.
+    cache_file.unlink()
+    monkeypatch.setattr(
+        mc, "fetch_json", lambda *a, **k: _catalog_doc([], schema_version=2)
+    )
+    assert mc.fetch_quality_catalog(args)["by_id"] == {}
+    assert not cache_file.exists()
+    # --no-cache neither reads nor writes the cache.
+    monkeypatch.setattr(mc, "fetch_json", fake_fetch)
+    calls.clear()
+    result = mc.fetch_quality_catalog(make_args(no_cache=True))
+    assert len(calls) == 1  # fresh fetch despite nothing cached
+    assert not cache_file.exists()
+    assert result["by_id"] == {
+        "acme/model-a": {"index": 45.1, "source": "aa", "as_of": doc["generated_at"]}
+    }
 
 
 # ---------------------------------------------------------------------------
