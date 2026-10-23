@@ -2499,12 +2499,26 @@ def test_build_candidates_stores_discount():
 
 
 def frontend_payload():
-    """Base-URL payload with discounts and benchmarks in one response."""
+    """Base-URL payload with discounts and benchmarks in one response.
+
+    Mirrors the live shape: models entries carry the slug/permaslug pair,
+    and several dated permaslugs can pair with one slug -- the newest
+    snapshot's trio wins for that slug.
+    """
     return {
         "data": {
             "models": [
                 {
                     "slug": "acme/a",
+                    "permaslug": "acme/a-20260826",
+                    "endpoint": {
+                        "variant": "standard",
+                        "pricing": {"discount": 0.5, "prompt": "0.1"},
+                    },
+                },
+                {
+                    "slug": "acme/a",
+                    "permaslug": "acme/a-20260915",
                     "endpoint": {
                         "variant": "standard",
                         "pricing": {"discount": 0.5, "prompt": "0.1"},
@@ -2534,6 +2548,13 @@ def frontend_payload():
                         "intelligence_index": 57.5,
                         "coding_index": 71.5,
                         "agentic_index": 58.2,
+                    }
+                },
+                "acme/a-20260915": {
+                    "aa": {
+                        "intelligence_index": 60,
+                        "coding_index": 72,
+                        "agentic_index": 59,
                     }
                 },
             },
@@ -2603,9 +2624,10 @@ def test_fetch_openrouter_frontend_derives_all_payloads(monkeypatch, tmp_path):
     assert zdr_ids == {"acme/a", "acme/b:batch"}
     assert aa_by_id == {
         "acme/a": {
-            "intelligence_index": 57.5,
-            "coding_index": 71.5,
-            "agentic_index": 58.2,
+            "intelligence_index": 60.0,
+            "coding_index": 72.0,
+            "agentic_index": 59.0,
+            "as_of": "20260915",
         }
     }
     assert cache_hits == set()
@@ -2754,7 +2776,7 @@ def test_fetch_openrouter_frontend_does_not_cache_empty(monkeypatch, tmp_path):
     assert len(calls) == 4  # 2 per run (base + zdr); nothing cacheable
     cache_dir = tmp_path / "model-compare"
     assert not (cache_dir / "openrouter-frontend-discounts.json").exists()
-    assert not (cache_dir / "openrouter-frontend-aa.json").exists()
+    assert not (cache_dir / "openrouter-frontend-aa-v2.json").exists()
     assert not (cache_dir / "openrouter-zdr-v3.json").exists()
 
 
@@ -2770,7 +2792,7 @@ def test_fetch_openrouter_frontend_treats_empty_cached_payloads_as_miss(
     (cache_dir / "openrouter-frontend-discounts.json").write_text(
         json.dumps({"fetched_at": now, "payload": {}})
     )
-    (cache_dir / "openrouter-frontend-aa.json").write_text(
+    (cache_dir / "openrouter-frontend-aa-v2.json").write_text(
         json.dumps({"fetched_at": now, "payload": {}})
     )
     (cache_dir / "openrouter-zdr-v3.json").write_text(
@@ -2805,9 +2827,10 @@ def test_fetch_openrouter_frontend_fresh_fetch_replaces_cached_discounts(
     assert discounts == {"acme/a": 0.5, "acme/b:free": 0.0, "acme/c:batch": 0.75}
     assert aa_by_id == {
         "acme/a": {
-            "intelligence_index": 57.5,
-            "coding_index": 71.5,
-            "agentic_index": 58.2,
+            "intelligence_index": 60.0,
+            "coding_index": 72.0,
+            "agentic_index": 59.0,
+            "as_of": "20260915",
         }
     }
     assert zdr_ids == {"acme/a", "acme/b:batch"}
@@ -3011,7 +3034,7 @@ def test_fetch_openrouter_frontend_aa_cache_hit_skips_base_fetch(monkeypatch, tm
     (cache_dir / "openrouter-frontend-discounts.json").write_text(
         json.dumps({"fetched_at": time.time(), "payload": {"acme/a": 0.5}})
     )
-    (cache_dir / "openrouter-frontend-aa.json").write_text(
+    (cache_dir / "openrouter-frontend-aa-v2.json").write_text(
         json.dumps(
             {
                 "fetched_at": time.time(),
@@ -3362,22 +3385,123 @@ def test_build_aa_benchmarks_strips_dated_permaslugs():
         },
         "acme/plain": {"aa": {"intelligence_index": 40}},
     }
-    aa = mc.build_aa_benchmarks(benchmarks)
+    aa = mc.build_aa_benchmarks(benchmarks, None)
     assert aa["z-ai/glm-5.3-flash"] == {
         "intelligence_index": 57.5,
         "coding_index": 71.5,
         "agentic_index": 58.2,
+        "as_of": "20260826",
     }
-    assert aa["acme/plain"] == {"intelligence_index": 40.0}
+    assert aa["acme/plain"] == {"intelligence_index": 40.0, "as_of": None}
 
 
-def test_build_aa_benchmarks_latest_date_wins():
+def test_build_aa_benchmarks_two_listings_no_borrowing():
+    # Regression for #17: two dated permaslugs of one model family strip to
+    # the SAME bare id, so blind date-stripping let the base listing borrow
+    # the snapshot's score. The catalog's own slug/permaslug pairs keep each
+    # listing's trio on its own slug (values are the live-verified pair).
     benchmarks = {
-        "acme/m-20260801": {"aa": {"intelligence_index": 10}},
-        "acme/m-20260820": {"aa": {"intelligence_index": 20}},
-        "acme/m": {"aa": {"intelligence_index": 30}},
+        "deepseek/deepseek-v4.1-flash-20261017": {"aa": {"intelligence_index": 39.5}},
+        "deepseek/deepseek-v4.1-flash-20260910": {"aa": {"intelligence_index": 24.7}},
     }
-    assert mc.build_aa_benchmarks(benchmarks)["acme/m"] == {"intelligence_index": 20.0}
+    models = [
+        {
+            "slug": "deepseek/deepseek-v4.1-flash",
+            "permaslug": "deepseek/deepseek-v4.1-flash-20260910",
+        },
+        # standard and batch variants repeat the same slug/permaslug pair
+        {
+            "slug": "deepseek/deepseek-v4.1-flash",
+            "permaslug": "deepseek/deepseek-v4.1-flash-20260910",
+        },
+        {
+            "slug": "deepseek/deepseek-v4.1-flash-1017",
+            "permaslug": "deepseek/deepseek-v4.1-flash-20261017",
+        },
+    ]
+    aa = mc.build_aa_benchmarks(benchmarks, models)
+    assert aa == {
+        "deepseek/deepseek-v4.1-flash": {
+            "intelligence_index": 24.7,
+            "as_of": "20260910",
+        },
+        "deepseek/deepseek-v4.1-flash-1017": {
+            "intelligence_index": 39.5,
+            "as_of": "20261017",
+        },
+    }
+
+
+def test_build_aa_benchmarks_undated_key_self_maps():
+    # An undated key is a bare catalog id and maps to itself.
+    benchmarks = {"acme/plain": {"aa": {"intelligence_index": 40}}}
+    assert mc.build_aa_benchmarks(benchmarks, []) == {
+        "acme/plain": {"intelligence_index": 40.0, "as_of": None}
+    }
+
+
+def test_build_aa_benchmarks_undated_key_drops_when_pass1_claimed():
+    # Pass 1 claims the slug through the catalog's permaslug pairing, and
+    # the undated key for that id defers -- in either benchmarks order,
+    # pinning that all of pass 1 resolves before pass 2 runs.
+    dated = {"aa": {"intelligence_index": 20}}
+    undated = {"aa": {"intelligence_index": 10}}
+    models = [{"slug": "acme/m", "permaslug": "acme/m-20260820"}]
+    for benchmarks in (
+        {"acme/m": undated, "acme/m-20260820": dated},
+        {"acme/m-20260820": dated, "acme/m": undated},
+    ):
+        aa = mc.build_aa_benchmarks(benchmarks, models)
+        assert aa == {"acme/m": {"intelligence_index": 20.0, "as_of": "20260820"}}
+
+
+def test_build_aa_benchmarks_unresolvable_dated_key_strips_when_unambiguous():
+    # A dated key the catalog does not pair still maps by stripping, as
+    # long as the stripped id is unclaimed and no other key strips there.
+    benchmarks = {"acme/legacy-20250101": {"aa": {"intelligence_index": 11}}}
+    assert mc.build_aa_benchmarks(benchmarks, []) == {
+        "acme/legacy": {"intelligence_index": 11.0, "as_of": "20250101"}
+    }
+
+
+def test_build_aa_benchmarks_ambiguous_strip_dropped():
+    # The #17 shape with no catalog pairing to disambiguate: two dated
+    # keys strip to one id, so neither may claim it (no borrowing).
+    benchmarks = {
+        "deepseek/deepseek-v4.1-flash-20261017": {"aa": {"intelligence_index": 39.5}},
+        "deepseek/deepseek-v4.1-flash-20260910": {"aa": {"intelligence_index": 24.7}},
+    }
+    assert mc.build_aa_benchmarks(benchmarks, []) == {}
+
+
+def test_build_aa_benchmarks_same_slug_latest_date_wins():
+    # glm-style: several dated permaslugs legitimately pair with ONE slug
+    # (snapshot variants of one listing); the latest date wins.
+    benchmarks = {
+        "z-ai/glm-5.3-flash-20260826": {"aa": {"intelligence_index": 57.5}},
+        "z-ai/glm-5.3-flash-20260915": {"aa": {"intelligence_index": 59.5}},
+    }
+    models = [
+        {"slug": "z-ai/glm-5.3-flash", "permaslug": "z-ai/glm-5.3-flash-20260826"},
+        {"slug": "z-ai/glm-5.3-flash", "permaslug": "z-ai/glm-5.3-flash-20260915"},
+    ]
+    assert mc.build_aa_benchmarks(benchmarks, models) == {
+        "z-ai/glm-5.3-flash": {"intelligence_index": 59.5, "as_of": "20260915"}
+    }
+
+
+def test_build_aa_benchmarks_invalid_trio_skipped():
+    # Non-finite and null index values fail the finite-number guard, so
+    # the whole entry is treated as absent.
+    benchmarks = {
+        "acme/null": {"aa": {"intelligence_index": None}},
+        "acme/nan": {"aa": {"intelligence_index": float("nan")}},
+        "acme/inf": {"aa": {"intelligence_index": float("inf")}},
+        "acme/valid": {"aa": {"intelligence_index": 42}},
+    }
+    assert mc.build_aa_benchmarks(benchmarks, []) == {
+        "acme/valid": {"intelligence_index": 42.0, "as_of": None}
+    }
 
 
 def test_build_aa_benchmarks_skips_invalid_values_but_keeps_valid_ones():
@@ -3393,7 +3517,7 @@ def test_build_aa_benchmarks_skips_invalid_values_but_keeps_valid_ones():
         "acme/not-a-node": "garbage",
     }
     aa = mc.build_aa_benchmarks(benchmarks)
-    assert aa == {"acme/partial": {"coding_index": 70.0}}
+    assert aa == {"acme/partial": {"coding_index": 70.0, "as_of": None}}
 
 
 def test_build_aa_benchmarks_empty_inputs():

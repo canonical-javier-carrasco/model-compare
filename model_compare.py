@@ -1215,7 +1215,9 @@ def fetch_openrouter_models(args):
 
 
 FRONTEND_DISCOUNTS_CACHE = "openrouter-frontend-discounts"
-FRONTEND_AA_CACHE = "openrouter-frontend-aa"
+# v2: AA records are keyed by exact catalog slug and carry as_of (#17);
+# v1 cached the conflated date-stripped shape, so the old key is never read.
+FRONTEND_AA_CACHE = "openrouter-frontend-aa-v2"
 
 
 def fetch_openrouter_frontend(args):
@@ -1273,7 +1275,8 @@ def fetch_openrouter_frontend(args):
                 key = slug if variant in ("", "standard") else f"{slug}:{variant}"
                 fresh_discounts.setdefault(key, float(raw))
             fresh_aa = build_aa_benchmarks(
-                data.get("benchmarks") if isinstance(data, dict) else None
+                data.get("benchmarks") if isinstance(data, dict) else None,
+                entries,
             )
             if fresh_discounts:
                 discounts = fresh_discounts
@@ -1946,24 +1949,37 @@ def base_model_id(model_id: str) -> str:
 AA_BENCHMARK_FIELDS = ("intelligence_index", "coding_index", "agentic_index")
 
 
-def build_aa_benchmarks(benchmarks) -> dict:
-    """Map bare OpenRouter id -> OR-published AA trio from data.benchmarks.
+def build_aa_benchmarks(benchmarks, models=None) -> dict:
+    """Map exact catalog slug -> OR-published AA trio from data.benchmarks.
 
-    Keys are dated permaslugs (z-ai/glm-5.3-flash-20260826): the trailing
-    -YYYYMMDD is stripped and undated keys map to themselves; when two keys
-    strip to the same id the latest date wins. Values failing the
-    finite-number guard are treated as absent; entries with at least one
-    valid field are kept.
+    Benchmark keys are dated permaslugs (deepseek/deepseek-v4.1-flash-
+    20261017) whose date-stripped form can collide across listings of one
+    model family: the snapshot listing deepseek/deepseek-v4.1-flash-1017
+    and the base listing deepseek/deepseek-v4.1-flash both strip to
+    deepseek/deepseek-v4.1-flash, so blind stripping with latest-date-wins
+    made the base listing borrow the snapshot's score (#17). Keys resolve
+    through three explicit passes over the surviving entries, and every
+    accepted id is claimed by the pass that resolved it, so later passes
+    never overwrite an earlier one:
+
+    1. Primary: a key equal to a models entry's permaslug maps to that
+       entry's slug -- the catalog's own pairing, no guessing. Several
+       dated permaslugs may legitimately pair with one slug (snapshot
+       variants of one listing); among those the latest date wins.
+    2. Undated: a key without a -YYYYMMDD suffix maps to itself, unless
+       pass 1 claimed the id.
+    3. Dated fallback: a dated key the catalog does not pair strips via
+       strip_permaslug_date, accepted only when the stripped id is
+       unclaimed and no other pass-3 key strips to the same id -- an
+       ambiguous strip is the #17 conflation shape, so every candidate
+       for that id drops rather than guess.
+
+    Entries whose values fail the finite-number guard are treated as
+    absent before the passes run; entries with at least one valid field
+    are kept. Records carry "as_of": the YYYYMMDD of the permaslug the
+    trio came from, or None for undated keys.
     """
-    aa_by_id = {}
-    seen_date = {}
-
-    def accept(bare, date, trio):
-        if bare in seen_date and seen_date[bare] >= date:
-            return
-        seen_date[bare] = date
-        aa_by_id[bare] = trio
-
+    valid = {}  # benchmark key -> (trio, permaslug date or "")
     for key, node in (benchmarks or {}).items():
         aa = node.get("aa") if isinstance(node, dict) else None
         if not isinstance(aa, dict):
@@ -1979,11 +1995,61 @@ def build_aa_benchmarks(benchmarks) -> dict:
                 trio[field] = float(value)
         if not trio:
             continue
-        match = re.match(r"^(.*)-(\d{8})$", key)
-        if match:
-            accept(match.group(1), match.group(2), trio)
-        else:
-            accept(key, "", trio)
+        bare = strip_permaslug_date(key)
+        # strip_permaslug_date removed a trailing -YYYYMMDD exactly when
+        # the key was dated; the date is then the final 8 characters.
+        valid[key] = (trio, "" if bare == key else key[-8:])
+
+    permaslug_to_slug = {}  # the catalog's own slug/permaslug pairing
+    for entry in models or []:
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get("slug") or ""
+        permaslug = entry.get("permaslug") or ""
+        if slug and permaslug:
+            # standard and batch variants repeat an identical pair; the
+            # overwrite is the dedup
+            permaslug_to_slug[permaslug] = slug
+
+    aa_by_id = {}
+    claimed = set()
+
+    def record(trio, date):
+        return {**trio, "as_of": date or None}
+
+    # Pass 1: permaslug keys pair with their own slug; same-slug
+    # snapshots resolve to the latest date (first wins on an equal date).
+    seen_date = {}
+    for key, (trio, date) in valid.items():
+        slug = permaslug_to_slug.get(key)
+        if slug is None or (slug in seen_date and seen_date[slug] >= date):
+            continue
+        seen_date[slug] = date
+        aa_by_id[slug] = record(trio, date)
+        claimed.add(slug)
+
+    # Pass 2: undated keys self-map unless pass 1 claimed the id.
+    for key, (trio, date) in valid.items():
+        if date or key in permaslug_to_slug or key in claimed:
+            continue
+        aa_by_id[key] = record(trio, date)
+        claimed.add(key)
+
+    # Pass 3: unpaired dated keys strip, but only onto an unclaimed id
+    # and only when the strip is unambiguous.
+    strip_candidates = {}
+    for key, (trio, date) in valid.items():
+        if not date or key in permaslug_to_slug:
+            continue
+        stripped = strip_permaslug_date(key)
+        strip_candidates.setdefault(stripped, []).append((date, trio))
+    for bare, candidates in strip_candidates.items():
+        if bare in claimed or len(candidates) > 1:
+            continue
+        date, trio = candidates[0]
+        aa_by_id[bare] = record(trio, date)
+        claimed.add(bare)
+
     return aa_by_id
 
 
