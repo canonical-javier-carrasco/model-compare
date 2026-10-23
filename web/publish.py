@@ -202,19 +202,20 @@ def check_best(output_dir: Path, catalog: dict) -> None:
         )
 
 
-AA_FALLBACKS_LIVE = ("aa",)
+AA_LIVE_MODE = "aa"
 
 
-def check_aa_fallback(catalog_path: Path) -> None:
-    """With AA_API_KEY set, fail unless the AA API itself worked.
+def check_aa_source(catalog_path: Path) -> None:
+    """With AA_API_KEY set, fail unless the AA API itself produced quality.
 
-    sources.aa.mode "openrouter" means at least one candidate's AA data came
-    from OpenRouter; it says nothing about whether the AA API worked.
-    sources.aa.fallback records that ("aa" or "none"; the page scrape that
-    could also yield "scrape" was removed), so the gate reads fallback and
-    requires "aa": a rejected key yields "none" and fails. A missing or
-    unknown value fails closed. Without a key AA data comes only from
-    OpenRouter, so the gate never raises.
+    sources.aa.mode records the run's quality chain: "aa" when the AA API
+    was consulted, "catalog" for published-catalog hydration (keyed runs
+    never hydrate), "none" when neither tier yielded anything. A keyed
+    publish must have live AA data standing behind its quality: mode "aa"
+    AND at least one AA-matched model (matched_aa > 0) -- a rejected key,
+    an empty result, a catalog-or-OR-only chain, an unknown mode or a
+    malformed count all fail closed. Without a key the catalog chain (or
+    OR-only data) is expected, so the gate never raises.
     """
     if not os.environ.get("AA_API_KEY"):
         return
@@ -223,15 +224,21 @@ def check_aa_fallback(catalog_path: Path) -> None:
     aa_sources = sources.get("aa") if isinstance(sources, dict) else None
     if not isinstance(aa_sources, dict):
         aa_sources = {}
-    fallback = aa_sources.get("fallback")
-    if fallback not in AA_FALLBACKS_LIVE:
+    mode = aa_sources.get("mode")
+    matched_aa = aa_sources.get("matched_aa")
+    if (
+        mode != AA_LIVE_MODE
+        or not isinstance(matched_aa, int)
+        or isinstance(matched_aa, bool)
+        or matched_aa <= 0
+    ):
         raise RuntimeError(
-            "publish: AA_API_KEY is set but catalog sources.aa.fallback is "
-            f"{fallback!r} (mode {aa_sources.get('mode')!r}): the AA API "
+            "publish: AA_API_KEY is set but catalog sources.aa is "
+            f"{{mode: {mode!r}, matched_aa: {matched_aa!r}}}: the AA API "
             "did not yield data. Check the key and artificialanalysis.ai, "
             "or unset AA_API_KEY, before deploying."
         )
-    print(f"publish: AA source mode {aa_sources.get('mode')}, fallback {fallback}")
+    print(f"publish: AA source mode {mode}, matched_aa {matched_aa}")
 
 
 def check_endpoint_drops(catalog_path: Path) -> None:
@@ -303,9 +310,9 @@ def build_site(output_dir: Path) -> None:
         # are never cached, so a later run may fetch different data. That
         # fails loudly (order_rows, check_best) and the next run self-heals.
         run_script(model_compare, ["--catalog"], out=scratch / "catalog.json")
-        # Gates before anything else runs, so a failed AA fallback or an
+        # Gates before anything else runs, so a failed AA source gate or an
         # endpoint-drop exodus writes no publish artifacts to output_dir.
-        check_aa_fallback(scratch / "catalog.json")
+        check_aa_source(scratch / "catalog.json")
         check_endpoint_drops(scratch / "catalog.json")
         run_script(model_compare, ["--best"], out=output_dir / "best.txt")
         for priority in PRIORITIES:

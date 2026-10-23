@@ -4615,7 +4615,7 @@ def build_doc(**overrides):
 
 def test_catalog_envelope():
     doc = build_doc()
-    assert doc["schema_version"] == 3
+    assert doc["schema_version"] == 4
     assert doc["tool"] == "model-compare"
     datetime.fromisoformat(doc["generated_at"])  # ISO with offset, raises if not
     p = doc["parameters"]
@@ -4632,11 +4632,15 @@ def test_catalog_envelope():
     assert p["weights"]["balanced"] == mc.PRIORITY_WEIGHTS["balanced"]
     assert doc["sources"] == {
         "openrouter": "ok",
+        # The keyed chain (the fixture passes an AA source); model-b matched
+        # through OpenRouter's benchmarks, so its bucket holds the count.
         "aa": {
-            "mode": "openrouter",
-            "fallback": "aa",
-            "matched": 1,
+            "mode": "aa",
+            "matched_aa": 0,
+            "matched_catalog": 0,
             "matched_openrouter": 1,
+            "catalog_generated_at": None,
+            "intelligence_index_version": None,
         },
         "zdr": "ok",
         "discounts": "ok",
@@ -4706,6 +4710,10 @@ def test_catalog_entry_shape():
     b = next(e for e in doc["models"] if e["id"] == "acme/model-b")
     assert b["quality"] == 68.4
     assert b["quality_match"] == "openrouter"
+    # Provenance (schema v4): the fixture's OR benchmark carries no as_of,
+    # and an OpenRouter-sourced record has no drift pair to report.
+    assert b["quality_as_of"] is None
+    assert b["quality_drift"] is None
     assert b["discount"] is None
 
 
@@ -5115,10 +5123,12 @@ def test_catalog_document_passes_site_validator():
     )
     assert {e["quality_match"] for e in doc["models"]} == {"aa", "openrouter"}
     assert doc["sources"]["aa"] == {
-        "mode": "openrouter",
-        "fallback": "aa",
-        "matched": 2,
+        "mode": "aa",
+        "matched_aa": 1,
+        "matched_catalog": 0,
         "matched_openrouter": 1,
+        "catalog_generated_at": None,
+        "intelligence_index_version": None,
     }
     bsd.validate_catalog(doc)  # must not raise
 
@@ -5148,10 +5158,12 @@ def test_catalog_quality_match_and_sources_counts():
     assert a["quality"] is None
     assert a["quality_match"] is None
     assert doc["sources"]["aa"] == {
-        "mode": "openrouter",
-        "fallback": "aa",
-        "matched": 1,
+        "mode": "aa",
+        "matched_aa": 0,
+        "matched_catalog": 0,
         "matched_openrouter": 1,
+        "catalog_generated_at": None,
+        "intelligence_index_version": None,
     }
 
 
@@ -5160,16 +5172,21 @@ def test_catalog_quality_published_even_without_any_aa_source():
     b = next(e for e in doc["models"] if e["id"] == "acme/model-b")
     assert b["quality"] == 68.4
     assert b["quality_match"] == "openrouter"
-    assert doc["sources"]["aa"]["mode"] == "openrouter"
+    # Without a key and without catalog meta the chain is "none"; the OR
+    # tier is the chain's ambient last resort and shows up only in its own
+    # bucket count.
+    assert doc["sources"]["aa"]["mode"] == "none"
 
 
-def test_catalog_aa_mode_reflects_fallback_when_or_empty():
+def test_catalog_aa_mode_when_or_empty():
     doc = build_doc(aa_source="AA API v2", aa_by_id={})
     assert doc["sources"]["aa"] == {
         "mode": "aa",
-        "fallback": "aa",
-        "matched": 0,
+        "matched_aa": 0,
+        "matched_catalog": 0,
         "matched_openrouter": 0,
+        "catalog_generated_at": None,
+        "intelligence_index_version": None,
     }
 
 
@@ -5184,6 +5201,223 @@ def test_catalog_rejects_removed_scrape_source():
     # the page scrape is gone; its source string must not map to a mode
     with pytest.raises(ValueError, match="unknown AA source"):
         build_doc(aa_source="AA page scrape")
+
+
+def _provenance_pool():
+    """Four candidates covering every provenance shape the catalog carries.
+
+    Returns (args, models, candidates, dropped, filtered, or_by_id,
+    aa_api_entries, catalog_quality) -- the raw inputs; each test resolves
+    quality the way its scenario needs, then scores and builds.
+
+    acme/a: only a hydrated published-catalog record (source "catalog").
+    acme/d: AA API record whose OR check value differs by >= 3.0 (drift).
+    acme/e: AA API record within the drift threshold of its OR check value.
+    acme/f: AA API record with no OpenRouter check value at all.
+    """
+    args = make_args(min_context=0)
+    models = [
+        make_model(id="acme/a", name="Acme: A"),
+        make_model(id="acme/d", name="Acme: D"),
+        make_model(id="acme/e", name="Acme: E"),
+        make_model(id="acme/f", name="Acme: F"),
+    ]
+    filtered = []
+    zdr = {m["id"] for m in models}
+    candidates, dropped = mc.build_candidates(models, args, {}, zdr, filtered)
+    aa_api_entries = [
+        {"key": "acme/d", "name": "D", "index": 45.1, "as_of": "2026-10-23T13:15:07Z"},
+        {"key": "acme/e", "name": "E", "index": 42.4, "as_of": "2026-10-23T13:15:07Z"},
+        {"key": "acme/f", "name": "F", "index": 45.1, "as_of": "2026-10-23T13:15:07Z"},
+    ]
+    or_by_id = {
+        "acme/d": {
+            "intelligence_index": 39.5,
+            "coding_index": 50.0,
+            "agentic_index": 40.0,
+            "as_of": "20261017",
+        },
+        "acme/e": {
+            "intelligence_index": 39.5,
+            "coding_index": 50.0,
+            "agentic_index": 40.0,
+            "as_of": "20261017",
+        },
+    }
+    catalog_quality = {
+        "acme/a": {
+            "index": 40.0,
+            "source": "catalog",
+            "as_of": "2026-10-20T09:00:00Z",
+        },
+    }
+    return (
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        or_by_id,
+        aa_api_entries,
+        catalog_quality,
+    )
+
+
+def test_catalog_entries_carry_quality_as_of_and_source():
+    (
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        or_by_id,
+        aa_api_entries,
+        catalog_quality,
+    ) = _provenance_pool()
+    exact, fuzzy = mc.build_aa_lookup(aa_api_entries)
+    quality_by_id, quality_source_by_id = mc.resolve_quality(
+        candidates, or_by_id, exact, fuzzy, "AA API v2", catalog_quality
+    )
+    mc.compute_scores(candidates, args, quality_by_id)
+    doc = mc.build_catalog(
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        {},
+        quality_by_id,
+        "AA API v2",
+        or_by_id,
+        quality_source_by_id,
+    )
+    entries = {e["id"]: e for e in doc["models"]}
+    # Every matched entry carries its record's as_of verbatim -- the AA
+    # fetch stamp, the hydrated catalog row's stamp -- and the label of the
+    # winning tier.
+    assert entries["acme/a"]["quality_match"] == "catalog"
+    assert entries["acme/a"]["quality_as_of"] == "2026-10-20T09:00:00Z"
+    assert entries["acme/d"]["quality_match"] == "aa"
+    assert entries["acme/d"]["quality_as_of"] == "2026-10-23T13:15:07Z"
+    assert entries["acme/e"]["quality_as_of"] == "2026-10-23T13:15:07Z"
+    assert entries["acme/f"]["quality_as_of"] == "2026-10-23T13:15:07Z"
+
+
+def test_catalog_flags_quality_drift_verbatim_from_record():
+    (
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        or_by_id,
+        aa_api_entries,
+        catalog_quality,
+    ) = _provenance_pool()
+    exact, fuzzy = mc.build_aa_lookup(aa_api_entries)
+    quality_by_id, quality_source_by_id = mc.resolve_quality(
+        candidates, or_by_id, exact, fuzzy, "AA API v2", catalog_quality
+    )
+    mc.compute_scores(candidates, args, quality_by_id)
+    doc = mc.build_catalog(
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        {},
+        quality_by_id,
+        "AA API v2",
+        or_by_id,
+        quality_source_by_id,
+    )
+    entries = {e["id"]: e for e in doc["models"]}
+    # The drift flag is the record's own verdict, verbatim: 45.1 vs 39.5
+    # (5.6 points) flags, 42.4 vs 39.5 (2.9 points) does not, and a record
+    # with no OpenRouter check value carries no verdict at all.
+    assert entries["acme/d"]["quality_drift"] is True
+    assert entries["acme/e"]["quality_drift"] is False
+    assert entries["acme/f"]["quality_drift"] is None
+    assert entries["acme/a"]["quality_drift"] is None
+
+
+def test_catalog_sources_aa_block_reshaped_with_counts_version_and_meta():
+    (
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        or_by_id,
+        aa_api_entries,
+        catalog_quality,
+    ) = _provenance_pool()
+    exact, fuzzy = mc.build_aa_lookup(aa_api_entries)
+    quality_by_id, quality_source_by_id = mc.resolve_quality(
+        candidates, or_by_id, exact, fuzzy, "AA API v2", catalog_quality
+    )
+    mc.compute_scores(candidates, args, quality_by_id)
+    doc = mc.build_catalog(
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        {},
+        quality_by_id,
+        "AA API v2",
+        or_by_id,
+        quality_source_by_id,
+        index_version=4.3,
+    )
+    # Keyed run: mode is the AA chain; the three counts are disjoint label
+    # buckets summing to the matched entries; the AA envelope's index
+    # version rides along; no catalog meta (keyed runs never hydrate).
+    assert doc["sources"]["aa"] == {
+        "mode": "aa",
+        "matched_aa": 3,
+        "matched_catalog": 1,
+        "matched_openrouter": 0,
+        "catalog_generated_at": None,
+        "intelligence_index_version": 4.3,
+    }
+
+    # Unkeyed run with a hydrated catalog: mode flips to the catalog chain
+    # and the published catalog's generated_at is the block's meta. Labels
+    # travel with the records -- the published rows' own provenance -- so
+    # an unkeyed run can still report aa-labeled matches (rows a keyed CI
+    # run resolved against the live AA API), and OpenRouter covers the ids
+    # the catalog lacks.
+    hydrated = {
+        "acme/a": {"index": 40.0, "source": "aa", "as_of": "2026-10-20T09:00:00Z"},
+        "acme/d": {"index": 44.0, "source": "catalog", "as_of": "2026-10-20T09:00:00Z"},
+    }
+    quality_by_id, quality_source_by_id = mc.resolve_quality(
+        candidates, or_by_id, {}, {}, None, hydrated
+    )
+    mc.compute_scores(candidates, args, quality_by_id)
+    doc = mc.build_catalog(
+        args,
+        models,
+        candidates,
+        dropped,
+        filtered,
+        {},
+        quality_by_id,
+        None,
+        or_by_id,
+        quality_source_by_id,
+        catalog_generated_at="2026-10-23T13:15:07+00:00",
+    )
+    assert doc["sources"]["aa"] == {
+        "mode": "catalog",
+        "matched_aa": 1,
+        "matched_catalog": 1,
+        "matched_openrouter": 1,
+        "catalog_generated_at": "2026-10-23T13:15:07+00:00",
+        "intelligence_index_version": None,
+    }
+    bsd.validate_catalog(doc)  # must not raise
 
 
 def test_catalog_no_zdr_marks_skipped(monkeypatch, capsys):
@@ -5500,32 +5734,32 @@ def test_fetch_openrouter_frontend_zdr_one_live_endpoint_suffices(
 
 
 # ---------------------------------------------------------------------------
-# sources.aa.fallback: what the AA API fallback yielded, unmasked
+# sources.aa: the run's quality chain, unmasked by match outcomes
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "aa_source, fallback",
+    "aa_source, expected_mode",
     [("AA API v2", "aa"), (None, "none")],
 )
-def test_catalog_aa_fallback_tracks_aa_source(aa_source, fallback):
-    # with OpenRouter benchmarks matched, mode stays "openrouter"
+def test_catalog_mode_tracks_quality_chain(aa_source, expected_mode):
+    # mode is the chain, not a match outcome: a keyed run stays "aa" even
+    # when every match came from OpenRouter's benchmarks, and an unkeyed
+    # run without catalog meta stays "none" for the same reason.
     doc = build_doc(aa_source=aa_source)
-    assert doc["sources"]["aa"]["mode"] == "openrouter"
-    assert doc["sources"]["aa"]["fallback"] == fallback
-    # without them, mode and fallback agree
+    assert doc["sources"]["aa"]["mode"] == expected_mode
+    # ...with or without OpenRouter coverage.
     doc = build_doc(aa_source=aa_source, aa_by_id={})
-    assert doc["sources"]["aa"]["mode"] == fallback
-    assert doc["sources"]["aa"]["fallback"] == fallback
+    assert doc["sources"]["aa"]["mode"] == expected_mode
 
 
-def test_catalog_aa_fallback_not_masked_by_openrouter_matches():
-    # Regression: the publish gate read mode alone, and any OpenRouter
-    # match turned a failed AA API into mode "openrouter".
+def test_catalog_mode_not_masked_by_openrouter_matches():
+    # Regression (the v3 mode was a match outcome): OpenRouter matches
+    # never upgrade the chain -- an unkeyed run without catalog meta stays
+    # "none" no matter how many models OpenRouter's benchmarks cover.
     doc = build_doc(aa_source=None)
     assert doc["sources"]["aa"]["matched_openrouter"] > 0
-    assert doc["sources"]["aa"]["mode"] == "openrouter"
-    assert doc["sources"]["aa"]["fallback"] == "none"
+    assert doc["sources"]["aa"]["mode"] == "none"
     bsd.validate_catalog(doc)  # must not raise
 
 
@@ -5729,7 +5963,7 @@ def test_session_cost_drops_unknown_turn_ranges(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _catalog_v3_doc(
+def _offline_catalog_doc(
     monkeypatch, capsys, models, endpoints_by_id, *, api_key=None, session_cost=None
 ):
     """Run --catalog through the stubbed offline pipeline; return the document.
@@ -5750,18 +5984,29 @@ def _catalog_v3_doc(
     return json.loads(capsys.readouterr().out)
 
 
-def test_catalog_schema_version_3(monkeypatch, capsys):
+def test_catalog_schema_version_is_4(monkeypatch, capsys):
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
-    doc = _catalog_v3_doc(
+    doc = _offline_catalog_doc(
         monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
     )
-    assert doc["schema_version"] == 3
+    assert doc["schema_version"] == 4
+    # run()'s unkeyed wiring, end to end: no AA key (no index version) and
+    # the published catalog unavailable (no hydration meta) -- the chain is
+    # "none" and every bucket is empty.
+    assert doc["sources"]["aa"] == {
+        "mode": "none",
+        "matched_aa": 0,
+        "matched_catalog": 0,
+        "matched_openrouter": 0,
+        "catalog_generated_at": None,
+        "intelligence_index_version": None,
+    }
 
 
 def test_catalog_entry_carries_endpoint_blocks(monkeypatch, capsys):
     eps = _endpoint_stage_eps()
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
-    doc = _catalog_v3_doc(monkeypatch, capsys, models, {"z-ai/glm": eps})
+    doc = _offline_catalog_doc(monkeypatch, capsys, models, {"z-ai/glm": eps})
     (entry,) = doc["models"]
     assert entry["id"] == "z-ai/glm"
     # The parsed endpoint list, verbatim from the stage.
@@ -5789,7 +6034,7 @@ def test_catalog_entry_carries_endpoint_blocks(monkeypatch, capsys):
 def test_catalog_entry_carries_steering_block(monkeypatch, capsys):
     eps = _endpoint_stage_eps()
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
-    doc = _catalog_v3_doc(monkeypatch, capsys, models, {"z-ai/glm": eps})
+    doc = _offline_catalog_doc(monkeypatch, capsys, models, {"z-ai/glm": eps})
     (entry,) = doc["models"]
     # The build_steering output shape (design section 4.7), the same dict
     # the --json row carries.
@@ -5815,7 +6060,7 @@ def test_catalog_entry_carries_steering_block(monkeypatch, capsys):
 
 def test_catalog_session_cost_block_omitted_keyless(monkeypatch, capsys):
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
-    doc = _catalog_v3_doc(
+    doc = _offline_catalog_doc(
         monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
     )
     # Omitted entirely -- consumers branch on key presence, not null shape.
@@ -5833,7 +6078,7 @@ def test_catalog_session_cost_block_present_with_key(monkeypatch, capsys):
         "medians": {"z-ai/glm": {"10-49-turns": 0.42}},
     }
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
-    doc = _catalog_v3_doc(
+    doc = _offline_catalog_doc(
         monkeypatch,
         capsys,
         models,
@@ -5848,7 +6093,7 @@ def test_catalog_session_cost_block_present_with_key(monkeypatch, capsys):
 
 def test_catalog_session_cost_unavailable_with_failed_fetch(monkeypatch, capsys):
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
-    doc = _catalog_v3_doc(
+    doc = _offline_catalog_doc(
         monkeypatch,
         capsys,
         models,
@@ -5862,7 +6107,7 @@ def test_catalog_session_cost_unavailable_with_failed_fetch(monkeypatch, capsys)
 
 def test_catalog_pricing_block_is_baseline_endpoint(monkeypatch, capsys):
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
-    doc = _catalog_v3_doc(
+    doc = _offline_catalog_doc(
         monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
     )
     (entry,) = doc["models"]

@@ -41,6 +41,16 @@ ROW_KEYS = (
     "price_spread",
     "session_cost_usd",
     "quant_note",
+    # data.json v2 additive provenance (quality source reconciliation):
+    # print_json emits the quality record's source label, its as_of, the
+    # drift verdict against OpenRouter's check value and the check pair
+    # itself; rows without a record degrade to null. The missing-key check
+    # demands them like the v2 keys above; the schema stays 2 (additive).
+    "quality_source",
+    "quality_as_of",
+    "quality_drift",
+    "quality_or_index",
+    "quality_or_as_of",
 )
 # provider-qualified opencode id (openrouter/<provider/model>), the plain
 # catalog id (<provider/model>), each with an optional :variant suffix.
@@ -56,7 +66,7 @@ MODEL_ID_RE = re.compile(
 # arbitrary text that would ship a dead footer link.
 REVISION_RE = re.compile(r"[0-9a-f]{7,40}")
 
-CATALOG_SCHEMA_VERSION = 3
+CATALOG_SCHEMA_VERSION = 4
 
 # Duplicated from model_compare.py: build_site_data is subprocess-isolated
 # from the CLI, and the catalog constants are duplicated here by convention
@@ -95,6 +105,11 @@ CATALOG_ENTRY_KEYS = (
     "quality",
     "aa",
     "quality_match",
+    # Schema v4 provenance (quality source reconciliation): the record's
+    # own as_of and drift verdict, emitted on every entry and null when
+    # the candidate matched no quality source.
+    "quality_as_of",
+    "quality_drift",
     "scores",
     # Schema v3 additive blocks (Task 8/9): the producer emits all four on
     # every entry, null when the candidate skipped the endpoint stage.
@@ -151,8 +166,12 @@ CATALOG_SCORE_KEYS = ("price", "quality", "context", "age")
 CATALOG_OVERALL_KEYS = ("balanced", "price", "quality")
 CATALOG_AA_KEYS = ("intelligence_index", "coding_index", "agentic_index")
 CATALOG_QUALITY_MATCH_VALUES = ("aa", "catalog", "openrouter")
-CATALOG_AA_MODES = ("openrouter", "aa", "none")
-CATALOG_AA_FALLBACKS = ("aa", "none")
+# sources.aa.mode is the run's quality chain, not a match outcome: "aa"
+# when the AA API was consulted (keyed runs), "catalog" when unkeyed runs
+# hydrated the published catalog, "none" when neither tier yielded
+# anything. OpenRouter's benchmarks are the chain's shared last resort and
+# carry their own count (matched_openrouter), never a mode.
+CATALOG_AA_MODES = ("aa", "catalog", "none")
 
 
 def _is_score(value) -> bool:
@@ -568,14 +587,35 @@ def validate_catalog(document) -> None:
         or aa_sources.get("mode") not in CATALOG_AA_MODES
     ):
         raise ValueError("catalog sources.aa.mode is unknown")
-    if aa_sources.get("fallback") not in CATALOG_AA_FALLBACKS:
-        raise ValueError("catalog sources.aa.fallback is unknown")
-    for key in ("matched", "matched_openrouter"):
+    # The v4 counts are disjoint label buckets (strict rank counts each
+    # model once); the sum-vs-entries invariant is checked below, after the
+    # entries themselves have been validated. The v3 two-bucket shape
+    # (fallback/matched) has no slot here and must not validate.
+    for key in ("matched_aa", "matched_catalog", "matched_openrouter"):
         value = aa_sources.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"catalog sources.aa.{key} must be a non-negative integer")
-    if aa_sources["matched_openrouter"] > aa_sources["matched"]:
-        raise ValueError("catalog sources.aa.matched_openrouter exceeds matched")
+    catalog_generated_at = aa_sources.get("catalog_generated_at")
+    if catalog_generated_at is not None:
+        if not isinstance(catalog_generated_at, str) or not catalog_generated_at:
+            raise ValueError(
+                "catalog sources.aa.catalog_generated_at must be an ISO-8601 "
+                f"string or null: {catalog_generated_at!r}"
+            )
+        try:
+            datetime.fromisoformat(catalog_generated_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(
+                "catalog sources.aa.catalog_generated_at is not ISO-8601: "
+                f"{catalog_generated_at!r}"
+            ) from None
+    version = aa_sources.get("intelligence_index_version")
+    # AA types the index version as a number ("v4.3" is a display form);
+    # bools are not versions.
+    if version is not None and not _is_number(version):
+        raise ValueError(
+            "catalog sources.aa.intelligence_index_version must be a number or null"
+        )
     models = document["models"]
     if not isinstance(models, list):
         raise ValueError("catalog models must be a list")
@@ -690,6 +730,22 @@ def validate_catalog(document) -> None:
         # Steering is optional here (old fixtures lack it; not in CATALOG_ENTRY_KEYS).
         if "steering" in entry:
             _validate_catalog_steering(entry["steering"], f"models[{i}] steering")
+    # The sources.aa counts are disjoint buckets over the quality labels:
+    # strict rank gives every matched entry exactly one label, so their sum
+    # must equal the number of entries with a non-null quality_match. An
+    # inflated bucket would let the document claim more matched models
+    # than it actually lists.
+    matched_sum = (
+        aa_sources["matched_aa"]
+        + aa_sources["matched_catalog"]
+        + aa_sources["matched_openrouter"]
+    )
+    matched_entries = sum(1 for entry in models if entry["quality_match"] is not None)
+    if matched_sum != matched_entries:
+        raise ValueError(
+            "catalog sources.aa counts are not disjoint buckets: "
+            f"{matched_sum} counted vs {matched_entries} entries with quality_match"
+        )
     # ids double as the document's primary key for downstream consumers:
     # unique within models, and never also present in filtered.
     model_ids = [entry["id"] for entry in models]

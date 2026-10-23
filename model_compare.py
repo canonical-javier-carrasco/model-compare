@@ -103,7 +103,7 @@ PRIORITY_WEIGHTS = {
     "quality": {"quality": 0.60, "price": 0.20, "context": 0.10, "age": 0.10},
 }
 
-CATALOG_SCHEMA_VERSION = 3
+CATALOG_SCHEMA_VERSION = 4
 
 # The drop-reason keys build_candidates counts, verbatim -- keep in sync with
 # its drop() call sites. pool.dropped lists all of them zero-filled so the
@@ -3033,6 +3033,8 @@ def build_catalog(
     quality_source_by_id,
     session_cost=None,
     session_cost_mode="skipped",
+    index_version=None,
+    catalog_generated_at=None,
 ):
     """Assemble the full-catalog document (see README "Catalog output").
 
@@ -3044,22 +3046,49 @@ def build_catalog(
     session_cost is the Task 7 fetch envelope (verbatim, medians included)
     or None; session_cost_mode is run()'s resolution of the key-presence
     fact ("ok" / "unavailable" / "skipped") -- build_catalog stays pure and
-    never fetches or inspects the environment itself.
+    never fetches or inspects the environment itself. index_version is the
+    AA envelope's intelligence_index_version (number or null) and
+    catalog_generated_at the published catalog's generated_at when this
+    run hydrated from it (else None); both pass verbatim into sources.aa.
     """
     now = datetime.now(timezone.utc)
     weights = catalog_weights(candidates, quality_by_id)
-    aa_modes = {"AA API v2": "aa"}
-    if aa_source is not None and aa_source not in aa_modes:
-        # Never claim mode "none" for a source we do not know: the document
-        # would contradict itself (mode none with matched quality scores).
+    if aa_source is not None and aa_source != "AA API v2":
+        # Never publish a document whose AA source we cannot name: the
+        # consumers' mode enum has no slot for it.
         raise ValueError(f"unknown AA source: {aa_source!r}")
+    # The three counts are disjoint label buckets: resolve_quality's strict
+    # rank gives every candidate at most one record, so their sum is exactly
+    # the number of entries with a non-null quality_match -- the invariant
+    # the site validator enforces. A label outside the buckets would break
+    # it silently, so it fails loudly here.
+    matched_aa = sum(1 for s in quality_source_by_id.values() if s == "aa")
+    matched_catalog = sum(1 for s in quality_source_by_id.values() if s == "catalog")
     matched_openrouter = sum(
         1 for s in quality_source_by_id.values() if s == "openrouter"
     )
-    # fallback is what the AA API yielded on its own; mode
-    # hides it behind "openrouter" as soon as one OpenRouter match exists.
-    aa_fallback = aa_modes.get(aa_source, "none")
-    aa_mode = "openrouter" if matched_openrouter else aa_fallback
+    unknown = sorted(
+        {
+            s
+            for s in quality_source_by_id.values()
+            if s not in ("aa", "catalog", "openrouter")
+        }
+    )
+    if unknown:
+        raise ValueError(f"unknown quality source: {unknown[0]!r}")
+    # mode is the run's quality chain, not a match outcome: "aa" when the
+    # AA API was consulted, "catalog" when unkeyed runs hydrated the
+    # published catalog, "none" when neither tier yielded anything.
+    # OpenRouter's benchmarks are the chain's shared last resort, never a
+    # mode of their own -- matched_openrouter carries their count. The
+    # catalog branch also fires on the counts alone: hydrated records are
+    # proof of a usable catalog even when its generated_at was unusable.
+    if aa_source is not None:
+        aa_mode = "aa"
+    elif catalog_generated_at is not None or matched_catalog or matched_aa:
+        aa_mode = "catalog"
+    else:
+        aa_mode = "none"
 
     entries = []
     for cand in candidates:
@@ -3090,6 +3119,12 @@ def build_catalog(
                 4,
             )
         bench = aa_by_id.get(base_model_id(cand["id"])) or {}
+        # The quality record map is already a parameter; the winning
+        # record's as_of and drift verdict become entry fields verbatim.
+        # Unmatched candidates degrade to null -- same shape as the v3
+        # additive blocks below.
+        record = quality_by_id.get(cand["id"])
+        record = record if isinstance(record, dict) else None
         entries.append(
             {
                 "id": cand["id"],
@@ -3157,6 +3192,11 @@ def build_catalog(
                 },
                 "quality": cand["quality"],
                 "quality_match": quality_source_by_id.get(cand["id"]),
+                # Provenance (schema v4), verbatim from the record: the
+                # winning source's own as_of and the drift verdict against
+                # OpenRouter's check value.
+                "quality_as_of": record["as_of"] if record else None,
+                "quality_drift": record["drift"] if record else None,
                 "scores": {**scores, "overall": overall},
                 # Additive provider-aware blocks (schema v3), verbatim from
                 # the candidate. Candidates that never went through the
@@ -3202,9 +3242,15 @@ def build_catalog(
             "openrouter": "ok",
             "aa": {
                 "mode": aa_mode,
-                "fallback": aa_fallback,
-                "matched": len(quality_by_id),
+                "matched_aa": matched_aa,
+                "matched_catalog": matched_catalog,
                 "matched_openrouter": matched_openrouter,
+                # Provenance meta (schema v4): the published catalog's stamp
+                # when this run hydrated from it, and the AA envelope's
+                # intelligence index version when the AA API ran. Both null
+                # when their source was not consulted.
+                "catalog_generated_at": catalog_generated_at,
+                "intelligence_index_version": index_version,
             },
             "zdr": "skipped" if args.no_zdr else "ok",
             "discounts": "ok" if discounts else "unavailable",
@@ -3399,6 +3445,7 @@ def run(args, models, or_cached) -> int:
     if args.aa_api_key or os.environ.get("AA_API_KEY"):
         aa_entries, aa_source, aa_cached, aa_index_version = fetch_aa_entries(args)
         catalog_quality = None
+        catalog_generated_at = None
     else:
         aa_entries, aa_source, aa_cached, aa_index_version = [], None, False, None
         # None (transport failure) and an empty by_id (fetched-but-unusable
@@ -3406,6 +3453,13 @@ def run(args, models, or_cached) -> int:
         # the footer treat them identically as "catalog unavailable".
         catalog_doc = fetch_quality_catalog(args)
         catalog_quality = (catalog_doc or {}).get("by_id") or None
+        # The catalog meta only means something when hydration actually
+        # produced rows: an unusable artifact contributes no meta, so the
+        # sources block and the mode never credit a catalog that yielded
+        # nothing.
+        catalog_generated_at = (
+            (catalog_doc or {}).get("generated_at") if catalog_quality else None
+        )
     exact, fuzzy = build_aa_lookup(aa_entries)
 
     filtered = []
@@ -3473,6 +3527,8 @@ def run(args, models, or_cached) -> int:
                 quality_source_by_id,
                 session_cost,
                 session_cost_mode,
+                aa_index_version,
+                catalog_generated_at,
             )
         )
         return 0
