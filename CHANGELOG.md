@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Site: heading hierarchy fixed — the page title renders above the section
+  headings (1.6rem vs 1.25rem); the ranked table, deals table and OpenCode
+  section headings share one size instead of three different ones.
 - Site: the tab line now centers "last refresh: date, time" between the
   priority tabs and the layout toggle.
 - Site: the CSS and JS moved out of `index.html` into `site/style.css` and

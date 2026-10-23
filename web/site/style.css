@@ -43,8 +43,15 @@
         color: var(--text);
       }
       h1 {
-        font-size: 1.4rem;
+        font-size: 1.6rem;
         margin-bottom: 0.25rem;
+      }
+      /* Section headings share one size, below the page title: the
+         ranked table, the deals table and the OpenCode section are the
+         same structural level (the highlights sub-headings override
+         smaller). */
+      h2 {
+        font-size: 1.25rem;
       }
       .sub {
         color: var(--muted);
@@ -207,7 +214,6 @@
         text-underline-offset: 3px;
       }
       #deals-section h2 {
-        font-size: 1.05rem;
         margin: 1rem 0 0.25rem;
       }
       .main-actions button {
