@@ -2320,11 +2320,17 @@ def resolve_quality(
         if match is not None:
             index, as_of = match
             record = {"index": index, "source": "aa", "as_of": as_of}
-        # Tier 2: catalog override (None until a later task wires it in).
+        # Tier 2: catalog record (unkeyed runs hydrate from the published
+        # catalog; the row carries its own source and as_of verbatim --
+        # provenance is the catalog's own record, not a blanket label).
         if record is None and catalog_quality is not None:
-            catalog_index = catalog_quality.get(cand["id"])
-            if catalog_index is not None:
-                record = {"index": catalog_index, "source": "catalog", "as_of": None}
+            catalog_record = catalog_quality.get(cand["id"])
+            if catalog_record is not None:
+                record = {
+                    "index": catalog_record["index"],
+                    "source": catalog_record["source"],
+                    "as_of": catalog_record["as_of"],
+                }
         # Tier 3: OpenRouter's per-slug benchmark trio (last resort).
         if record is None:
             bench = aa_by_id.get(base_model_id(cand["id"]))
@@ -2783,6 +2789,81 @@ def fmt_quant_note(annotations: dict) -> str | None:
     spread = (annotations or {}).get("price_spread")
     if spread is not None:
         note += f" in ({spread:.2f}x baseline)"
+    return note
+
+
+def _footer_as_of(source, value):
+    """Format a record's as_of for its footer block (None when unusable).
+
+    Live AA records carry one ISO fetch timestamp for the whole fetch
+    (checked today), so their block shows the time of day only. Catalog
+    rows carry a full ISO stamp ("as of 2026-10-23 13:15Z"); OpenRouter's
+    benchmark date is YYYYMMDD ("as of 2026-10-17").
+    """
+    if not value:
+        return None
+    if source == "openrouter":
+        text = str(value)
+        if len(text) == 8 and text.isdigit():
+            return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    if source == "aa":
+        return parsed.strftime("%H:%MZ")
+    return parsed.strftime("%Y-%m-%d %H:%MZ")
+
+
+def quality_footer_note(quality_by_id, aa_index_version, unmatched):
+    """Compose the footer's quality note from the resolved records.
+
+    Lists per-source counts, each source's own as_of and the AA index
+    version when known, e.g. "AA index v4.3 - live AA (58, checked 13:15Z)
+    | our catalog (12, as of 2026-10-23 13:15Z) | OpenRouter snapshot (2,
+    as of 2026-10-17)". A trailing "unmatched score 0" names candidates
+    with no quality record, and a drift footnote appears when any resolved
+    record disagrees with the OpenRouter check value. Returns None when no
+    record resolved -- run() falls back to the quality-blind note.
+    """
+    labels = {
+        "aa": "live AA",
+        "catalog": "our catalog",
+        "openrouter": "OpenRouter snapshot",
+    }
+    stamp_words = {"aa": "checked", "catalog": "as of", "openrouter": "as of"}
+    counts = {}
+    latest = {}
+    for record in quality_by_id.values():
+        source = record.get("source")
+        if source not in labels:
+            continue
+        counts[source] = counts.get(source, 0) + 1
+        value = record.get("as_of")
+        if value:
+            current = latest.get(source)
+            if current is None or str(value) > str(current):
+                latest[source] = value
+    blocks = []
+    for source in ("aa", "catalog", "openrouter"):
+        count = counts.get(source, 0)
+        if not count:
+            continue
+        stamp = _footer_as_of(source, latest.get(source))
+        if stamp:
+            blocks.append(f"{labels[source]} ({count}, {stamp_words[source]} {stamp})")
+        else:
+            blocks.append(f"{labels[source]} ({count})")
+    if not blocks:
+        return None
+    note = "quality: "
+    if aa_index_version is not None:
+        note += f"AA index v{aa_index_version} - "
+    note += " | ".join(blocks)
+    if unmatched:
+        note += "; unmatched score 0"
+    drift = sum(1 for record in quality_by_id.values() if record.get("drift"))
+    if drift:
+        note += f"; drift vs OpenRouter snapshot ({drift})"
     return note
 
 
@@ -3309,7 +3390,22 @@ def run(args, models, or_cached) -> int:
             "(--no-zdr to override)"
         )
         return 1
-    aa_entries, aa_source, aa_cached, aa_index_version = fetch_aa_entries(args)
+    # Mode-scoped quality chains: a keyed run consults the AA API only; an
+    # unkeyed run hydrates from the published catalog only. The catalog
+    # fetcher must NEVER run on keyed builds -- a CI/site build hydrating
+    # from the published catalog would consume its own output (a
+    # self-reference loop). Both chains end in OpenRouter's benchmarks as
+    # the last resort, then nothing.
+    if args.aa_api_key or os.environ.get("AA_API_KEY"):
+        aa_entries, aa_source, aa_cached, aa_index_version = fetch_aa_entries(args)
+        catalog_quality = None
+    else:
+        aa_entries, aa_source, aa_cached, aa_index_version = [], None, False, None
+        # None (transport failure) and an empty by_id (fetched-but-unusable
+        # artifact) both degrade to no catalog tier -- resolve_quality and
+        # the footer treat them identically as "catalog unavailable".
+        catalog_doc = fetch_quality_catalog(args)
+        catalog_quality = (catalog_doc or {}).get("by_id") or None
     exact, fuzzy = build_aa_lookup(aa_entries)
 
     filtered = []
@@ -3335,7 +3431,7 @@ def run(args, models, or_cached) -> int:
         return 2
 
     quality_by_id, quality_source_by_id = resolve_quality(
-        candidates, aa_by_id, exact, fuzzy, aa_source
+        candidates, aa_by_id, exact, fuzzy, aa_source, catalog_quality
     )
     weights = compute_scores(candidates, args, quality_by_id)
 
@@ -3395,25 +3491,14 @@ def run(args, models, or_cached) -> int:
                 f"{v} {k}" for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])
             )
             drop_note = f" (dropped: {bits})"
-        matched_or = sum(1 for s in quality_source_by_id.values() if s == "openrouter")
-        matched_aa = len(quality_by_id) - matched_or
+        # The footer lists per-source counts, each source's own as_of and
+        # the AA index version when known; unmatched candidates and drift
+        # get trailing footnotes. No record resolved -> the quality-blind
+        # fallback note.
         unmatched = len(candidates) - len(quality_by_id)
-        bits = []
-        # The note lists tiers in precedence order: AA API is primary,
-        # OpenRouter's benchmarks are the last-resort fallback.
-        if matched_aa:
-            bits.append(f"{aa_source} exact ({matched_aa})")
-        if matched_or:
-            bits.append(f"OpenRouter benchmarks ({matched_or})")
-        if bits:
-            quality_note = (
-                f"quality via {' + '.join(bits)}: matched "
-                f"{len(quality_by_id)}/{len(candidates)} candidates"
-            )
-            if unmatched:
-                quality_note += "; unmatched candidates score 0 on quality"
-        else:
-            quality_note = "quality data unavailable, ranked on price/context/age"
+        quality_note = quality_footer_note(
+            quality_by_id, aa_index_version, unmatched
+        ) or ("quality data unavailable, ranked on price/context/age")
         source_note = []
         if or_cached:
             source_note.append("catalog cached")

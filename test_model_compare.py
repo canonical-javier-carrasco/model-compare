@@ -1843,6 +1843,10 @@ def _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id, fail_ids=()):
     monkeypatch.setattr(mc, "fetch_openrouter_models", lambda a: (models, False))
     monkeypatch.setattr(mc, "fetch_openrouter_frontend", lambda a: ({}, zdr, {}, set()))
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False, None))
+    # Task 4's unkeyed chain hydrates quality from the published catalog;
+    # these tests are about the endpoint/session-cost/zdr stages, so the
+    # catalog stays unavailable (None) and the OR trio keeps covering.
+    monkeypatch.setattr(mc, "fetch_quality_catalog", lambda a: None)
     calls = []
 
     def fake_fetch(model_id, args):
@@ -3155,6 +3159,9 @@ def test_best_prints_provider_qualified_id(monkeypatch, capsys):
         mc, "fetch_openrouter_frontend", lambda a: ({}, {"acme/model-a"}, {}, set())
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False, None))
+    # Unkeyed runs hydrate quality from the published catalog (Task 4);
+    # this test is about the --best id, so the catalog stays unavailable.
+    monkeypatch.setattr(mc, "fetch_quality_catalog", lambda a: None)
     # The endpoint stage fetches per candidate: one eligible endpoint keeps
     # the model in the pool (offline stub, like every other fetcher here).
     monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
@@ -3184,16 +3191,19 @@ def test_table_mode_prints_composed_quality_note(monkeypatch, capsys):
         ),
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False, None))
+    # Unkeyed runs hydrate quality from the published catalog (Task 4);
+    # this test pins the table footer, so the catalog stays unavailable.
+    monkeypatch.setattr(mc, "fetch_quality_catalog", lambda a: None)
     # The endpoint stage fetches per candidate: one eligible endpoint keeps
     # both models in the pool (offline stub, like every other fetcher here).
     monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
     argv = ["--top", "1", "--no-cache", "--min-context", "0", "--no-require-tools"]
     assert mc.main(argv) == 0
     captured = capsys.readouterr()
-    assert (
-        "quality via OpenRouter benchmarks (1): matched 1/2 candidates; "
-        "unmatched candidates score 0 on quality" in captured.out
-    )
+    # Task 4's footer: per-source counts + as_of + index version when
+    # known. The OR benchmark carries no as_of here, so the block shows the
+    # bare count; model-b is unmatched and gets the trailing footnote.
+    assert "quality: OpenRouter snapshot (1); unmatched score 0" in captured.out
     assert "note:" not in captured.err  # --no-cache: nothing served from cache
 
 
@@ -5184,6 +5194,9 @@ def test_catalog_no_zdr_marks_skipped(monkeypatch, capsys):
         mc, "fetch_openrouter_frontend", lambda args: ({}, set(), {}, set())
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda args: ([], None, False, None))
+    # Unkeyed runs hydrate quality from the published catalog (Task 4);
+    # this test is about the zdr source state, so the catalog stays down.
+    monkeypatch.setattr(mc, "fetch_quality_catalog", lambda args: None)
     # The endpoint stage fetches per candidate: one eligible endpoint keeps
     # the models in the pool (offline stub, like every other fetcher here).
     monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
@@ -5913,3 +5926,283 @@ def test_best_run_skips_session_cost_fetch(monkeypatch, capsys):
     args = make_args(min_context=0, best=True, openrouter_api_key="sk-or")
     assert mc.run(args, models, False) == 0
     assert capsys.readouterr().out.strip() == "openrouter/z-ai/glm"
+
+
+# ---------------------------------------------------------------------------
+# Task 4: run() wiring -- mode-scoped chains + footer rework
+# ---------------------------------------------------------------------------
+
+
+def _stub_quality_run(
+    monkeypatch,
+    models,
+    *,
+    aa_entries=(),
+    aa_version=None,
+    catalog=None,
+    or_bench=None,
+    aa_raises=False,
+    catalog_raises=False,
+):
+    """Stub every fetcher so mc.run() exercises the quality chain offline.
+
+    The three quality fetchers are controlled independently so tests can pin
+    the mode-scoped wiring: unkeyed runs must never touch the AA API
+    (aa_raises), keyed runs must never touch the published catalog
+    (catalog_raises). The endpoint stage returns one eligible endpoint per
+    candidate so no model drops fail-closed.
+    """
+    monkeypatch.delenv("AA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    zdr = {m["id"] for m in models}
+    monkeypatch.setattr(
+        mc,
+        "fetch_openrouter_frontend",
+        lambda a: ({}, zdr, or_bench or {}, set()),
+    )
+    if aa_raises:
+
+        def fake_aa(args):
+            raise AssertionError("fetch_aa_entries must not be called")
+
+    else:
+
+        def fake_aa(args):
+            return (
+                list(aa_entries),
+                "AA API v2" if aa_entries else None,
+                False,
+                aa_version,
+            )
+
+    monkeypatch.setattr(mc, "fetch_aa_entries", fake_aa)
+    if catalog_raises:
+
+        def fake_catalog(args):
+            raise AssertionError("fetch_quality_catalog must not be called")
+
+    else:
+
+        def fake_catalog(args):
+            return catalog
+
+    monkeypatch.setattr(mc, "fetch_quality_catalog", fake_catalog)
+    monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
+
+
+def test_run_unkeyed_uses_catalog_not_openrouter_for_covered_models(
+    monkeypatch, capsys
+):
+    # Unkeyed: the published catalog's exact-id row wins over the OR trio
+    # for the model it covers, and the record keeps the row's own source
+    # label ("catalog") and as_of -- not a blanket "catalog" tag.
+    models = [make_model(id="deepseek/deepseek-chat", name="DeepSeek: Chat")]
+    catalog = {
+        "by_id": {
+            "deepseek/deepseek-chat": {
+                "index": 42.0,
+                "source": "catalog",
+                "as_of": "2026-10-23T13:15:00Z",
+            }
+        },
+        "generated_at": "2026-10-23T13:15:00Z",
+        "schema_version": 4,
+    }
+    or_bench = {
+        "deepseek/deepseek-chat": {"intelligence_index": 39.5, "as_of": "20261017"}
+    }
+    _stub_quality_run(
+        monkeypatch, models, catalog=catalog, or_bench=or_bench, aa_raises=True
+    )
+    args = make_args(json=True)
+    assert mc.run(args, models, False) == 0
+    (row,) = json.loads(capsys.readouterr().out)
+    assert row["quality_source"] == "catalog"
+    assert row["quality_index"] == 42.0
+    assert row["quality_as_of"] == "2026-10-23T13:15:00Z"
+
+
+def test_run_unkeyed_uses_openrouter_only_for_models_catalog_lacks(monkeypatch, capsys):
+    # Unkeyed: the catalog covers one model; the model it lacks falls through
+    # to the OR trio -- the last-resort tier.
+    models = [
+        make_model(id="acme/covered", name="Acme: Covered"),
+        make_model(id="acme/uncovered", name="Acme: Uncovered"),
+    ]
+    catalog = {
+        "by_id": {
+            "acme/covered": {
+                "index": 42.0,
+                "source": "catalog",
+                "as_of": "2026-10-23T13:15:00Z",
+            }
+        },
+        "generated_at": "2026-10-23T13:15:00Z",
+        "schema_version": 4,
+    }
+    or_bench = {
+        "acme/covered": {"intelligence_index": 41.0, "as_of": "20261017"},
+        "acme/uncovered": {"intelligence_index": 30.0, "as_of": "20261010"},
+    }
+    _stub_quality_run(
+        monkeypatch, models, catalog=catalog, or_bench=or_bench, aa_raises=True
+    )
+    args = make_args(json=True)
+    assert mc.run(args, models, False) == 0
+    rows = {row["model"]: row for row in json.loads(capsys.readouterr().out)}
+    assert rows["acme/covered"]["quality_source"] == "catalog"
+    assert rows["acme/uncovered"]["quality_source"] == "openrouter"
+    assert rows["acme/uncovered"]["quality_index"] == 30.0
+
+
+def test_run_keyed_aa_down_falls_to_openrouter_not_catalog(monkeypatch, capsys):
+    # Keyed: an AA failure must degrade to the OR trio, and the catalog
+    # fetcher must NEVER run -- a keyed CI/site build hydrating from the
+    # published catalog would consume its own output (self-reference loop).
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    or_bench = {"acme/model-a": {"intelligence_index": 35.0, "as_of": "20261017"}}
+    _stub_quality_run(monkeypatch, models, or_bench=or_bench, catalog_raises=True)
+    args = make_args(aa_api_key="dummy-key", json=True)
+    assert mc.run(args, models, False) == 0
+    (row,) = json.loads(capsys.readouterr().out)
+    assert row["quality_source"] == "openrouter"
+
+
+def test_run_unkeyed_catalog_down_falls_to_openrouter(monkeypatch, capsys):
+    # Unkeyed: a transport failure (None) and a fetched-but-unusable artifact
+    # (empty by_id) both degrade to the OR trio -- the footer treats them
+    # identically as "catalog unavailable".
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    or_bench = {"acme/model-a": {"intelligence_index": 35.0, "as_of": "20261017"}}
+    args = make_args(json=True)
+    for catalog in (
+        None,
+        {"by_id": {}, "generated_at": None, "schema_version": 4},
+    ):
+        _stub_quality_run(
+            monkeypatch, models, catalog=catalog, or_bench=or_bench, aa_raises=True
+        )
+        assert mc.run(args, models, False) == 0
+        (row,) = json.loads(capsys.readouterr().out)
+        assert row["quality_source"] == "openrouter"
+
+
+def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, capsys):
+    # Keyed: the footer lists the index version, per-source counts and each
+    # source's own as_of, plus the drift footnote for the AA-vs-OR gap.
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/model-b", name="Acme: B"),
+        make_model(id="acme/model-c", name="Acme: C"),
+        make_model(id="acme/model-d", name="Acme: D"),
+    ]
+    aa_entries = [
+        {
+            "key": "acme/model-a",
+            "name": "Acme: A",
+            "index": 45.1,
+            "as_of": "2026-10-23T13:15:00Z",
+        },
+        {
+            "key": "acme/model-b",
+            "name": "Acme: B",
+            "index": 50.0,
+            "as_of": "2026-10-23T13:15:00Z",
+        },
+    ]
+    or_bench = {
+        "acme/model-a": {"intelligence_index": 39.5, "as_of": "20261017"},
+        "acme/model-b": {"intelligence_index": 49.0, "as_of": "20261017"},
+        "acme/model-c": {"intelligence_index": 30.0, "as_of": "20261017"},
+    }
+    _stub_quality_run(
+        monkeypatch,
+        models,
+        aa_entries=aa_entries,
+        aa_version=4.3,
+        or_bench=or_bench,
+        catalog_raises=True,
+    )
+    # Keyed: the AA API version prefix only exists on keyed runs, so the
+    # args carry a key (the brief's footer example shows "AA index v4.3").
+    args = make_args(aa_api_key="dummy-key")
+    assert mc.run(args, models, False) == 0
+    out = capsys.readouterr().out
+    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
+    assert (
+        "| quality: AA index v4.3 - live AA (2, checked 13:15Z) "
+        "| OpenRouter snapshot (1, as of 2026-10-17); unmatched score 0; "
+        "drift vs OpenRouter snapshot (1)"
+    ) in pool_line
+
+    # Unkeyed: the catalog block shows the row's own as_of (v4 per-row stamp)
+    # and the OR block shows the permaslug date; no index version (the AA API
+    # is not consulted).
+    models = [
+        make_model(id="acme/covered", name="Acme: Covered"),
+        make_model(id="acme/or-only", name="Acme: OR only"),
+    ]
+    catalog = {
+        "by_id": {
+            "acme/covered": {
+                "index": 42.0,
+                "source": "catalog",
+                "as_of": "2026-10-23T13:15:00Z",
+            }
+        },
+        "generated_at": "2026-10-23T13:15:00Z",
+        "schema_version": 4,
+    }
+    or_bench = {
+        "acme/or-only": {"intelligence_index": 30.0, "as_of": "20261017"},
+    }
+    _stub_quality_run(
+        monkeypatch, models, catalog=catalog, or_bench=or_bench, aa_raises=True
+    )
+    args = make_args()
+    assert mc.run(args, models, False) == 0
+    out = capsys.readouterr().out
+    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
+    assert (
+        "| quality: our catalog (1, as of 2026-10-23 13:15Z) "
+        "| OpenRouter snapshot (1, as of 2026-10-17)"
+    ) in pool_line
+
+
+def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys):
+    # End-to-end: build_schedules consumes the quality record through
+    # record["index"] -- a hydrated catalog row must never leak the dict
+    # into the catalog document's schedules[].quality (number-or-null).
+    models = [make_model(id="acme/model-a", pricing=deepseek_pricing())]
+    catalog = {
+        "by_id": {
+            "acme/model-a": {
+                "index": 42.0,
+                "source": "catalog",
+                "as_of": "2026-10-23T13:15:00Z",
+            }
+        },
+        "generated_at": "2026-10-23T13:15:00Z",
+        "schema_version": 4,
+    }
+    _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
+    args = make_args(catalog=True)
+    assert mc.run(args, models, False) == 0
+    doc = json.loads(capsys.readouterr().out)
+    (sched,) = doc["schedules"]
+    assert sched["id"] == "acme/model-a"
+    assert isinstance(sched["quality"], float)
+    assert sched["quality"] == 42.0
+
+
+def test_run_no_network_quality_blind_ranking_unchanged(monkeypatch, capsys):
+    # All sources empty (no key, catalog down, OR silent): the existing
+    # quality-blind path must be unchanged -- no fetch, no catalog, and the
+    # fallback footer note.
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args()
+    assert mc.run(args, models, False) == 0
+    out = capsys.readouterr().out
+    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
+    assert "quality data unavailable, ranked on price/context/age" in pool_line
