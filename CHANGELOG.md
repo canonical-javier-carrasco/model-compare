@@ -22,6 +22,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored. The dialog is a real modal to assistive tech
   (`role="dialog"`/`aria-modal`, focus moves in and back out), and the
   toggles expose their state via `aria-pressed`.
+- Quality provenance end to end: every quality value is a record carrying
+  its source (`aa` — the keyed AA API v2, the live index; `catalog` — the
+  repo's published `catalog.json`; `openrouter` — OpenRouter's republished
+  benchmarks) and its `as_of`, plus the OpenRouter comparison pair and the
+  drift verdict. Surfaced in `--json` rows (`quality_source`,
+  `quality_as_of`, `quality_drift`, `quality_or_index`, `quality_or_as_of`),
+  catalog v4 entries, the CLI footer's quality note and the site's QUAL
+  tooltip. The AA envelope's `intelligence_index_version` is captured too
+  and shown in the footer when known; the AA entries cache key moved to
+  `aa-intelligence-v3`, since entries now carry the fetch stamp and version.
+- Unkeyed runs hydrate quality from the repo's published catalog
+  (`https://model-compare.dev/catalog.json`; the github.io host 301s to
+  plain http, so the direct https URL is used deliberately): an exact
+  catalog-id join with no re-matching, a `schema_version >= 3` gate (v3
+  rows normalized — `quality_match` "api" becomes "aa" and the as-of is the
+  catalog's `generated_at`; v4 rows pass through their recorded fields), a
+  warn-but-use staleness check past 14 days, and full-artifact degradation
+  on any parse surprise — the ranking never crashes, worst case it proceeds
+  without catalog data. Cached under `published-catalog`; only usable
+  results are ever written.
+- Quality drift flag: when the winning source (`aa` or `catalog`) and
+  OpenRouter's snapshot for the same model differ by 3 or more index
+  points, the record carries `quality_drift: true` plus the snapshot pair
+  (`quality_or_index`/`quality_or_as_of`); the site tooltip appends
+  "differs from OpenRouter snapshot (...)" and the CLI footer counts the
+  rows.
+- Site: QUAL cells carry a provenance tooltip ("AA intelligence index -
+  source: ..., as of ...", the drift note appended where flagged) and the
+  legend explains it; `data.json` files without the new fields keep
+  rendering.
 
 ### Changed
 
@@ -35,6 +65,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (same-origin assets instead of inline code).
 - Site: the OpenCode section headings keep their "OpenCode v1/v2" text
   without the badge styling.
+- Quality precedence inverted: the keyed AA API is now the primary quality
+  source and OpenRouter's republished benchmarks the last resort — used
+  only for models neither AA path covers — instead of OpenRouter first
+  (part of issue #18's clarity goals; issue #17 covers the conflation this
+  removes). The source label `api` is renamed `aa`. Chains are mode-scoped:
+  keyed runs consult the AA API then OpenRouter and never fetch the
+  published catalog (a CI/site build hydrating from its own published
+  output would be a self-reference loop); unkeyed runs hydrate the catalog
+  then OpenRouter.
+- The CLI footer's quality note lists per-source counts with each source's
+  own as-of ("live AA (58, checked 13:15Z) | our catalog (12, as of
+  2026-10-23 13:15Z) | OpenRouter snapshot (2, as of 2026-10-17)"), the AA
+  index version when known, and footnotes for unmatched models ("unmatched
+  score 0") and drift.
+- Catalog `schema_version` 3 → 4 — per-model entries gain additive
+  `quality_as_of` and `quality_drift`, `quality_match` carries the winning
+  source's label, and `sources.aa` is reshaped to `{mode:
+  "aa"|"catalog"|"none", matched_aa, matched_catalog, matched_openrouter,
+  catalog_generated_at, intelligence_index_version}` (the `fallback` and
+  `matched` keys are removed; the three counts are disjoint buckets whose
+  sum equals the number of matched entries — the site validator enforces
+  the invariant and rejects the v3 shape). `data.json` stays schema 2: the
+  five provenance fields are additive row keys.
+- The publish gate (`check_aa_source`) reads the new block: with
+  `AA_API_KEY` set it fails closed unless the catalog shows live AA data
+  (`mode` "aa" with `matched_aa` > 0) — a rejected key or an AA-less chain
+  can no longer deploy silently; keyless publishes are never gated.
+
+### Fixed
+
+- OpenRouter's republished AA benchmarks are keyed by exact catalog slug
+  via the frontend payload's slug/permaslug pairs (three passes: permaslug
+  pairs first, undated keys when unclaimed, unambiguous date-strips only),
+  so each dated listing resolves to its own snapshot — no cross-listing
+  borrowing (issue #17): `deepseek/deepseek-v4.1-flash` no longer borrows
+  the `-1017` snapshot's score, and every OpenRouter-sourced value carries
+  its listing's date as `as_of`. The benchmark cache key moved to
+  `openrouter-frontend-aa-v2`, so shapes cached before the fix are never
+  read.
 
 ## [0.4.0] - 2026-10-21
 
