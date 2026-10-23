@@ -5210,7 +5210,9 @@ def _provenance_pool():
     aa_api_entries, catalog_quality) -- the raw inputs; each test resolves
     quality the way its scenario needs, then scores and builds.
 
-    acme/a: only a hydrated published-catalog record (source "catalog").
+    acme/a: only a hydrated published-catalog record (parser shape: the
+        row carries the keyed CI run's own "aa" label; resolve_quality's
+        catalog tier relabels the record to the chain label "catalog").
     acme/d: AA API record whose OR check value differs by >= 3.0 (drift).
     acme/e: AA API record within the drift threshold of its OR check value.
     acme/f: AA API record with no OpenRouter check value at all.
@@ -5247,7 +5249,7 @@ def _provenance_pool():
     catalog_quality = {
         "acme/a": {
             "index": 40.0,
-            "source": "catalog",
+            "source": "aa",
             "as_of": "2026-10-20T09:00:00Z",
         },
     }
@@ -5383,14 +5385,19 @@ def test_catalog_sources_aa_block_reshaped_with_counts_version_and_meta():
     }
 
     # Unkeyed run with a hydrated catalog: mode flips to the catalog chain
-    # and the published catalog's generated_at is the block's meta. Labels
-    # travel with the records -- the published rows' own provenance -- so
-    # an unkeyed run can still report aa-labeled matches (rows a keyed CI
-    # run resolved against the live AA API), and OpenRouter covers the ids
-    # the catalog lacks.
+    # and the published catalog's generated_at is the block's meta. The
+    # run-level label is the source chain, not the row's own: tier 2
+    # relabels every hydrated record "catalog" (real catalogs carry the
+    # keyed CI run's row-level "aa"/"openrouter" labels), so an unkeyed
+    # run never reports matched_aa -- and OpenRouter covers the ids the
+    # catalog lacks.
     hydrated = {
         "acme/a": {"index": 40.0, "source": "aa", "as_of": "2026-10-20T09:00:00Z"},
-        "acme/d": {"index": 44.0, "source": "catalog", "as_of": "2026-10-20T09:00:00Z"},
+        "acme/d": {
+            "index": 44.0,
+            "source": "openrouter",
+            "as_of": "2026-10-20T09:00:00Z",
+        },
     }
     quality_by_id, quality_source_by_id = mc.resolve_quality(
         candidates, or_by_id, {}, {}, None, hydrated
@@ -5411,8 +5418,8 @@ def test_catalog_sources_aa_block_reshaped_with_counts_version_and_meta():
     )
     assert doc["sources"]["aa"] == {
         "mode": "catalog",
-        "matched_aa": 1,
-        "matched_catalog": 1,
+        "matched_aa": 0,
+        "matched_catalog": 2,
         "matched_openrouter": 1,
         "catalog_generated_at": "2026-10-23T13:15:07+00:00",
         "intelligence_index_version": None,
@@ -6239,14 +6246,16 @@ def test_run_unkeyed_uses_catalog_not_openrouter_for_covered_models(
     monkeypatch, capsys
 ):
     # Unkeyed: the published catalog's exact-id row wins over the OR trio
-    # for the model it covers, and the record keeps the row's own source
-    # label ("catalog") and as_of -- not a blanket "catalog" tag.
+    # for the model it covers. Tier 2 labels the record with the source
+    # chain ("catalog" -- read from our published catalog) while as_of
+    # stays the row's own stamp; the row's "aa" label is the keyed CI
+    # run's row-level truth inside the artifact, never the run's.
     models = [make_model(id="deepseek/deepseek-chat", name="DeepSeek: Chat")]
     catalog = {
         "by_id": {
             "deepseek/deepseek-chat": {
                 "index": 42.0,
-                "source": "catalog",
+                "source": "aa",
                 "as_of": "2026-10-23T13:15:00Z",
             }
         },
@@ -6278,7 +6287,7 @@ def test_run_unkeyed_uses_openrouter_only_for_models_catalog_lacks(monkeypatch, 
         "by_id": {
             "acme/covered": {
                 "index": 42.0,
-                "source": "catalog",
+                "source": "aa",
                 "as_of": "2026-10-23T13:15:00Z",
             }
         },
@@ -6380,9 +6389,10 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
         "drift vs OpenRouter snapshot (1)"
     ) in pool_line
 
-    # Unkeyed: the catalog block shows the row's own as_of (v4 per-row stamp)
-    # and the OR block shows the permaslug date; no index version (the AA API
-    # is not consulted).
+    # Unkeyed: the catalog block shows the hydrated row's as_of (the v4
+    # per-row stamp; the tier labels the record "catalog" regardless of
+    # the row's own label) and the OR block shows the permaslug date; no
+    # index version (the AA API is not consulted).
     models = [
         make_model(id="acme/covered", name="Acme: Covered"),
         make_model(id="acme/or-only", name="Acme: OR only"),
@@ -6391,7 +6401,7 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
         "by_id": {
             "acme/covered": {
                 "index": 42.0,
-                "source": "catalog",
+                "source": "aa",
                 "as_of": "2026-10-23T13:15:00Z",
             }
         },
@@ -6423,7 +6433,7 @@ def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys
         "by_id": {
             "acme/model-a": {
                 "index": 42.0,
-                "source": "catalog",
+                "source": "aa",
                 "as_of": "2026-10-23T13:15:00Z",
             }
         },

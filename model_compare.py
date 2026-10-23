@@ -1251,7 +1251,10 @@ def catalog_quality_by_id(doc) -> dict:
     row with the catalog's generated_at -- the live v3 artifact carries
     quality_as_of: null, which must be ignored, not passed through.
     v4+ rows keep their recorded quality_as_of (None when absent) and
-    source label as-is.
+    source label as-is: that label is the row-level truth inside the
+    published artifact (a keyed CI run emits "aa"/"openrouter", never
+    "catalog"). resolve_quality's catalog tier owns the run-level label:
+    it relabels every hydrated record to the chain label "catalog".
     """
     if not isinstance(doc, dict):
         warn("published catalog returned an unexpected response shape")
@@ -2296,7 +2299,13 @@ def resolve_quality(
     behavior where OpenRouter's benchmarks won):
       1. AA API entries -- match_quality's exact tiers (fuzzy stays off in
          production: it is the proven variant-conflation bug).
-      2. catalog_quality -- explicit overrides, None until wired.
+      2. catalog_quality -- records hydrated from the published catalog on
+         unkeyed runs. Every winner is labeled "catalog": the run-level
+         provenance is the source chain (read from our published catalog),
+         overriding the row's own "aa"/"openrouter" label -- that label is
+         the keyed CI run's row-level truth inside the artifact, and no
+         real catalog row ever carries "catalog". as_of stays the row's
+         own stamp.
       3. OpenRouter's benchmark trio -- per-slug, matched via
          base_model_id, so a :variant suffix inherits its base's trio.
       4. No match -- the candidate stays quality-blind downstream.
@@ -2321,14 +2330,20 @@ def resolve_quality(
             index, as_of = match
             record = {"index": index, "source": "aa", "as_of": as_of}
         # Tier 2: catalog record (unkeyed runs hydrate from the published
-        # catalog; the row carries its own source and as_of verbatim --
-        # provenance is the catalog's own record, not a blanket label).
+        # catalog). The run-level provenance label is the source chain:
+        # every hydrated record is tagged "catalog" -- read from our
+        # published catalog -- overriding the row's own label, which is
+        # the keyed CI run's row-level truth inside the artifact ("aa"/
+        # "openrouter"; no real catalog row ever carries "catalog").
+        # as_of stays the row's own stamp (v4 rows carry the CI run's
+        # recorded quality_as_of; v3 rows the catalog's generated_at --
+        # catalog_quality_by_id normalizes that).
         if record is None and catalog_quality is not None:
             catalog_record = catalog_quality.get(cand["id"])
             if catalog_record is not None:
                 record = {
                     "index": catalog_record["index"],
-                    "source": catalog_record["source"],
+                    "source": "catalog",
                     "as_of": catalog_record["as_of"],
                 }
         # Tier 3: OpenRouter's per-slug benchmark trio (last resort).

@@ -126,10 +126,14 @@ Per-source matching and `as_of` semantics:
    skips — accepting v3 is the deploy-day skew case); v3 rows are
    normalized (`quality_match` "api" → "aa", `as_of` = the catalog's
    `generated_at` — the live v3 artifact's null `quality_as_of` is ignored,
-   not passed through); v4+ rows keep their recorded source label and
-   `quality_as_of`. A `generated_at` older than 14 days warns but is used —
-   the records' `as_of` makes the staleness visible downstream (the check
-   runs only when rows actually hydrate). Any shape surprise — a non-dict
+   not passed through); v4+ rows keep their recorded `quality_as_of`. The
+   row labels are the keyed CI run's row-level truth inside the artifact
+   (`aa`/`openrouter` — a real catalog row never carries `catalog`); the
+   catalog tier labels every hydrated record `catalog` — the run-level
+   provenance is the source chain (read from our published catalog), not
+   the row's own label. A `generated_at` older than 14 days warns but is
+   used — the records' `as_of` makes the staleness visible downstream (the
+   check runs only when rows actually hydrate). Any shape surprise — a non-dict
    document, a non-list `models`, a matched row whose quality is not a
    finite number — skips the **whole artifact** with a warning: never a
    partial hydration, never a raise; one malformed row means this is not

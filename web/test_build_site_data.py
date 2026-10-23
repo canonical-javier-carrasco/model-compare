@@ -565,6 +565,26 @@ def test_validate_catalog_accepts_null_aa_fields_and_all_provenances():
 @pytest.mark.parametrize(
     "mutate, field",
     [
+        (lambda doc: doc["models"][0].update(quality_as_of=13.15), "quality_as_of"),
+        (lambda doc: doc["models"][0].update(quality_as_of=True), "quality_as_of"),
+        (lambda doc: doc["models"][0].update(quality_drift="no"), "quality_drift"),
+        (lambda doc: doc["models"][0].update(quality_drift=1), "quality_drift"),
+    ],
+)
+def test_validate_catalog_rejects_bad_quality_provenance(mutate, field):
+    # Schema v4 provenance is presence-checked via CATALOG_ENTRY_KEYS; the
+    # value types are pinned here so a malformed document fails loudly:
+    # quality_as_of is a string stamp or null, quality_drift a boolean
+    # verdict or null.
+    doc = make_catalog()
+    mutate(doc)
+    with pytest.raises(ValueError, match=field):
+        bsd.validate_catalog(doc)
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
         (lambda doc: doc["sources"]["aa"].update(mode="scrape"), "sources.aa.mode"),
         (lambda doc: doc["models"][0].update(quality_match="scrape"), "quality_match"),
     ],

@@ -706,6 +706,17 @@ def validate_catalog(document) -> None:
             and entry["quality_match"] not in CATALOG_QUALITY_MATCH_VALUES
         ):
             raise ValueError(f"models[{i}] has unknown quality_match")
+        # Schema v4 provenance: presence-checked via CATALOG_ENTRY_KEYS,
+        # value types pinned here -- the stamp is a string or null, the
+        # drift verdict a boolean or null.
+        if entry["quality_as_of"] is not None and not isinstance(
+            entry["quality_as_of"], str
+        ):
+            raise ValueError(f"models[{i}] quality_as_of must be a string or null")
+        if entry["quality_drift"] is not None and not isinstance(
+            entry["quality_drift"], bool
+        ):
+            raise ValueError(f"models[{i}] quality_drift must be a boolean or null")
         if parameters["zdr_required"] and entry["zdr"] is not True:
             raise ValueError(f"models[{i}] is not zdr=true under zdr_required")
         # Schema v3 additive blocks: the producer emits all four (null when

@@ -37,11 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plain http, so the direct https URL is used deliberately): an exact
   catalog-id join with no re-matching, a `schema_version >= 3` gate (v3
   rows normalized — `quality_match` "api" becomes "aa" and the as-of is the
-  catalog's `generated_at`; v4 rows pass through their recorded fields), a
+  catalog's `generated_at`; v4 rows keep their recorded `quality_as_of`), a
   warn-but-use staleness check past 14 days, and full-artifact degradation
   on any parse surprise — the ranking never crashes, worst case it proceeds
-  without catalog data. Cached under `published-catalog`; only usable
-  results are ever written.
+  without catalog data. Every hydrated record is labeled `catalog` — the
+  run-level provenance is the source chain (read from our published
+  catalog), not the row's own label inside the artifact. Cached under
+  `published-catalog`; only usable results are ever written.
 - Quality drift flag: when the winning source (`aa` or `catalog`) and
   OpenRouter's snapshot for the same model differ by 3 or more index
   points, the record carries `quality_drift: true` plus the snapshot pair
