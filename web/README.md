@@ -13,7 +13,7 @@ subprocess.
 | file | what it is |
 |------|------------|
 | `index.html` | the picks page: top-20 table per priority tab (10 shown, "Show more" expands) with copy buttons, a 7-day movement column, the TIER column and the Off-peak deals table (dark theme by default, light when the system or browser reports light) |
-| `data.json` | the rendered rows: per-priority top 20 plus the current best id and the off-peak `schedules` rows; schema-versioned (`schema_version`, currently 2) and stamped with the `source_revision` (short commit hash) that built it — the footer links it to the exact commit |
+| `data.json` | the rendered rows: per-priority top 20 plus the current best id, the off-peak `schedules` rows, and `generated_at` (ISO timestamp shown as "last refresh: …" between the tab and layout toggles); schema-versioned (`schema_version`, currently 2) and stamped with the `source_revision` (short commit hash) that built it — the footer links it to the exact commit |
 | `best.txt` | the current *balanced* #1 as a plain `opencode --model`-ready id |
 | `catalog.json` | the full `--catalog` document (stable contract, see [DESIGN.md](../DESIGN.md)) |
 | `history.json` | rolling 10-day snapshot history feeding the 7-day column |
@@ -61,6 +61,17 @@ highlights.
   baselines not diffable against effective-tier prices) and the history-v3
   cutover (old snapshots priced at advertised models-API scalars not diffable
   against baseline-endpoint prices).
+- **Simple / Expert layout toggle** — the two buttons on the right of the tab
+  line switch the ranked table between the full expert layout (13 columns:
+  rank, 7-day, model, quality, in, out, discount, precision, tier, context,
+  age, score, task cost) and the simple summary (rank, 7-day, model, quality,
+  in, out, discount, age, with unabbreviated headers). The legend under the
+  table hides the entries that explain columns absent from the simple view.
+  The choice persists via a consent-first preference cookie
+  (`view=simple`, one year): the cookie is only written after the dialog's OK
+  — Reject keeps the choice for the current page load but stores nothing, and
+  the dialog only re-asks on the next visit. Switching back to Expert removes
+  the cookie. Nothing else is ever stored.
 - **Off-peak deals** — the second table lists the top 10 models with
   scheduled discount windows (sub-1% discounts excluded), ranked by discount size; prices shown are the discounted
   off-peak rates. It is built from the catalog's `schedules` index, which is

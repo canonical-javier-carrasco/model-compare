@@ -86,10 +86,16 @@ def test_preview_sh_serves_synthetic_fallback(tmp_path):
         assert (
             _get(f"http://127.0.0.1:{port}/best.txt").strip() == data["best"].encode()
         )
-        assert b"generated-top" in _get(f"http://127.0.0.1:{port}/index.html")
         served_html = _get(f"http://127.0.0.1:{port}/index.html")
+        assert b"generated-top" in served_html
         assert b'id="deals"' in served_html and b"TIER" in served_html
-        assert b"schedule-text" in served_html  # clip wrapper for SCHEDULE cells
+        # The site's CSS/JS are external files now: preview must serve
+        # them next to index.html (the schedule clip wrapper lives in
+        # style.css, the table renderer in app.js).
+        served_css = _get(f"http://127.0.0.1:{port}/style.css")
+        assert b"schedule-text" in served_css
+        served_js = _get(f"http://127.0.0.1:{port}/app.js")
+        assert b"function render" in served_js
     finally:
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=10)

@@ -1,0 +1,324 @@
+      :root {
+        color-scheme: light dark;
+        /* dark is the base (default); light applies via prefers-color-scheme */
+        --bg: #181a1b;
+        --text: #e8e6e3;
+        --muted: #988f81;
+        --btn-bg: #262a2b;
+        --btn-border: var(--muted);
+        --thead-border: var(--text);
+        --row-border: var(--muted);
+        --status: #e06c60;
+        --up: #7bb98c;
+        --down: #de8482;
+        --flat: #7fa6d9;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f6f3ec;
+          --text: #33302b;
+          --muted: #8a8175;
+          --btn-bg: #e9e4d8;
+          --status: #b03a2a;
+          --up: #2e7d4f;
+          --down: #b0392b;
+          --flat: #3a6ea5;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        max-width: 120rem;
+        width: calc(100% - 2 * clamp(1rem, 4vw, 4rem));
+        margin: 2rem auto;
+        padding: 0.5rem clamp(1rem, 2vw, 2rem);
+        line-height: 1.45;
+        background: var(--bg);
+        color: var(--text);
+      }
+      h1 {
+        font-size: 1.4rem;
+        margin-bottom: 0.25rem;
+      }
+      .sub {
+        color: var(--muted);
+        margin-top: 0;
+        font-size: 0.95rem;
+      }
+      .tabs {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin: 1.25rem 0 0.75rem;
+      }
+      .tabs button {
+        border: 1px solid var(--btn-border);
+        background: var(--bg);
+        color: inherit;
+        padding: 0.35rem 0.9rem;
+        border-radius: 999px;
+        cursor: pointer;
+        font: inherit;
+      }
+      .tabs button.active {
+        background: var(--btn-bg);
+        color: var(--text);
+        border-color: var(--btn-border);
+      }
+      /* the stamp centers on the tabs line: flex: 1 makes its box the
+         gap between the priority group and the view buttons, so
+         text-align: center centers it between the two sets */
+      .tabs .stamp {
+        flex: 1 1 auto;
+        text-align: center;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      /* Simple/Expert view toggle. Expert is the default (all 13
+         columns); simple shows rank, 7-day, model, quality, in, out,
+         discount, age and hides the legend for the absent columns. The
+         body class is flipped by app.js (setView/applyView). */
+      .view-simple .hide-simple {
+        display: none;
+      }
+      #table .lbl-simple {
+        display: none;
+      }
+      .view-simple #table .lbl-simple {
+        display: inline;
+      }
+      .view-simple #table .lbl-expert {
+        display: none;
+      }
+      .actions button {
+        border: 1px solid var(--btn-border);
+        background: var(--btn-bg);
+        color: var(--text);
+        padding: 0.4rem 0.9rem;
+        margin-top: 1rem;
+        border-radius: 6px;
+        cursor: pointer;
+        font: inherit;
+      }
+      .actions button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .hint {
+        font-size: 0.85rem;
+        color: var(--muted);
+        margin: 0.6rem 0 0;
+      }
+      code {
+        font-family: ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+      #alias-hint {
+        color: var(--text);
+      }
+      .status {
+        color: var(--status);
+        margin: 0.75rem 0;
+      }
+      #table,
+      #deals {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 1rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.9rem;
+      }
+      #table th,
+      #table td,
+      #deals th,
+      #deals td {
+        padding: 0.3rem 0.6rem;
+        text-align: right;
+        border-bottom: 1px solid var(--row-border);
+        white-space: nowrap;
+      }
+      #table th:nth-child(3),
+      #table td:nth-child(3) {
+        text-align: left;
+      }
+      #deals th:nth-child(1),
+      #deals td:nth-child(1) {
+        text-align: left;
+      }
+      #table thead th,
+      #deals thead th {
+        border-bottom: 2px solid var(--thead-border);
+      }
+      #table .movement {
+        text-align: center;
+      }
+      #table .caveat {
+        color: var(--muted);
+      }
+      #table .na {
+        color: var(--muted);
+      }
+      #table tbody tr[role="button"] {
+        cursor: pointer;
+      }
+      #table tbody tr[role="button"]:focus {
+        outline: 1px solid var(--flat);
+        outline-offset: -2px;
+      }
+      #table .endpoint-note {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      #table tr.endpoint-row td {
+        padding: 0.5rem 0.75rem 1rem;
+        background: var(--row-alt, transparent);
+      }
+      #table tr.endpoint-row table {
+        width: 100%;
+        font-size: 0.8rem;
+      }
+      #table [title],
+      #deals [title] {
+        cursor: help;
+        text-decoration: underline dotted;
+        text-underline-offset: 3px;
+      }
+      /* max-width is ignored on <td> in auto table layout, so the SCHEDULE
+         text clips on an inner inline-block span instead (measured there). */
+      #deals .schedule-text {
+        display: inline-block;
+        max-width: 25ch;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: bottom;
+      }
+      /* text-decoration does not propagate into the inline-block clip
+         wrapper, so underline it directly when the cell is clipped (the
+         cell then carries the title). */
+      #deals td[title] .schedule-text {
+        text-decoration: underline dotted;
+        text-underline-offset: 3px;
+      }
+      #deals-section h2 {
+        font-size: 1.05rem;
+        margin: 1rem 0 0.25rem;
+      }
+      .main-actions button {
+        float: right;
+        margin: 0.9rem 0 0.7rem 1rem;
+      }
+      .deals-actions button {
+        float: right;
+        margin: 0.9rem 0 0.7rem;
+      }
+      #deals-section,
+      .actions {
+        clear: both;
+      }
+      .movement.up {
+        color: var(--up);
+      }
+      .movement.down {
+        color: var(--down);
+      }
+      .movement.flat {
+        color: var(--flat);
+      }
+      .movement.new {
+        color: var(--up);
+      }
+      #highlights h2 {
+        font-size: 1.05rem;
+        margin: 1rem 0 0.25rem;
+      }
+      #highlights p {
+        margin: 0 0 0.5rem;
+        font-size: 0.9rem;
+      }
+      #use-opencode h3 {
+        font-size: 1rem;
+        margin: 1.1rem 0 0.35rem;
+      }
+      /* the copy tables keep the .actions button look outside .actions */
+      .copybuttons,
+      .copybuttons td {
+        border: none;
+      }
+      .copybuttons td:nth-child(2) {
+        padding-top: 0.7rem;
+      }
+      /* v2 plugin snippet: static JSON syntax highlighting (tokens are
+         marked up by hand in the markup) */
+      .jsonbox {
+        background: var(--btn-bg);
+        border: 1px solid var(--muted);
+        border-radius: 6px;
+        padding: 0.7rem 0.9rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.83rem;
+        overflow-x: auto;
+        margin: 0.6rem 0;
+      }
+      .jsonbox .jk {
+        color: var(--flat);
+      }
+      .jsonbox .js {
+        color: var(--up);
+      }
+      .jsonbox .jp {
+        color: var(--muted);
+      }
+      footer {
+        margin-top: 1.5rem;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      a {
+        color: inherit;
+      }
+      a:hover {
+        text-decoration: none;
+        color: var(--text);
+      }
+      /* Consent-first cookie dialog: a bottom-right overlay, shown only
+         when no consent decision is stored (app.js gates it). */
+      #cookie-dialog {
+        position: fixed;
+        right: 1.25rem;
+        bottom: 1.25rem;
+        max-width: 22rem;
+        background: var(--btn-bg);
+        border: 1px solid var(--btn-border);
+        border-radius: 8px;
+        padding: 0.9rem 1.1rem;
+        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+        z-index: 10;
+        font-size: 0.88rem;
+      }
+      #cookie-dialog[hidden] {
+        display: none;
+      }
+      #cookie-dialog p {
+        margin: 0 0 0.7rem;
+      }
+      #cookie-dialog .cookie-actions {
+        display: flex;
+        gap: 0.5rem;
+        justify-content: flex-end;
+      }
+      #cookie-dialog button {
+        border: 1px solid var(--btn-border);
+        background: var(--bg);
+        color: inherit;
+        padding: 0.3rem 0.9rem;
+        border-radius: 999px;
+        cursor: pointer;
+        font: inherit;
+      }

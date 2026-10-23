@@ -1,15 +1,16 @@
-"""Node-backed tests for the inline script in web/site/index.html.
+"""Node-backed tests for the site's app.js (web/site/app.js).
 
-No npm toolchain: the test extracts the page's single <script> block,
-prepends the web/js_stubs.js shims, appends a per-test driver, and
-evaluates it under node (skipped when node is absent; GitHub's ubuntu
-runners ship node preinstalled). The harness exists because the script
-duplicates model_compare.py's fmt_* helpers under a "keep them in sync"
-comment and has regressed before -- parity is enforced here, and the
-pure helpers (tooltip sentence construction, formatters, guards) get
-real tests instead of code reading.
+No npm toolchain: the test prepends the web/js_stubs.js shims to
+app.js, appends a per-test driver, and evaluates it under node
+(skipped when node is absent; GitHub's ubuntu runners ship node
+preinstalled). The harness exists because app.js duplicates
+model_compare.py's fmt_* helpers under a "keep them in sync" comment
+and has regressed before -- parity is enforced here, and the pure
+helpers (tooltip sentence construction, formatters, guards) get real
+tests instead of code reading.
 
-Limitation: the pure helpers and the named render helpers that mutate
+Limitation: the pure helpers, the built-element shape (endpointRow,
+render on a stub tbody), and the named render helpers that mutate
 captured elements (renderFooter's revision/stamp flow) are exercised;
 tooltip delivery (the td.title assignment inside render), event wiring,
 and the fetch-driven flow are not: the fetch stub rejects so init()'s
@@ -30,6 +31,8 @@ import pytest
 
 WEB = Path(__file__).parent
 SITE_HTML = WEB / "site" / "index.html"
+SITE_CSS = WEB / "site" / "style.css"
+SCRIPT_JS = WEB / "site" / "app.js"
 STUBS_JS = WEB / "js_stubs.js"
 
 sys.path.insert(0, str(WEB.parent))
@@ -39,28 +42,15 @@ pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node is not installed"
 )
 
-# The page carries exactly one inline <script> block (its CSP forbids
-# external scripts), so this match is the whole program. Non-greedy like
-# an HTML parser: it terminates at the first </script>.
-SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
-
 NODE_TIMEOUT = 30
 
 
 def run_js(expression: str):
-    """Evaluate stubs + inline script + expression under node; return JSON."""
-    html = SITE_HTML.read_text()
-    openings, closings = html.count("<script>"), html.count("</script>")
-    if openings != 1 or closings != 1:
-        raise AssertionError(
-            "expected exactly one <script>...</script> block in "
-            f"web/site/index.html, found {openings} opening and "
-            f"{closings} closing tags"
-        )
+    """Evaluate stubs + app.js + expression under node; return JSON."""
     program = "\n".join(
         [
             STUBS_JS.read_text(),
-            SCRIPT_RE.search(html).group(1),
+            SCRIPT_JS.read_text(),
             f"var __out = ({expression});",
             "console.log(JSON.stringify(__out));",
         ]
@@ -95,7 +85,7 @@ def run_js(expression: str):
 # Harness sanity + Python parity (existing behaviour)
 
 
-def test_harness_reaches_the_inline_script():
+def test_harness_reaches_the_site_script():
     out = run_js(
         "{price: fmtPrice(0.1), context: fmtContext(1048576), age: fmtAge(null)}"
     )
@@ -159,15 +149,122 @@ def test_fmtprice_non_tie_decimal_matches_python():
     assert run_js("pyFixed(0.15, 1)") == f"{0.15:.1f}" == "0.1"
 
 
-def test_script_extraction_covers_the_whole_program():
-    # Exactly one <script>...</script> pair on the page; the extraction
-    # must reach the end of the program, not stop at an early block.
+# ---------------------------------------------------------------------------
+# Site assembly: external assets, view toggle, cookie consent, verbadge
+
+
+def test_site_references_the_external_assets():
+    # The former inline CSS/JS blocks are external files now: the page
+    # links them, and its CSP allows same-origin assets but no inline
+    # code (the hand-marked JSON highlighting is markup, not script).
     html = SITE_HTML.read_text()
-    assert html.count("<script>") == 1
-    assert html.count("</script>") == 1
-    script = SCRIPT_RE.search(html).group(1)
+    assert '<link rel="stylesheet" href="style.css" />' in html
+    assert '<script src="app.js" defer></script>' in html
+    assert "style-src 'self'" in html
+    assert "script-src 'self'" in html
+    assert "unsafe-inline" not in html
+    assert html.count("<style") == 0
+    # every <script ...> carries a src: no inline script blocks remain
+    assert re.search(r"<script(?![^>]*\bsrc=)", html) is None
+    # CSP tripwires the tightened policy would silently block in
+    # production while every behavioral test stays green:
+    assert re.search(r"<[^>]*\son[a-z]+\s*=", html) is None  # inline handlers
+    assert re.search(r"<[^>]*\sstyle\s*=", html) is None  # inline styles
+    assert "javascript:" not in html
+    css = SITE_CSS.read_text()
+    assert "@import" not in css and "url(" not in css  # no external fetches
+    assert SITE_CSS.is_file()
+    script = SCRIPT_JS.read_text()
     assert "function init" in script
     assert "tierCellData" in script
+
+
+def test_view_toggle_buttons_markup():
+    html = SITE_HTML.read_text()
+    tabs = re.search(r'<div class="tabs" id="tabs">.*?</div>', html, re.DOTALL).group(0)
+    simple_btn = re.search(r'<button[^>]*id="view-simple"[^>]*>', tabs).group(0)
+    expert_btn = re.search(r'<button[^>]*id="view-expert"[^>]*>', tabs).group(0)
+    # Expert is the default view: only its button starts active.
+    assert "active" not in simple_btn
+    assert "active" in expert_btn
+    # The view buttons carry no data-priority: the priority wiring keys
+    # on that attribute and must not hijack the layout toggle.
+    assert "data-priority" not in simple_btn
+    assert "data-priority" not in expert_btn
+    # Order on the line: priority group, centered stamp, view buttons.
+    assert (
+        tabs.index('data-priority="quality"')
+        < tabs.index('id="generated-top"')
+        < tabs.index('id="view-simple"')
+    )
+
+
+def test_priority_wiring_scoped_to_data_priority():
+    # The view buttons live in #tabs too: the priority click wiring keys
+    # on [data-priority] so clicking Simple/Expert cannot blank the
+    # table by setting current to undefined.
+    script = SCRIPT_JS.read_text()
+    assert script.count('document.querySelectorAll("#tabs button[data-priority]")') == 2
+
+
+def test_simple_view_headers():
+    html = SITE_HTML.read_text()
+    main_table = re.search(r'<table id="table">.*?</table>', html, re.DOTALL).group(0)
+    # The four abbreviated expert headers gain unabbreviated simple
+    # labels; the price columns keep their dollar units.
+    for expert_label, simple_label in [
+        ("QUAL", "QUALITY"),
+        ("$IN/M", "IN $/M"),
+        ("$OUT/M", "OUT $/M"),
+        ("DISC", "DISCOUNT"),
+    ]:
+        assert f'<span class="lbl-expert">{expert_label}</span>' in main_table
+        assert f'<span class="lbl-simple">{simple_label}</span>' in main_table
+
+
+def test_simple_view_hidden_columns_and_legend():
+    html = SITE_HTML.read_text()
+    main_table = re.search(r'<table id="table">.*?</table>', html, re.DOTALL).group(0)
+    ths = re.findall(r"<th.*?</th>", main_table, re.DOTALL)
+    for col in ("PREC", "TIER", "CTX", "SCORE", "TASK$"):
+        th = next(
+            (t for t in ths if re.search(r">\s*" + re.escape(col) + r"\s*<", t)),
+            None,
+        )
+        assert th is not None, f"no <th> for {col}"
+        assert "hide-simple" in th, f"{col} th missing hide-simple"
+    # Legend hints for the absent columns are hidden in simple view; the
+    # long-session-prices hint stays in both (it explains the IN/OUT
+    # columns, which are present in both views).
+    assert '<p class="hint hide-simple">\n      <strong>PREC</strong>' in html
+    assert (
+        '<p class="hint hide-simple">\n      <strong><span class="tier">TIER</span></strong>'
+        in html
+    )
+    assert '<p class="hint hide-simple">\n      <strong>TASK$</strong>' in html
+    assert '<p class="hint">\n      Prices shown are what a long session pays' in html
+
+
+def test_opencode_headings_keep_version_text_drop_badge():
+    html = SITE_HTML.read_text()
+    assert "verbadge" not in html
+    assert "<h3>OpenCode v1 — Launch flag, shell alias</h3>" in html
+    assert "<h3>OpenCode v2 — model-compare plugin</h3>" in html
+
+
+def test_cookie_dialog_markup():
+    html = SITE_HTML.read_text()
+    assert '<div id="cookie-dialog" hidden>' in html
+    assert 'id="cookie-ok"' in html
+    assert 'id="cookie-reject"' in html
+
+
+def test_top_stamp_reads_last_refresh():
+    # "last refresh: date, time" -- the browser's locale formatting
+    # prefixed with the label. The footer keeps its bare stamp.
+    script = SCRIPT_JS.read_text()
+    assert 'els.generatedTop.textContent = "last refresh: " + stamp;' in script
+    assert "els.generated.textContent = stamp;" in script
 
 
 # ---------------------------------------------------------------------------
@@ -664,18 +761,267 @@ def test_baseline_note_null_without_endpoints():
     assert run_js("baselineNote({endpoints: []})") is None
 
 
-def test_endpoint_row_colspan_pins_header_count():
-    # The disclosure row must span the full main-table width. The count is
-    # a named constant (MAIN_TABLE_COLS) that this test pins to the actual
-    # number of <th> cells in the markup, so the next column addition that
-    # forgets the constant fails here instead of misaligning the table.
+def test_main_table_colspans_pin_header_counts():
+    # The disclosure row must span the visible main-table width in both
+    # views. The counts are named constants pinned to the actual <th>
+    # markup: MAIN_TABLE_COLS to the full count, SIMPLE_TABLE_COLS to the
+    # count minus the hide-simple columns, so a column addition that
+    # forgets the constants fails here instead of misaligning the table.
     html = SITE_HTML.read_text()
     main_table = re.search(r'<table id="table">.*?</table>', html, re.DOTALL).group(0)
     header_cols = len(re.findall(r"<th[\s>]", main_table))
-    script = SCRIPT_RE.search(html).group(1)
+    hidden_cols = len(re.findall(r"<th[^>]*class=\"[^\"]*hide-simple", main_table))
+    script = SCRIPT_JS.read_text()
     assert f"var MAIN_TABLE_COLS = {header_cols};" in script
-    assert "td.colSpan = MAIN_TABLE_COLS;" in script
-    assert "td.colSpan = 12;" not in script
+    assert f"var SIMPLE_TABLE_COLS = {header_cols - hidden_cols};" in script
+    assert (
+        'td.colSpan = view === "simple" ? SIMPLE_TABLE_COLS : MAIN_TABLE_COLS;'
+        in script
+    )
+
+
+def test_endpoint_row_colspan_follows_view():
+    # Behavior pin: the disclosure row spans 13 columns in expert view
+    # and 8 in simple view (built-element shape, like the other DOM tests).
+    expert = run_js(
+        "(function () {"
+        '  view = "expert";'
+        "  var tr = endpointRow(null, false);"
+        "  return tr.children[0].colSpan;"
+        "})()"
+    )
+    assert expert == 13
+    simple = run_js(
+        "(function () {"
+        '  view = "simple";'
+        "  var tr = endpointRow(null, false);"
+        "  return tr.children[0].colSpan;"
+        "})()"
+    )
+    assert simple == 8
+
+
+# One ranked row shaped exactly as data.json v2 provides it: every field
+# render() touches is present, with tier/sched/quant annotations unset.
+SIMPLE_VIEW_ROW = {
+    "model": "m/x",
+    "opencode_model": "openrouter/m/x",
+    "quality_index": 40.0,
+    "input_usd_per_m": 1.0,
+    "output_usd_per_m": 2.0,
+    "discount_pct": "10",
+    "default_precision": "fp8",
+    "risk_flag": False,
+    "tier_note": None,
+    "sched_note": None,
+    "context_tokens": 1000,
+    "age_days": 30,
+    "score": 0.5,
+    "session_cost_usd": 1.0,
+    "quant_note": None,
+}
+
+
+def test_render_row_shapes_follow_view():
+    # render() must drop exactly the five expert-only columns in simple
+    # view: the row keeps 8 cells (rank, 7-day, model, quality, in, out,
+    # discount, age) and the 8th visible cell is AGE, where the expert
+    # row's 8th is PREC. The stub tbody never clears its children, so
+    # the expert row lands at index 0 and the simple row at index 1.
+    data_fix = {
+        "priorities": {"balanced": [SIMPLE_VIEW_ROW]},
+        "schedules": [],
+    }
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(data_fix)};"
+        ' view = "expert"; render();'
+        " var expertTr = els.tbody.children[0];"
+        ' view = "simple"; render();'
+        " var simpleTr = els.tbody.children[1];"
+        " return {"
+        "   expertCells: expertTr.children.length,"
+        "   expertCell7: expertTr.children[7].textContent,"
+        "   simpleCells: simpleTr.children.length,"
+        "   simpleCell7: simpleTr.children[7].textContent"
+        " };"
+        "})()"
+    )
+    assert out == {
+        "expertCells": 13,
+        "expertCell7": "fp8",
+        "simpleCells": 8,
+        "simpleCell7": "30d",
+    }
+
+
+DEALS_ROW = {
+    "model": "d/y",
+    "sched_note": "-30%",
+    "sched_detail": "00:00-08:00 UTC daily",
+    "quality": 50.0,
+    "input_per_1m": 0.5,
+    "output_per_1m": 1.5,
+    "context": 128000,
+    "score": 0.7,
+}
+
+
+def test_render_deals_rows_are_view_independent():
+    # The layout toggle switches the main table only: renderDeals must
+    # emit the same 8 cells per row in both views, with the score last
+    # (a view-conditional skip here would drop values under the wrong
+    # headers, since the deals headers never hide). The stub hands out
+    # a fresh element per getElementById call, so the test patches the
+    # lookup to capture each tbody the function builds into.
+    data_fix = {"priorities": {"balanced": []}, "schedules": [DEALS_ROW]}
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(data_fix)};"
+        " var captured = null;"
+        " var realGet = document.getElementById;"
+        " document.getElementById = function (id) {"
+        "   var e = realGet(id);"
+        '   if (id === "deals-tbody") captured = e;'
+        "   return e;"
+        " };"
+        ' view = "expert"; renderDeals();'
+        " var expertTr = captured.children[0];"
+        " captured = null;"
+        ' view = "simple"; renderDeals();'
+        " var simpleTr = captured.children[0];"
+        " document.getElementById = realGet;"
+        " return {"
+        "   expertCells: expertTr.children.length,"
+        "   expertLast: expertTr.children[7].textContent,"
+        "   simpleCells: simpleTr.children.length,"
+        "   simpleLast: simpleTr.children[7].textContent"
+        " };"
+        "})()"
+    )
+    assert out == {
+        "expertCells": 8,
+        "expertLast": "0.700",
+        "simpleCells": 8,
+        "simpleLast": "0.700",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Consent-first view cookie
+
+
+def test_should_ask_for_consent_fresh_load():
+    # No cookie, nothing rejected: the dialog must ask.
+    assert run_js("shouldAskForConsent()") is True
+
+
+def test_should_ask_for_consent_stored_consent():
+    # A stored view=simple cookie means consent was given: no dialog.
+    assert (
+        run_js(
+            '(function () { document.cookie = "view=simple";'
+            " return shouldAskForConsent(); })()"
+        )
+        is False
+    )
+
+
+def test_should_ask_for_consent_rejected_this_load():
+    # Reject stores nothing but suppresses re-asking for this page load.
+    assert (
+        run_js(
+            "(function () { consentRejected = true; return shouldAskForConsent(); })()"
+        )
+        is False
+    )
+
+
+def test_deals_table_immune_to_view_toggle():
+    # The layout toggle switches the MAIN table only. The deals table
+    # shares header markup with it (same QUAL/CTX th text), so a stray
+    # copy of the view markers here rendered "QUAL QUALITY" in both
+    # views and misaligned the deals columns in simple view.
+    html = SITE_HTML.read_text()
+    deals = re.search(r'<table id="deals"[^>]*>.*?</table>', html, re.DOTALL).group(0)
+    assert "lbl-expert" not in deals
+    assert "lbl-simple" not in deals
+    assert "hide-simple" not in deals
+    assert '<th title="Intelligence index (Artificial Analysis)">QUAL</th>' in deals
+    assert '<th title="Context window in tokens">CTX</th>' in deals
+
+
+def test_view_cookie_round_trip():
+    # writeViewCookie/clearViewCookie must agree on the cookie's
+    # attributes (a write/delete disagreement silently breaks deletion
+    # in a real browser), and clearing must restore the ask-again
+    # contract: the full OK -> Expert -> Simple sequence re-asks.
+    out = run_js(
+        "(function () {"
+        "  writeViewCookie();"
+        "  var afterWrite = { value: readCookie('view'), header: document.cookie };"
+        "  clearViewCookie();"
+        "  var afterClear = { value: readCookie('view'), asks: shouldAskForConsent(),"
+        "    header: document.cookie };"
+        "  return { afterWrite: afterWrite, afterClear: afterClear };"
+        "})()"
+    )
+    assert out["afterWrite"]["value"] == "simple"
+    assert "max-age=31536000" in out["afterWrite"]["header"]
+    assert "SameSite=Lax" in out["afterWrite"]["header"]
+    assert "path=/" in out["afterWrite"]["header"]
+    assert out["afterClear"]["value"] is None
+    assert out["afterClear"]["asks"] is True
+    # The delete must agree with the write on path/attributes (a
+    # disagreement silently breaks deletion in a real browser).
+    assert "max-age=0" in out["afterClear"]["header"]
+    assert "SameSite=Lax" in out["afterClear"]["header"]
+    assert "path=/" in out["afterClear"]["header"]
+
+
+def test_should_ask_for_consent_reask_after_revoke():
+    # The full OK -> Expert -> Simple sequence via the real cookie
+    # helpers: consent written, then removed, then Simple clicked again
+    # -- no consent is stored any more, so the dialog must ask again
+    # (the once-per-page-load bug the mockup review caught). Reject, by
+    # contrast, keeps suppressing until the next page load.
+    assert (
+        run_js(
+            "(function () {"
+            "  writeViewCookie();"
+            "  clearViewCookie();"
+            "  return shouldAskForConsent();"
+            "})()"
+        )
+        is True
+    )
+    assert (
+        run_js(
+            "(function () {"
+            "  writeViewCookie();"
+            "  clearViewCookie();"
+            "  consentRejected = true;"
+            "  return shouldAskForConsent();"
+            "})()"
+        )
+        is False
+    )
+
+
+def test_read_cookie_parses_header_shaped_string():
+    out = run_js(
+        '(function () { document.cookie = "a=1; view=simple; b=2";'
+        ' return { view: readCookie("view"), missing: readCookie("nope") };'
+        "})()"
+    )
+    assert out == {"view": "simple", "missing": None}
+    # An empty cookie value carries no consent (and matches what a real
+    # browser reports after the max-age=0 deletion): read as absent.
+    out = run_js(
+        '(function () { document.cookie = "view=; max-age=0";'
+        ' return readCookie("view"); })()'
+    )
+    assert out is None
 
 
 def test_endpoint_row_artifact_vs_model_level_text():

@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Site: Simple/Expert layout toggle for the ranked table. Expert stays the
+  default full 13-column layout; Simple shows only rank, 7-day, model,
+  quality, in, out, discount and age, spells its headers out
+  (quality, discount; price columns keep the dollar units) and hides the
+  legend entries that explain columns it does not show. The choice persists
+  via a consent-first preference cookie (`view=simple`, one year): the cookie
+  is written only after the dialog's OK, Reject stores nothing (the choice
+  lasts one page load), switching back to Expert removes the cookie, and the
+  dialog only re-asks when no consent decision is stored.
+
+### Changed
+
+- Site: the tab line now centers "last refresh: date, time" between the
+  priority tabs and the layout toggle.
+- Site: the CSS and JS moved out of `index.html` into `site/style.css` and
+  `site/app.js`; the page's Content-Security-Policy tightened accordingly
+  (same-origin assets instead of inline code).
+- Site: the OpenCode section headings keep their "OpenCode v1/v2" text
+  without the badge styling.
+
 ## [0.4.0] - 2026-10-21
 
 ### Added

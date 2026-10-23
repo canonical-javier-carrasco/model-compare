@@ -3,8 +3,9 @@
 
 Runs the standalone model_compare.py, then the web-side generators
 (generate_highlights.py, build_site_data.py), and assembles the deploy
-directory: data.json, catalog.json, history.json, highlights.json, best.txt
-and index.html. Fails loudly on any unexpected result -- including
+directory: data.json, catalog.json, history.json, highlights.json,
+best.txt, index.html and its style.css/app.js assets. Fails loudly on
+any unexpected result -- including
 data.json/history.json stamps that disagree with catalog.json's
 generated_at, or a best.txt that is not catalog.json's balanced rank 1 --
 so a broken run never deploys a broken site.
@@ -358,7 +359,8 @@ def build_site(output_dir: Path) -> None:
             ],
         )
 
-        shutil.copyfile(WEB_DIR / "site" / "index.html", output_dir / "index.html")
+        for name in ("index.html", "style.css", "app.js"):
+            shutil.copyfile(WEB_DIR / "site" / name, output_dir / name)
 
     artifacts = (
         "data.json",
@@ -367,6 +369,8 @@ def build_site(output_dir: Path) -> None:
         "highlights.json",  # ditto via PREV_HIGHLIGHTS_URL
         "best.txt",
         "index.html",
+        "style.css",
+        "app.js",
     )
     missing = [name for name in artifacts if not (output_dir / name).is_file()]
     if missing:

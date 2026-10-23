@@ -167,6 +167,8 @@ def test_build_site_pipeline_order_and_assembly(tmp_path, monkeypatch):
     ] == ["balanced", "price", "quality"]
     assert (out / "best.txt").read_text().strip() == "openrouter/z-ai/glm-5.3-flash"
     assert (out / "index.html").is_file()
+    assert (out / "style.css").is_file()
+    assert (out / "app.js").is_file()
 
     # Downstream argument wiring is the riskiest surface: pin it exactly.
     gh_cmd = next(cmd for cmd in calls if Path(cmd[1]).name == "generate_highlights.py")
@@ -572,6 +574,8 @@ PUBLISH_ARTIFACTS = (
     "highlights.json",
     "best.txt",
     "index.html",
+    "style.css",
+    "app.js",
 )
 
 

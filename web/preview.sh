@@ -18,6 +18,9 @@ BUILD=0
 LIVE_URL="https://canonical.github.io/model-compare"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SITE_DIR="$SCRIPT_DIR/site"
+# The site's static files: index.html plus its external CSS/JS assets
+# (the deploy dir carries the same set; keep publish.py in sync).
+SITE_FILES="index.html style.css app.js"
 SRV_PID=""
 
 die_usage() {
@@ -38,7 +41,7 @@ with data.json and best.txt.
                   previous history/highlights and may call OpenRouter for
                   highlights (LLM spend) if OPENROUTER_API_KEY is set
   --live-url URL  deployed site to fetch data from
-  --site-dir DIR  directory holding index.html (default: ./web/site)
+  --site-dir DIR  directory holding the site files (default: ./web/site)
 EOF
 	exit 0
 }
@@ -78,10 +81,12 @@ command -v python3 >/dev/null || {
 	echo "preview.sh: python3 is required" >&2
 	exit 1
 }
-[ -f "$SITE_DIR/index.html" ] || {
-	echo "preview.sh: no index.html in $SITE_DIR" >&2
-	exit 1
-}
+for f in $SITE_FILES; do
+	[ -f "$SITE_DIR/$f" ] || {
+		echo "preview.sh: no $f in $SITE_DIR" >&2
+		exit 1
+	}
+done
 
 PREVIEW_DIR="$(mktemp -d)"
 trap '
@@ -91,13 +96,17 @@ trap '
 	rm -rf "$PREVIEW_DIR"
 ' EXIT
 
-cp "$SITE_DIR/index.html" "$PREVIEW_DIR/index.html"
+for f in $SITE_FILES; do
+	cp "$SITE_DIR/$f" "$PREVIEW_DIR/$f"
+done
 
 if [ "$BUILD" -eq 1 ]; then
 	echo "building data locally with web/publish.py..."
 	python3 "$SCRIPT_DIR/publish.py" --output-dir "$PREVIEW_DIR"
-	# publish.py always copies web/site/index.html; restore a custom --site-dir
-	cp "$SITE_DIR/index.html" "$PREVIEW_DIR/index.html"
+	# publish.py always copies web/site/*; restore a custom --site-dir
+	for f in $SITE_FILES; do
+		cp "$SITE_DIR/$f" "$PREVIEW_DIR/$f"
+	done
 elif command -v curl >/dev/null &&
 	curl -fsSL --max-time 10 "$LIVE_URL/data.json" -o "$PREVIEW_DIR/data.json" &&
 	curl -fsSL --max-time 10 "$LIVE_URL/best.txt" -o "$PREVIEW_DIR/best.txt"; then
