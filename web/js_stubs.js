@@ -9,14 +9,14 @@
 // (tooltip sentence construction, formatters, guards), the built-element
 // shape of endpointRow()/baselineNote() and of render() against a stub
 // tbody — appendChild records children so a driver can walk the DOM the
-// script built — named mutations like renderFooter() (getElementById
-// hands out the same cached stub per id, so a driver can read back what
-// the script wrote through els or document.getElementById), and the
-// event wiring: addEventListener records handlers per type and
-// dispatchEvent fires them, so a driver can click the view/consent
-// buttons. Tooltip delivery (the td.title assignment inside render) and
-// the live fetch flows are not exercised: fetch() rejects so render()
-// never runs from the fetch path, and querySelectorAll returns [].
+// script built, including the title a render loop assigned to a cell —
+// named mutations like renderFooter() (getElementById hands out the same
+// cached stub per id, so a driver can read back what the script wrote
+// through els or document.getElementById), and the event wiring:
+// addEventListener records handlers per type and dispatchEvent fires
+// them, so a driver can click the view/consent buttons. The live fetch
+// flows are not exercised: fetch() rejects so render() never runs from
+// the fetch path, and querySelectorAll returns [].
 
 function stubElement() {
   return {
