@@ -9,10 +9,12 @@
 // (tooltip sentence construction, formatters, guards), the built-element
 // shape of endpointRow()/baselineNote() and of render() against a stub
 // tbody — appendChild records children so a driver can walk the DOM the
-// script built — and named mutations like renderFooter() (getElementById
+// script built — named mutations like renderFooter() (getElementById
 // hands out the same cached stub per id, so a driver can read back what
-// the script wrote through els or document.getElementById). Tooltip
-// delivery (the td.title assignment inside render), event wiring, and
+// the script wrote through els or document.getElementById), and the
+// event wiring: addEventListener records handlers per type and
+// dispatchEvent fires them, so a driver can click the view/consent
+// buttons. Tooltip delivery (the td.title assignment inside render) and
 // the live fetch flows are not exercised: fetch() rejects so render()
 // never runs from the fetch path, and querySelectorAll returns [].
 
@@ -28,6 +30,34 @@ function stubElement() {
     children: [],
     dataset: {},
     style: {},
+    // Listeners recorded per type so a driver can fire events and a
+    // test can prove which handler is bound to which element (the
+    // consent wiring tests depend on this).
+    listeners: {},
+    attrs: {},
+    addEventListener: function (type, fn) {
+      (this.listeners[type] = this.listeners[type] || []).push(fn);
+    },
+    dispatchEvent: function (type, extra) {
+      var ev = { type: type, preventDefault: function () {} };
+      if (extra) {
+        for (var k in extra) ev[k] = extra[k];
+      }
+      (this.listeners[type] || []).forEach(function (fn) {
+        fn.call(this, ev);
+      }, this);
+    },
+    setAttribute: function (name, value) {
+      this.attrs[name] = String(value);
+    },
+    getAttribute: function (name) {
+      return Object.prototype.hasOwnProperty.call(this.attrs, name)
+        ? this.attrs[name]
+        : null;
+    },
+    focus: function () {
+      document.activeElement = this;
+    },
     querySelector: function () {
       return null;
     },
@@ -35,12 +65,30 @@ function stubElement() {
       return [];
     },
     classList: {
-      toggle: function () {},
-      add: function () {},
-      remove: function () {},
+      _set: {},
+      toggle: function (name, force) {
+        var on = force === undefined ? !this._set[name] : !!force;
+        if (on) this._set[name] = true;
+        else delete this._set[name];
+      },
+      contains: function (name) {
+        return !!this._set[name];
+      },
+      add: function (name) {
+        this._set[name] = true;
+      },
+      remove: function (name) {
+        delete this._set[name];
+      },
     },
-    setAttribute: function () {},
-    addEventListener: function () {},
+    setAttribute: function (name, value) {
+      this.attrs[name] = String(value);
+    },
+    getAttribute: function (name) {
+      return Object.prototype.hasOwnProperty.call(this.attrs, name)
+        ? this.attrs[name]
+        : null;
+    },
     appendChild: function (child) {
       this.children.push(child);
       return child;
@@ -59,6 +107,7 @@ var document = {
   // cookie: the consent-first view preference is read at init() time;
   // empty by default, tests may assign a header-shaped string.
   cookie: "",
+  activeElement: null,
   getElementById: function (id) {
     if (!Object.prototype.hasOwnProperty.call(stubsById, id)) {
       stubsById[id] = stubElement();

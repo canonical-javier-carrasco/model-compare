@@ -68,10 +68,12 @@ highlights.
   in, out, discount, age, with unabbreviated headers). The legend under the
   table hides the entries that explain columns absent from the simple view.
   The choice persists via a consent-first preference cookie
-  (`view=simple`, one year): the cookie is only written after the dialog's OK
-  — Reject keeps the choice for the current page load but stores nothing, and
-  the dialog only re-asks on the next visit. Switching back to Expert removes
-  the cookie. Nothing else is ever stored.
+  (`model-compare-view=simple`, one year, scoped to this page's
+  directory): the cookie is only written after the dialog's OK — Reject
+  (or Escape) keeps the choice for the current page load but stores
+  nothing, so the dialog stays closed until the next page load, while a
+  stored consent that Expert later removes re-opens the dialog the next
+  time Simple is picked. Nothing else is ever stored.
 - **Off-peak deals** — the second table lists the top 10 models with
   scheduled discount windows (sub-1% discounts excluded), ranked by discount size; prices shown are the discounted
   off-peak rates. It is built from the catalog's `schedules` index, which is

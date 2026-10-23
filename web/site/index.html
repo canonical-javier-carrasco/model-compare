@@ -27,8 +27,10 @@
       <button type="button" data-priority="price">price</button>
       <button type="button" data-priority="quality">quality</button>
       <span id="generated-top" class="stamp"></span>
-      <button type="button" id="view-simple">Simple</button>
-      <button type="button" id="view-expert" class="active">
+      <button type="button" id="view-simple" aria-pressed="false">
+        Simple
+      </button>
+      <button type="button" id="view-expert" class="active" aria-pressed="true">
         Expert
       </button>
     </div>
@@ -252,10 +254,17 @@
         >canonical/model-compare</a
       >
     </footer>
-    <div id="cookie-dialog" hidden>
+    <div
+      id="cookie-dialog"
+      hidden
+      role="dialog"
+      aria-modal="true"
+      aria-label="Cookie consent for remembering your table layout"
+      tabindex="-1"
+    >
       <p>
-        This page stores one cookie ("view=simple") to remember your
-        table layout choice. Nothing is tracked or shared.
+        This page stores one cookie ("model-compare-view=simple") to
+        remember your table layout choice. Nothing is tracked or shared.
       </p>
       <div class="cookie-actions">
         <button type="button" id="cookie-reject">Reject</button>

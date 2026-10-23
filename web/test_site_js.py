@@ -10,13 +10,14 @@ helpers (tooltip sentence construction, formatters, guards) get real
 tests instead of code reading.
 
 Limitation: the pure helpers, the built-element shape (endpointRow,
-render on a stub tbody), and the named render helpers that mutate
-captured elements (renderFooter's revision/stamp flow) are exercised;
-tooltip delivery (the td.title assignment inside render), event wiring,
-and the fetch-driven flow are not: the fetch stub rejects so init()'s
-render() never runs and there is no querySelector support. The stubs
-cache one element per id, so a driver can read back what a helper wrote
-through els or document.getElementById.
+render on a stub tbody), the named render helpers that mutate captured
+elements (renderFooter's revision/stamp flow), and the event wiring
+(stubs record handlers per type; a driver fires clicks on the
+view/consent buttons) are exercised; tooltip delivery (the td.title
+assignment inside render) and the fetch-driven flow are not: the fetch
+stub rejects so init()'s render() never runs and querySelectorAll
+returns []. The stubs cache one element per id, so a driver can read
+back what a helper wrote through els or document.getElementById.
 """
 
 import json
@@ -254,17 +255,73 @@ def test_opencode_headings_keep_version_text_drop_badge():
 
 def test_cookie_dialog_markup():
     html = SITE_HTML.read_text()
-    assert '<div id="cookie-dialog" hidden>' in html
+    assert re.search(r'<div[^>]*id="cookie-dialog"[^>]*hidden', html)
     assert 'id="cookie-ok"' in html
     assert 'id="cookie-reject"' in html
+
+
+def test_cookie_dialog_a11y_markup():
+    # The consent dialog is a real modal to assistive tech and can take
+    # focus programmatically; the view toggles expose their state.
+    html = SITE_HTML.read_text()
+    dialog = re.search(r'<div[^>]*id="cookie-dialog"[^>]*>', html, re.DOTALL).group(0)
+    assert 'role="dialog"' in dialog
+    assert 'aria-modal="true"' in dialog
+    assert "aria-label=" in dialog
+    assert 'tabindex="-1"' in dialog
+    simple = re.search(r'<button[^>]*id="view-simple"[^>]*>', html).group(0)
+    expert = re.search(r'<button[^>]*id="view-expert"[^>]*>', html).group(0)
+    assert 'aria-pressed="false"' in simple
+    assert 'aria-pressed="true"' in expert
 
 
 def test_top_stamp_reads_last_refresh():
     # "last refresh: date, time" -- the browser's locale formatting
     # prefixed with the label. The footer keeps its bare stamp.
-    script = SCRIPT_JS.read_text()
-    assert 'els.generatedTop.textContent = "last refresh: " + stamp;' in script
-    assert "els.generated.textContent = stamp;" in script
+    # Behavioral, not source-text: renderFooter drives both stamps.
+    out = run_js(
+        "(function () {"
+        "  renderFooter({"
+        "    generated_at: '2026-09-28T06:00:00Z',"
+        "    source_revision: 'abc1234',"
+        "  });"
+        "  return {"
+        "    top: document.getElementById('generated-top').textContent,"
+        "    footer: document.getElementById('generated').textContent,"
+        "  };"
+        "})()"
+    )
+    assert out["top"].startswith("last refresh: ")
+    assert out["footer"] in out["top"]
+
+
+def test_view_toggles_reflect_aria_pressed():
+    # applyView keeps aria-pressed in sync with the active view so the
+    # toggle state is announced, not just styled.
+    out = run_js(
+        "(function () {"
+        "  var simple = document.getElementById('view-simple');"
+        "  var expert = document.getElementById('view-expert');"
+        "  var before = {"
+        "    simple: simple.getAttribute('aria-pressed'),"
+        "    expert: expert.getAttribute('aria-pressed'),"
+        "  };"
+        "  document.getElementById('view-simple').dispatchEvent('click');"
+        "  var afterSimple = {"
+        "    simple: simple.getAttribute('aria-pressed'),"
+        "    expert: expert.getAttribute('aria-pressed'),"
+        "  };"
+        "  document.getElementById('view-expert').dispatchEvent('click');"
+        "  var afterExpert = {"
+        "    simple: simple.getAttribute('aria-pressed'),"
+        "    expert: expert.getAttribute('aria-pressed'),"
+        "  };"
+        "  return { before: before, afterSimple: afterSimple, afterExpert: afterExpert };"
+        "})()"
+    )
+    assert out["before"] == {"simple": "false", "expert": "true"}
+    assert out["afterSimple"] == {"simple": "true", "expert": "false"}
+    assert out["afterExpert"] == {"simple": "false", "expert": "true"}
 
 
 # ---------------------------------------------------------------------------
@@ -917,10 +974,11 @@ def test_should_ask_for_consent_fresh_load():
 
 
 def test_should_ask_for_consent_stored_consent():
-    # A stored view=simple cookie means consent was given: no dialog.
+    # A stored model-compare-view=simple cookie means consent was given:
+    # no dialog.
     assert (
         run_js(
-            '(function () { document.cookie = "view=simple";'
+            '(function () { document.cookie = "model-compare-view=simple";'
             " return shouldAskForConsent(); })()"
         )
         is False
@@ -959,14 +1017,15 @@ def test_view_cookie_round_trip():
     out = run_js(
         "(function () {"
         "  writeViewCookie();"
-        "  var afterWrite = { value: readCookie('view'), header: document.cookie };"
+        "  var afterWrite = { value: readCookie('model-compare-view'), header: document.cookie };"
         "  clearViewCookie();"
-        "  var afterClear = { value: readCookie('view'), asks: shouldAskForConsent(),"
+        "  var afterClear = { value: readCookie('model-compare-view'), asks: shouldAskForConsent(),"
         "    header: document.cookie };"
         "  return { afterWrite: afterWrite, afterClear: afterClear };"
         "})()"
     )
     assert out["afterWrite"]["value"] == "simple"
+    assert "model-compare-view=simple" in out["afterWrite"]["header"]
     assert "max-age=31536000" in out["afterWrite"]["header"]
     assert "SameSite=Lax" in out["afterWrite"]["header"]
     assert "path=/" in out["afterWrite"]["header"]
@@ -977,6 +1036,163 @@ def test_view_cookie_round_trip():
     assert "max-age=0" in out["afterClear"]["header"]
     assert "SameSite=Lax" in out["afterClear"]["header"]
     assert "path=/" in out["afterClear"]["header"]
+
+
+def test_consent_wiring_ok_writes_cookie_only():
+    # Click-level consent contract (the helpers alone do not prove the
+    # wiring): firing the real buttons proves which handler is bound to
+    # which element. Simple opens the dialog and stores nothing; only
+    # the dialog's OK writes the cookie; Expert removes it; Reject
+    # stores nothing and silences the dialog for this page load; a
+    # stored-then-removed consent re-asks.
+    out = run_js(
+        "(function () {"
+        "  var dlg = document.getElementById('cookie-dialog');"
+        "  var simple = document.getElementById('view-simple');"
+        "  var expert = document.getElementById('view-expert');"
+        "  var ok = document.getElementById('cookie-ok');"
+        "  var reject = document.getElementById('cookie-reject');"
+        "  var state = function () {"
+        "    return { dialogHidden: dlg.hidden,"
+        "             cookie: readCookie('model-compare-view') };"
+        "  };"
+        "  expert.dispatchEvent('click');"
+        "  var afterExpertFirst = state();"
+        "  simple.dispatchEvent('click');"
+        "  var afterSimple = state();"
+        "  ok.dispatchEvent('click');"
+        "  var afterOk = state();"
+        "  var okHeader = document.cookie;"
+        "  expert.dispatchEvent('click');"
+        "  var afterExpert = state();"
+        "  simple.dispatchEvent('click');"
+        "  var reAsk = state();"
+        "  reject.dispatchEvent('click');"
+        "  var afterReject = state();"
+        "  simple.dispatchEvent('click');"
+        "  var afterRejectSimple = state();"
+        "  return { afterExpertFirst: afterExpertFirst, afterSimple: afterSimple,"
+        "    afterOk: afterOk, okHeader: okHeader, afterExpert: afterExpert,"
+        "    reAsk: reAsk, afterReject: afterReject,"
+        "    afterRejectSimple: afterRejectSimple };"
+        "})()"
+    )
+    # Expert-first never opens the dialog (nothing to consent to).
+    assert out["afterExpertFirst"] == {"dialogHidden": True, "cookie": None}
+    # Simple asks; it must NOT write the cookie itself.
+    assert out["afterSimple"] == {"dialogHidden": False, "cookie": None}
+    # Only the dialog's OK stores consent and closes the dialog.
+    assert out["afterOk"]["dialogHidden"] is True
+    assert out["afterOk"]["cookie"] == "simple"
+    assert "model-compare-view=simple" in out["okHeader"]
+    # Expert removes the cookie (and never re-opens the dialog).
+    assert out["afterExpert"] == {"dialogHidden": True, "cookie": None}
+    # OK -> Expert -> Simple asks again: no consent decision is stored.
+    assert out["reAsk"] == {"dialogHidden": False, "cookie": None}
+    # Reject stores nothing but silences the dialog for this page load.
+    assert out["afterReject"] == {"dialogHidden": True, "cookie": None}
+    assert out["afterRejectSimple"] == {"dialogHidden": True, "cookie": None}
+
+
+def test_view_cookie_scoped_to_page_directory():
+    # canonical.github.io hosts every project page on one origin, so the
+    # preference cookie must be scoped to this page's directory and
+    # carry a project-specific name: a sibling project's "view" cookie
+    # (or a leaked path=/ cookie) must not reach readCookie.
+    out = run_js(
+        "(function () {"
+        "  var real = window.location.href;"
+        "  window.location.href ="
+        "    'https://canonical.github.io/model-compare/index.html';"
+        "  writeViewCookie();"
+        "  var header = document.cookie;"
+        "  var value = readCookie('model-compare-view');"
+        "  clearViewCookie();"
+        "  window.location.href = real;"
+        "  return { header: header, value: value };"
+        "})()"
+    )
+    assert out["value"] == "simple"
+    assert "model-compare-view=simple" in out["header"]
+    assert "path=/model-compare/" in out["header"]
+
+
+def test_view_cookie_secure_only_in_secure_context():
+    # Secure keeps the preference off plaintext transport on the https
+    # deploy; it is added only where the browser reports a secure
+    # context (localhost previews count; a plain-http LAN preview does
+    # not, and the cookie must keep working there).
+    out = run_js(
+        "(function () {"
+        "  writeViewCookie();"
+        "  var plain = document.cookie;"
+        "  clearViewCookie();"
+        "  window.isSecureContext = true;"
+        "  writeViewCookie();"
+        "  var secure = document.cookie;"
+        "  clearViewCookie();"
+        "  var secureClear = document.cookie;"
+        "  delete window.isSecureContext;"
+        "  return { plain: plain, secure: secure, secureClear: secureClear };"
+        "})()"
+    )
+    assert "model-compare-view=simple" in out["plain"]
+    assert "Secure" not in out["plain"]
+    assert "model-compare-view=simple" in out["secure"]
+    assert "; Secure" in out["secure"]
+    # The secure write and its delete still agree on the other
+    # attributes, so deletion works there too.
+    assert "SameSite=Lax" in out["secure"]
+    assert "max-age=0" in out["secureClear"]
+    assert "SameSite=Lax" in out["secureClear"]
+    assert "; Secure" in out["secureClear"]
+
+
+def test_cookie_dialog_focus_moves_on_show_and_back():
+    # Keyboard/AT contract: showing the dialog moves focus into it
+    # (it carries tabindex="-1"); OK, Reject and Escape all return
+    # focus to the toggle that opened it.
+    out = run_js(
+        "(function () {"
+        "  var dlg = document.getElementById('cookie-dialog');"
+        "  var simple = document.getElementById('view-simple');"
+        "  simple.dispatchEvent('click');"
+        "  var onShow = document.activeElement === dlg;"
+        "  document.getElementById('cookie-ok').dispatchEvent('click');"
+        "  var onOk = document.activeElement === simple;"
+        "  simple.dispatchEvent('click');"
+        "  document.getElementById('cookie-reject').dispatchEvent('click');"
+        "  var onReject = document.activeElement === simple;"
+        "  simple.dispatchEvent('click');"
+        "  dlg.dispatchEvent('keydown', { key: 'Escape' });"
+        "  var onEscape = document.activeElement === simple;"
+        "  return { onShow: onShow, onOk: onOk, onReject: onReject,"
+        "    onEscape: onEscape };"
+        "})()"
+    )
+    assert out == {"onShow": True, "onOk": True, "onReject": True, "onEscape": True}
+
+
+def test_cookie_dialog_escape_dismisses_without_storing():
+    # Escape is a dismissal, not a consent: nothing is stored and the
+    # dialog is not re-opened by the suppression this page load.
+    out = run_js(
+        "(function () {"
+        "  var dlg = document.getElementById('cookie-dialog');"
+        "  var simple = document.getElementById('view-simple');"
+        "  simple.dispatchEvent('click');"
+        "  dlg.dispatchEvent('keydown', { key: 'Escape' });"
+        "  var afterEscape = {"
+        "    hidden: dlg.hidden,"
+        "    cookie: readCookie('model-compare-view'),"
+        "  };"
+        "  simple.dispatchEvent('click');"
+        "  var afterResimple = { hidden: dlg.hidden };"
+        "  return { afterEscape: afterEscape, afterResimple: afterResimple };"
+        "})()"
+    )
+    assert out["afterEscape"] == {"hidden": True, "cookie": None}
+    assert out["afterResimple"] == {"hidden": True}
 
 
 def test_should_ask_for_consent_reask_after_revoke():
@@ -1010,16 +1226,16 @@ def test_should_ask_for_consent_reask_after_revoke():
 
 def test_read_cookie_parses_header_shaped_string():
     out = run_js(
-        '(function () { document.cookie = "a=1; view=simple; b=2";'
-        ' return { view: readCookie("view"), missing: readCookie("nope") };'
+        '(function () { document.cookie = "a=1; model-compare-view=simple; b=2";'
+        ' return { view: readCookie("model-compare-view"), missing: readCookie("nope") };'
         "})()"
     )
     assert out == {"view": "simple", "missing": None}
     # An empty cookie value carries no consent (and matches what a real
     # browser reports after the max-age=0 deletion): read as absent.
     out = run_js(
-        '(function () { document.cookie = "view=; max-age=0";'
-        ' return readCookie("view"); })()'
+        '(function () { document.cookie = "model-compare-view=; max-age=0";'
+        ' return readCookie("model-compare-view"); })()'
     )
     assert out is None
 

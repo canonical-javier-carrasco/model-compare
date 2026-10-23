@@ -14,10 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quality, in, out, discount and age, spells its headers out
   (quality, discount; price columns keep the dollar units) and hides the
   legend entries that explain columns it does not show. The choice persists
-  via a consent-first preference cookie (`view=simple`, one year): the cookie
-  is written only after the dialog's OK, Reject stores nothing (the choice
-  lasts one page load), switching back to Expert removes the cookie, and the
-  dialog only re-asks when no consent decision is stored.
+  via a consent-first preference cookie (`model-compare-view=simple`, one
+  year, scoped to the page's directory, `Secure` on secure contexts): the
+  cookie is written only after the dialog's OK, Reject or Escape stores
+  nothing (the choice lasts one page load), switching back to Expert removes
+  the cookie, and the dialog only re-asks when no consent decision is
+  stored. The dialog is a real modal to assistive tech
+  (`role="dialog"`/`aria-modal`, focus moves in and back out), and the
+  toggles expose their state via `aria-pressed`.
 
 ### Changed
 

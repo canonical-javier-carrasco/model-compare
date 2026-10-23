@@ -35,7 +35,7 @@
       // user accepts in the dialog. Reject keeps the view for this page
       // load but stores nothing, and it suppresses re-asking only until
       // the next page load. Nothing else is ever stored.
-      var COOKIE_NAME = "view";
+      var COOKIE_NAME = "model-compare-view";
       var consentRejected = false;
 
       function readCookie(name) {
@@ -45,7 +45,8 @@
           if (kv[0] === name) {
             // An empty value carries no consent. (A real browser drops
             // the cookie entirely after the max-age=0 deletion; the
-            // retained "view=" string is what the test stub reports.)
+            // retained "model-compare-view=" string is what the test
+            // stub reports.)
             var value = kv.slice(1).join("=");
             return value === "" ? null : value;
           }
@@ -53,16 +54,32 @@
         return null;
       }
 
-      function writeViewCookie() {
-        // One year, SameSite=Lax: a layout preference needs neither
-        // cross-site access nor a Secure flag discussion -- GitHub Pages
-        // serves https, and Lax is enough since only this page reads it.
-        document.cookie =
-          COOKIE_NAME + "=simple; max-age=31536000; SameSite=Lax; path=/";
+      // Attributes shared by the write and the delete, so deletion
+      // always matches the write (a mismatch silently breaks removal).
+      // The path is scoped to this page's directory: canonical.github.io
+      // serves every project page from one origin, and a path=/ cookie
+      // with a generic name would leak to — and collide with — sibling
+      // projects. Secure is added only where the browser reports a
+      // secure context (the https deploy; localhost previews count as
+      // secure, a plain-http LAN preview does not and must keep
+      // working).
+      function cookiePath() {
+        return new URL(".", window.location.href).pathname;
       }
-
+      function cookieAttrs() {
+        return (
+          "; SameSite=Lax; path=" +
+          cookiePath() +
+          (window.isSecureContext ? "; Secure" : "")
+        );
+      }
+      function writeViewCookie() {
+        // One year: a layout preference, not a session.
+        document.cookie =
+          COOKIE_NAME + "=simple; max-age=31536000" + cookieAttrs();
+      }
       function clearViewCookie() {
-        document.cookie = COOKIE_NAME + "=; max-age=0; SameSite=Lax; path=/";
+        document.cookie = COOKIE_NAME + "=; max-age=0" + cookieAttrs();
       }
 
       // The dialog asks only when no consent decision is stored: not
@@ -76,12 +93,13 @@
       function applyView() {
         var simple = view === "simple";
         document.body.classList.toggle("view-simple", simple);
-        document
-          .getElementById("view-simple")
-          .classList.toggle("active", simple);
-        document
-          .getElementById("view-expert")
-          .classList.toggle("active", !simple);
+        var simpleBtn = document.getElementById("view-simple");
+        var expertBtn = document.getElementById("view-expert");
+        simpleBtn.classList.toggle("active", simple);
+        expertBtn.classList.toggle("active", !simple);
+        // The toggle state is announced, not just styled.
+        simpleBtn.setAttribute("aria-pressed", String(simple));
+        expertBtn.setAttribute("aria-pressed", String(!simple));
       }
 
       function setView(next) {
@@ -804,19 +822,34 @@
         if (readCookie(COOKIE_NAME) === "simple") view = "simple";
         applyView();
 
+        // Focus moves into the dialog when it opens (it carries
+        // tabindex="-1") and back to the toggle that opened it when it
+        // closes, so keyboard and screen-reader users see the
+        // conversation. Escape dismisses without storing anything.
+        function openConsentDialog() {
+          var dlg = document.getElementById("cookie-dialog");
+          dlg.hidden = false;
+          dlg.focus();
+        }
+        function closeConsentDialog() {
+          var dlg = document.getElementById("cookie-dialog");
+          if (dlg.hidden) return;
+          dlg.hidden = true;
+          document.getElementById("view-simple").focus();
+        }
         document
           .getElementById("view-simple")
           .addEventListener("click", function () {
             setView("simple");
             if (shouldAskForConsent()) {
-              document.getElementById("cookie-dialog").hidden = false;
+              openConsentDialog();
             }
           });
         document
           .getElementById("view-expert")
           .addEventListener("click", function () {
             setView("expert");
-            document.getElementById("cookie-dialog").hidden = true;
+            closeConsentDialog();
             if (readCookie(COOKIE_NAME) === "simple") clearViewCookie();
           });
         document
@@ -824,13 +857,21 @@
           .addEventListener("click", function () {
             writeViewCookie();
             consentRejected = false;
-            document.getElementById("cookie-dialog").hidden = true;
+            closeConsentDialog();
           });
         document
           .getElementById("cookie-reject")
           .addEventListener("click", function () {
             consentRejected = true;
-            document.getElementById("cookie-dialog").hidden = true;
+            closeConsentDialog();
+          });
+        document
+          .getElementById("cookie-dialog")
+          .addEventListener("keydown", function (ev) {
+            if (ev.key !== "Escape") return;
+            // A dismissal is not a consent: same contract as Reject.
+            consentRejected = true;
+            closeConsentDialog();
           });
 
         document
