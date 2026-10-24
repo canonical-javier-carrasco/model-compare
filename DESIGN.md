@@ -257,12 +257,24 @@ only its `priorities` mapping (rows with a string `model` id, optional
 `quality_index`, optional `discount`), validating nothing about
 `schema_version` — a v2 `data.json` therefore needs no downstream work. The
 catalog's strict consumer is the [model-compare OpenCode
-plugin](https://www.npmjs.com/package/model-compare-opencode-plugin), which
-rejects any catalog whose `schema_version` is not `2` and degrades gracefully
-(cached older document, then no pick, with warnings); a v3-accepting plugin
-release must land before or with the first v3 publish. Both facts were
-investigated against the live consumer repos on 2026-10-20 — see
-`docs/superpowers/notes/2026-10-20-downstream-investigations.md`. Same
+plugin](https://www.npmjs.com/package/model-compare-opencode-plugin). Its
+only published release (npm 0.1.3, `latest` as of 2026-10-23; the
+2026-10-20 investigation audited 0.1.1) pins `schema_version === 2` and
+degrades gracefully on anything else (cached older document, then no pick,
+with warnings). Its default `auto` source runs the vendored upstream pin
+(`vendor/model_compare.py`, byte-identical to upstream v0.3.1, which emits
+v2 catalogs), so default installs are unaffected by catalog schema bumps;
+the vendored pin is re-pinned via the plugin's `sync-vendor.mjs` flow when
+upstream cuts a release. The plugin's remote source fetches the published
+catalog and has therefore rejected every published catalog since the v3
+publish — the v3-accepting plugin release the v3 cutover required never
+shipped — and v4 extends that rejection: remote-source users keep serving
+their last cached document until a plugin release accepts the published
+schema and is installed. Both facts were investigated against the live
+consumer repos on 2026-10-20 — see
+`docs/superpowers/notes/2026-10-20-downstream-investigations.md` — and the
+npm 0.1.3 source (`src/core/catalog.ts` rejects any document whose
+`schema_version` is not `2`) was re-verified on 2026-10-23. Same
 inputs still produce the same output apart from `generated_at` and the age
 score (`age_days`/`listed_at` use UTC date precision, but `scores.age` decays
 continuously, so two runs on the same day differ slightly in `scores.age`).

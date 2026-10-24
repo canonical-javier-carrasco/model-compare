@@ -94,6 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AA_API_KEY` set it fails closed unless the catalog shows live AA data
   (`mode` "aa" with `matched_aa` > 0) — a rejected key or an AA-less chain
   can no longer deploy silently; keyless publishes are never gated.
+- Downstream note: the published catalog is now schema v4. The OpenCode
+  plugin's only published release (npm 0.1.3) accepts v2 catalogs only and
+  has therefore served remote-source users their last cached document since
+  the v3 publish — the v3-accepting release the v3 cutover required never
+  shipped. Its default vendored source (`auto`) is unaffected: it runs a
+  pinned upstream v0.3.1 copy that emits v2 catalogs. A plugin release
+  accepting the published schema is needed before remote-source users see
+  fresh picks again.
 
 ### Fixed
 
