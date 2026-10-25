@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-25
 
 ### Added
 
@@ -65,7 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "differs from OpenRouter snapshot (...)" and the CLI footer counts the
   rows.
 - Site: QUAL cells carry a provenance tooltip ("AA intelligence index -
-  source: ..., as of ...", the drift note appended where flagged) and the
+  source: aa, checked 13:15Z" / "source: openrouter, as of 2026-10-17",
+  the drift note appended where flagged) and the
   legend explains it; `data.json` files without the new fields keep
   rendering.
 

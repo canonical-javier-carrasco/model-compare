@@ -84,7 +84,7 @@ QUALITY_CATALOG_CACHE = "published-catalog"
 # A published catalog generated more than this many days ago is stale:
 # warn but use -- the records' as_of makes the staleness visible downstream.
 QUALITY_CATALOG_MAX_AGE_DAYS = 14
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
 # opencode expects provider-qualified model ids: openrouter/<provider/model>.
