@@ -582,6 +582,18 @@ def test_validate_catalog_rejects_bad_quality_provenance(mutate, field):
         bsd.validate_catalog(doc)
 
 
+@pytest.mark.parametrize("bad", [-50.0, 200.0, 1e308, float("inf"), "45.1"])
+def test_validate_catalog_rejects_out_of_range_models_quality(bad):
+    # models[].quality is an AA intelligence index and carries the same
+    # 0..100 range the schedules rows enforce -- the validator used to
+    # range-check schedules[].quality only, so a catalog with
+    # models[0].quality = -50.0 passed.
+    doc = make_catalog()
+    doc["models"][0]["quality"] = bad
+    with pytest.raises(ValueError, match="quality"):
+        bsd.validate_catalog(doc)
+
+
 @pytest.mark.parametrize(
     "mutate, field",
     [
@@ -1473,6 +1485,10 @@ def _schedule_entry(model_id, discount, off_in=0.66, off_out=1.98):
         "name": model_id.split("/")[1],
         "context": 262144,
         "quality": None,
+        # Provenance for the deals QUAL tooltip: null like a row whose
+        # quality came without any (the producer emits the keys always).
+        "quality_source": None,
+        "quality_as_of": None,
         "score": None,
         "max_discount": discount,
         "sched_note": f"-{discount:.0%}",
@@ -1703,6 +1719,10 @@ def test_validate_catalog_schedules_entries():
         ("context", "262144"),
         ("context", True),
         ("context", float("nan")),
+        ("quality_source", "scrape"),
+        ("quality_source", 42),
+        ("quality_as_of", 42),
+        ("quality_as_of", ["20261017"]),
     ):
         doc = make_catalog()
         schedules = make_schedules()
@@ -1717,6 +1737,18 @@ def test_validate_catalog_schedules_entries():
     schedules[0]["context"] = None
     doc["schedules"] = schedules
     bsd.validate_catalog(doc)  # must not raise
+    # Provenance (QUAL tooltip): null or the winner's label and stamp; the
+    # keys are required like the rest (the producer always emits them).
+    doc = make_catalog()
+    schedules = make_schedules()
+    schedules[0].update(
+        quality=50.0, quality_source="catalog", quality_as_of="20261017"
+    )
+    doc["schedules"] = schedules
+    bsd.validate_catalog(doc)  # must not raise
+    del schedules[0]["quality_source"]
+    with pytest.raises(ValueError, match="quality_source"):
+        bsd.validate_catalog(doc)
 
 
 def test_project_schedules():
@@ -1732,7 +1764,21 @@ def test_project_schedules():
     assert big["input_per_1m"] == 0.66  # cheapest off-peak prices
     assert big["output_per_1m"] == 1.98
     assert big["quality"] is None and big["score"] is None
+    # Provenance rides through to data.json verbatim (null without a
+    # winner), so the deals QUAL tooltip can render on the site.
+    assert big["quality_source"] is None and big["quality_as_of"] is None
     assert big["context"] == 262144
+    schedules = make_schedules()
+    schedules[0].update(
+        quality=30.0, quality_source="catalog", quality_as_of="20261017"
+    )
+    catalog["schedules"] = schedules
+    (projected,) = [
+        row for row in bsd.project_schedules(catalog) if row["model"] == "acme/big-deal"
+    ]
+    assert projected["quality"] == 30.0
+    assert projected["quality_source"] == "catalog"
+    assert projected["quality_as_of"] == "20261017"
 
 
 def test_project_schedules_top10_cap():

@@ -209,13 +209,13 @@ def check_aa_source(catalog_path: Path) -> None:
     """With AA_API_KEY set, fail unless the AA API itself produced quality.
 
     sources.aa.mode records the run's quality chain: "aa" when the AA API
-    was consulted, "catalog" for published-catalog hydration (keyed runs
-    never hydrate), "none" when neither tier yielded anything. A keyed
-    publish must have live AA data standing behind its quality: mode "aa"
-    AND at least one AA-matched model (matched_aa > 0) -- a rejected key,
-    an empty result, a catalog-or-OR-only chain, an unknown mode or a
-    malformed count all fail closed. Without a key the catalog chain (or
-    OR-only data) is expected, so the gate never raises.
+    returned usable entries, "catalog" for published-catalog hydration
+    (keyed runs never hydrate), "none" when neither tier produced data. A
+    keyed publish must have live AA data standing behind its quality:
+    mode "aa" AND at least one AA-matched model (matched_aa > 0) -- a
+    rejected key, an empty result, a catalog-or-OR-only chain, an unknown
+    mode or a malformed count all fail closed. Without a key the catalog
+    chain (or OR-only data) is expected, so the gate never raises.
     """
     if not os.environ.get("AA_API_KEY"):
         return

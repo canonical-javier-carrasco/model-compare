@@ -186,17 +186,21 @@
 
       // QUAL provenance: one row's quality as_of, rendered the way the CLI
       // footer's _footer_as_of renders it (display-only duplication, keep
-      // them in sync). OpenRouter's benchmark date is YYYYMMDD and renders
-      // as a plain date ("2026-10-17"); live AA records carry one fetch
-      // timestamp for the whole fetch (checked today), so they show the
-      // time of day only ("checked 13:15Z"); catalog rows carry a full ISO
-      // stamp ("2026-10-23 13:15Z"). An unusable stamp returns null and
-      // the caller drops the "as of" clause, like the CLI footer drops the
-      // stamp. Stamps in data.json are UTC, so the UTC getters are exact.
+      // them in sync). YYYYMMDD stamps (OpenRouter's benchmark date, and
+      // catalog rows hydrated from OR rows) render as a plain date
+      // ("2026-10-17") for any source -- a date-only stamp never fabricates
+      // a time of day. Live AA records carry one fetch timestamp for the
+      // whole fetch (checked today), so they show the time of day only
+      // ("13:15Z"); other ISO stamps show the full form ("2026-10-23
+      // 13:15Z"). The function returns the bare stamp: the caller owns the
+      // connective word (the CLI footer's stamp_words -- "checked" for aa,
+      // "as of" elsewhere). An unusable stamp returns null and the caller
+      // drops the clause, like the CLI footer drops the stamp. Stamps in
+      // data.json are UTC, so the UTC getters are exact.
       function qualityAsOf(source, value) {
         if (value === null || value === undefined || value === "") return null;
         var text = String(value);
-        if (source === "openrouter" && text.length === 8 && /^\d+$/.test(text)) {
+        if (text.length === 8 && /^\d+$/.test(text)) {
           return text.slice(0, 4) + "-" + text.slice(4, 6) + "-" + text.slice(6);
         }
         var parsed = new Date(text);
@@ -206,7 +210,7 @@
         };
         var clock =
           pad(parsed.getUTCHours()) + ":" + pad(parsed.getUTCMinutes()) + "Z";
-        if (source === "aa") return "checked " + clock;
+        if (source === "aa") return clock;
         return (
           parsed.getUTCFullYear() +
           "-" +
@@ -222,18 +226,21 @@
       // label verbatim -- display strings from data.json are shown as-is)
       // and when it was checked, plus the drift note when the producer
       // flagged the row as disagreeing with OpenRouter's snapshot by >= 3
-      // index points. The note names the row's own OR pair; a flag without
-      // a finite check value cannot name what it disagrees with, so the
-      // note is withheld rather than leaking "NaN". Rows without
-      // provenance (older data.json files, unmatched models) return null:
-      // the cell keeps its bare value and the column header's title
-      // carries the hint.
+      // index points. The connective word mirrors the CLI footer's
+      // stamp_words ("checked" for aa, "as of" elsewhere). The note names
+      // the row's own OR pair; a flag without a finite check value cannot
+      // name what it disagrees with, so the note is withheld rather than
+      // leaking "NaN". Rows without provenance (older data.json files,
+      // unmatched models) return null: the cell keeps its bare value and
+      // the column header's title carries the hint.
       function qualityTooltip(row) {
         var source = row.quality_source;
         if (!source) return null;
         var text = "AA intelligence index - source: " + String(source);
         var asOf = qualityAsOf(source, row.quality_as_of);
-        if (asOf !== null) text += ", as of " + asOf;
+        if (asOf !== null) {
+          text += (source === "aa" ? ", checked " : ", as of ") + asOf;
+        }
         if (row.quality_drift === true && Number.isFinite(row.quality_or_index)) {
           var orDate = qualityAsOf("openrouter", row.quality_or_as_of);
           text +=

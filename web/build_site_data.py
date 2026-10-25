@@ -154,6 +154,11 @@ CATALOG_SCHEDULE_ENTRY_KEYS = (
     "name",
     "context",
     "quality",
+    # Provenance for the site's QUAL tooltip (data.json v2 additive): the
+    # winning quality tier's label and stamp, null when the row's quality
+    # came without any.
+    "quality_source",
+    "quality_as_of",
     "score",
     "max_discount",
     "sched_note",
@@ -167,10 +172,11 @@ CATALOG_OVERALL_KEYS = ("balanced", "price", "quality")
 CATALOG_AA_KEYS = ("intelligence_index", "coding_index", "agentic_index")
 CATALOG_QUALITY_MATCH_VALUES = ("aa", "catalog", "openrouter")
 # sources.aa.mode is the run's quality chain, not a match outcome: "aa"
-# when the AA API was consulted (keyed runs), "catalog" when unkeyed runs
-# hydrated the published catalog, "none" when neither tier yielded
-# anything. OpenRouter's benchmarks are the chain's shared last resort and
-# carry their own count (matched_openrouter), never a mode.
+# when the AA API returned usable entries (a keyed run whose fetch failed
+# publishes "none"), "catalog" when unkeyed runs hydrated the published
+# catalog, "none" when neither tier produced data. OpenRouter's benchmarks
+# are the chain's shared last resort and carry their own count
+# (matched_openrouter), never a mode.
 CATALOG_AA_MODES = ("aa", "catalog", "none")
 
 
@@ -701,6 +707,11 @@ def validate_catalog(document) -> None:
         bad_aa = [key for key in CATALOG_AA_KEYS if not _is_aa_value(aa[key])]
         if bad_aa:
             raise ValueError(f"models[{i}] aa out of range: {', '.join(bad_aa)}")
+        # The same 0..100 range the schedules rows enforce: quality is an
+        # AA intelligence index, never a negative or astronomically large
+        # number.
+        if entry["quality"] is not None and not _is_aa_value(entry["quality"]):
+            raise ValueError(f"models[{i}] quality must be a number in 0..100 or null")
         if (
             entry["quality_match"] is not None
             and entry["quality_match"] not in CATALOG_QUALITY_MATCH_VALUES
@@ -810,6 +821,19 @@ def validate_catalog(document) -> None:
             raise ValueError(
                 f"schedules[{i}] quality must be a number in 0..100 or null"
             )
+        # Provenance (data.json v2 additive): presence-checked via
+        # CATALOG_SCHEDULE_ENTRY_KEYS, value types pinned here -- the label
+        # is one of the quality match values or null, the stamp a string or
+        # null (same shapes as models[].quality_match/quality_as_of).
+        if (
+            entry["quality_source"] is not None
+            and entry["quality_source"] not in CATALOG_QUALITY_MATCH_VALUES
+        ):
+            raise ValueError(f"schedules[{i}] has unknown quality_source")
+        if entry["quality_as_of"] is not None and not isinstance(
+            entry["quality_as_of"], str
+        ):
+            raise ValueError(f"schedules[{i}] quality_as_of must be a string or null")
         if entry["score"] is not None and not _is_score(entry["score"]):
             raise ValueError(f"schedules[{i}] score must be a score in [0, 1] or null")
         if entry["sched_detail"] is not None and not isinstance(
@@ -1107,6 +1131,11 @@ def project_schedules(catalog) -> list:
                     "sched_note": entry["sched_note"],
                     "sched_detail": entry["sched_detail"],
                     "quality": entry["quality"],
+                    # Provenance for the deals QUAL tooltip (presence is
+                    # pinned by validate_catalog; the site degrades rows
+                    # without it silently).
+                    "quality_source": entry["quality_source"],
+                    "quality_as_of": entry["quality_as_of"],
                     "score": entry["score"],
                     "input_per_1m": entry["offpeak"]["input_per_1m"],
                     "output_per_1m": entry["offpeak"]["output_per_1m"],

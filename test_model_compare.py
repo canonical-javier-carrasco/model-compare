@@ -4225,6 +4225,9 @@ def test_compute_scores_and_build_schedules_keep_quality_numeric():
     )
     entry = mc.build_schedules([model], make_args(), {"a/x": record}, {}, {})[0]
     assert entry["quality"] == 60.0
+    # The winner's provenance rides along for the site's QUAL tooltip.
+    assert entry["quality_source"] == "aa"
+    assert entry["quality_as_of"] is None
 
 
 def test_print_json_rows_carry_quality_source_and_as_of(capsys):
@@ -4263,7 +4266,12 @@ def _catalog_doc(models, schema_version=3, generated_at="2026-10-23T13:15:07+00:
 
 def test_catalog_quality_by_id_v4_passthrough(capsys):
     """v4 rows keep their recorded quality_as_of and source label verbatim;
-    unmatched rows (no value, no label) are skipped without a warning."""
+    unmatched rows (no value, no label) are skipped without a warning.
+
+    Producer-faithful stamps: aa rows carry the CI run's ISO fetch stamp,
+    OR rows its YYYYMMDD permaslug date (build_catalog never emits an ISO
+    stamp on an openrouter row).
+    """
     doc = _catalog_doc(
         [
             {
@@ -4276,7 +4284,7 @@ def test_catalog_quality_by_id_v4_passthrough(capsys):
                 "id": "acme/model-b",
                 "quality": 39.5,
                 "quality_match": "openrouter",
-                "quality_as_of": "2026-10-17T00:00:00+00:00",
+                "quality_as_of": "20261017",
             },
             {"id": "acme/model-c", "quality": None, "quality_match": None},
         ],
@@ -4291,7 +4299,7 @@ def test_catalog_quality_by_id_v4_passthrough(capsys):
         "acme/model-b": {
             "index": 39.5,
             "source": "openrouter",
-            "as_of": "2026-10-17T00:00:00+00:00",
+            "as_of": "20261017",
         },
     }
     assert capsys.readouterr().err == ""
@@ -4363,6 +4371,23 @@ def test_catalog_quality_by_id_malformed_never_raises(capsys):
         _catalog_doc([{"id": "acme/model-a", "quality": 45.1, "quality_match": None}]),
     ]
     for doc in bad_docs:
+        assert mc.catalog_quality_by_id(doc) == {}
+        assert "unexpected response shape" in capsys.readouterr().err
+
+
+def test_catalog_quality_by_id_out_of_range_quality_degrades(capsys):
+    """An out-of-range quality is poisoned data: hydration degrades the
+    whole artifact instead of feeding a bogus index to resolve_quality's
+    catalog tier, where a -50.0 would win and fabricate drift. The surface
+    is unkeyed runs -- only they hydrate from the published catalog."""
+    for bad in (-50.0, 200.0, 1e308):
+        doc = _catalog_doc(
+            [
+                {"id": "acme/model-a", "quality": 45.1, "quality_match": "aa"},
+                {"id": "acme/model-b", "quality": bad, "quality_match": "openrouter"},
+            ],
+            schema_version=4,
+        )
         assert mc.catalog_quality_by_id(doc) == {}
         assert "unexpected response shape" in capsys.readouterr().err
 
@@ -6341,6 +6366,18 @@ def test_run_unkeyed_catalog_down_falls_to_openrouter(monkeypatch, capsys):
         assert row["quality_source"] == "openrouter"
 
 
+def test_footer_as_of_date_only_stamp_any_source():
+    # A YYYYMMDD stamp renders as a plain date for ANY source -- catalog
+    # rows hydrated from OR rows carry the same date-only stamp and must
+    # not fall through parse_iso_datetime to a fabricated midnight time.
+    assert mc._footer_as_of("openrouter", "20261017") == "2026-10-17"
+    assert mc._footer_as_of("catalog", "20261017") == "2026-10-17"
+    assert mc._footer_as_of("aa", "2026-10-23T13:15:07+00:00") == "13:15Z"
+    assert mc._footer_as_of("catalog", "2026-10-23T13:15:07+00:00") == (
+        "2026-10-23 13:15Z"
+    )
+
+
 def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, capsys):
     # Keyed: the footer lists the index version, per-source counts and each
     # source's own as_of, plus the drift footnote for the AA-vs-OR gap.
@@ -6424,6 +6461,76 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     ) in pool_line
 
 
+def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
+    # Unkeyed: the hydrated catalog mixes stamp shapes exactly like the
+    # published artifact does -- OR rows carry the YYYYMMDD permaslug date,
+    # aa rows the CI run's ISO stamp, and both land in the one "our
+    # catalog" block. The footer picks the truly latest stamp per source
+    # (parsed instants, never string order: "20261017" sorts above every
+    # "2026-..." ISO string yet is not the fresher stamp) and renders a
+    # date-only stamp as a plain date -- never a fabricated midnight time.
+    models = [
+        make_model(id="acme/or-row", name="Acme: OR row"),
+        make_model(id="acme/aa-row", name="Acme: AA row"),
+    ]
+
+    def catalog_with(aa_stamp):
+        doc = _catalog_doc(
+            [
+                {
+                    "id": "acme/or-row",
+                    "quality": 30.0,
+                    "quality_match": "openrouter",
+                    "quality_as_of": "20261017",
+                },
+                {
+                    "id": "acme/aa-row",
+                    "quality": 45.1,
+                    "quality_match": "aa",
+                    "quality_as_of": aa_stamp,
+                },
+            ],
+            schema_version=4,
+        )
+        return {
+            "by_id": mc.catalog_quality_by_id(doc),
+            "generated_at": "2026-10-23T13:15:07+00:00",
+            "schema_version": 4,
+        }
+
+    # The aa row's ISO stamp is the fresher one: it wins despite the
+    # date-only stamp's lexicographic head start.
+    _stub_quality_run(
+        monkeypatch,
+        models,
+        catalog=catalog_with("2026-10-23T13:15:07+00:00"),
+        aa_raises=True,
+    )
+    assert mc.run(make_args(), models, False) == 0
+    pool_line = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("pool:")
+    )
+    assert "| quality: our catalog (2, as of 2026-10-23 13:15Z)" in pool_line
+
+    # The date-only stamp is the fresher one: it wins and renders as a
+    # plain date (the block ends at "2026-10-17)", never "00:00Z").
+    _stub_quality_run(
+        monkeypatch,
+        models,
+        catalog=catalog_with("2026-10-16T13:15:07+00:00"),
+        aa_raises=True,
+    )
+    assert mc.run(make_args(), models, False) == 0
+    pool_line = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("pool:")
+    )
+    assert "| quality: our catalog (2, as of 2026-10-17)" in pool_line
+
+
 def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys):
     # End-to-end: build_schedules consumes the quality record through
     # record["index"] -- a hydrated catalog row must never leak the dict
@@ -6448,6 +6555,51 @@ def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys
     assert sched["id"] == "acme/model-a"
     assert isinstance(sched["quality"], float)
     assert sched["quality"] == 42.0
+
+
+def test_run_unkeyed_catalog_schedules_quality_for_non_candidates(monkeypatch, capsys):
+    # build_schedules walks the same fallback chain resolve_quality walks,
+    # minus its AA tier: a schedules-only model (filtered out of the
+    # candidate pool by the context floor) that the hydrated catalog
+    # covers must get a numeric deals QUAL with catalog provenance -- the
+    # run-level chain label "catalog" and the row's own stamp, exactly
+    # like resolve_quality's catalog tier records it.
+    models = [
+        make_model(id="acme/candidate", name="Acme: Candidate"),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+        ),
+    ]
+    catalog_doc = _catalog_doc(
+        [
+            {
+                "id": "acme/sched-only",
+                "quality": 30.0,
+                "quality_match": "openrouter",
+                "quality_as_of": "20261017",
+            },
+        ],
+        schema_version=4,
+    )
+    catalog = {
+        "by_id": mc.catalog_quality_by_id(catalog_doc),
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schema_version": 4,
+    }
+    _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
+    args = make_args(catalog=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    published = json.loads(capsys.readouterr().out)
+    assert [entry["id"] for entry in published["models"]] == ["acme/candidate"]
+    (sched,) = published["schedules"]
+    assert sched["id"] == "acme/sched-only"
+    assert isinstance(sched["quality"], float)
+    assert sched["quality"] == 30.0
+    assert sched["quality_source"] == "catalog"
+    assert sched["quality_as_of"] == "20261017"
 
 
 def test_run_no_network_quality_blind_ranking_unchanged(monkeypatch, capsys):

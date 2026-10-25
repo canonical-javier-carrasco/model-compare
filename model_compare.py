@@ -1303,6 +1303,13 @@ def catalog_quality_by_id(doc) -> dict:
         if not math.isfinite(index):
             warn("published catalog returned an unexpected response shape")
             return {}
+        # The AA indexes run 0..100 (the range the catalog validator
+        # enforces on quality); an out-of-range value is poisoned data and
+        # degrades the whole artifact. The surface is unkeyed runs: only
+        # they hydrate from the published catalog.
+        if not 0.0 <= index <= 100.0:
+            warn("published catalog returned an unexpected response shape")
+            return {}
         if schema_version == 3:
             as_of = v3_as_of
         else:
@@ -2402,7 +2409,9 @@ def _per_1m(price_per_token: float) -> float:
     return round(price_per_token * 1_000_000.0, 6)
 
 
-def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
+def build_schedules(
+    models, args, quality_by_id, aa_by_id, balanced_by_id, catalog_quality=None
+):
     """Catalog-wide off-peak index built from the RAW model list (spec 5.4).
 
     Deliberately unfiltered by the candidate pool: sub-floor-context and
@@ -2410,6 +2419,12 @@ def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
     schedule models mostly sit below the 1M context floor). Router aliases
     (~ids) and malformed ids are excluded; :batch variants are included as
     distinct deals. Sorted by id.
+
+    Quality falls back through the same chain resolve_quality walks, minus
+    its AA tier (the AA lookup only ever matched candidates): candidate
+    records, then the hydrated catalog (unkeyed runs), then OpenRouter's
+    benchmark trio. Every schedule row carries the winner's provenance
+    (quality_source/quality_as_of) so the site's QUAL tooltip can render.
     """
     entries = []
     for model in models:
@@ -2435,12 +2450,37 @@ def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
         peak = max(windows, key=lambda window: window["blended"])
         offpeak = min(windows, key=lambda window: window["blended"])
         # quality_by_id values are records {"index", "source", ...}; the
-        # schedule row keeps the bare float index verbatim (never a dict).
+        # schedule row keeps the bare float index verbatim (never a dict)
+        # and echoes the winning record's provenance for the QUAL tooltip.
+        # Fallback chain mirrors resolve_quality's minus its AA tier:
+        # candidate record, hydrated catalog record (unkeyed runs; every
+        # hydrated record is relabeled with the run-level chain label
+        # "catalog", exactly like resolve_quality's catalog tier), then
+        # OpenRouter's benchmark trio (row label "openrouter").
         record = quality_by_id.get(model_id)
-        quality = record["index"] if isinstance(record, dict) else record
+        if isinstance(record, dict):
+            quality = record.get("index")
+            quality_source = record.get("source")
+            quality_as_of = record.get("as_of")
+        else:
+            quality = record
+            quality_source = None
+            quality_as_of = None
+        if quality is None and catalog_quality is not None:
+            catalog_record = catalog_quality.get(model_id)
+            if catalog_record is not None:
+                quality = catalog_record["index"]
+                quality_source = "catalog"
+                quality_as_of = catalog_record["as_of"]
         if quality is None:
             benchmark = aa_by_id.get(base_model_id(model_id)) or {}
             quality = benchmark.get("intelligence_index")
+            if quality is not None:
+                quality_source = "openrouter"
+                quality_as_of = benchmark.get("as_of")
+            else:
+                quality_source = None
+                quality_as_of = None
         name = model.get("name") or model_id
         entries.append(
             {
@@ -2448,6 +2488,10 @@ def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
                 "name": PROVIDER_PREFIX_RE.sub("", name).strip() or name,
                 "context": coerce_int(model.get("context_length"), 0),
                 "quality": quality,
+                # Provenance for the site's QUAL tooltip (null when the
+                # quality came without any -- e.g. a bare-float test map).
+                "quality_source": quality_source,
+                "quality_as_of": quality_as_of,
                 "score": balanced_by_id.get(model_id),
                 "max_discount": eff["max_discount"],
                 "sched_note": fmt_sched_note(eff["max_discount"]),
@@ -2810,23 +2854,51 @@ def fmt_quant_note(annotations: dict) -> str | None:
 def _footer_as_of(source, value):
     """Format a record's as_of for its footer block (None when unusable).
 
-    Live AA records carry one ISO fetch timestamp for the whole fetch
-    (checked today), so their block shows the time of day only. Catalog
-    rows carry a full ISO stamp ("as of 2026-10-23 13:15Z"); OpenRouter's
-    benchmark date is YYYYMMDD ("as of 2026-10-17").
+    Two stamp shapes circulate. A YYYYMMDD date (OpenRouter's benchmark
+    date, and catalog rows hydrated from OR rows) renders as a plain date
+    ("as of 2026-10-17") for ANY source -- a date-only stamp never
+    fabricates a time of day. ISO stamps: live AA records carry one fetch
+    timestamp for the whole fetch (checked today), so their block shows
+    the time of day only; other rows carry the full stamp ("as of
+    2026-10-23 13:15Z").
     """
     if not value:
         return None
-    if source == "openrouter":
-        text = str(value)
-        if len(text) == 8 and text.isdigit():
-            return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
     parsed = parse_iso_datetime(value)
     if parsed is None:
         return None
     if source == "aa":
         return parsed.strftime("%H:%MZ")
     return parsed.strftime("%Y-%m-%d %H:%MZ")
+
+
+def _as_of_instant(value):
+    """Parse an as_of stamp to a comparable UTC instant (None when unusable).
+
+    The pipeline carries ISO stamps and the YYYYMMDD benchmark date; a
+    date-only stamp means "that day" and compares as midnight UTC.
+    """
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return parse_iso_datetime(f"{text[:4]}-{text[4:6]}-{text[6:]}")
+    return parse_iso_datetime(value)
+
+
+def _later_as_of(value, current) -> bool:
+    """True when the value stamp names a later instant than current.
+
+    Parsed instants, never raw strings: a YYYYMMDD stamp must not
+    lexicographically beat a fresher ISO stamp ("20261017" sorts above
+    every "2026-..." string). Ties keep the earlier pick; an unparseable
+    stamp never displaces anything.
+    """
+    new, old = _as_of_instant(value), _as_of_instant(current)
+    if new is None or old is None:
+        return new is not None
+    return new > old
 
 
 def quality_footer_note(quality_by_id, aa_index_version, unmatched):
@@ -2856,7 +2928,7 @@ def quality_footer_note(quality_by_id, aa_index_version, unmatched):
         value = record.get("as_of")
         if value:
             current = latest.get(source)
-            if current is None or str(value) > str(current):
+            if current is None or _later_as_of(value, current):
                 latest[source] = value
     blocks = []
     for source in ("aa", "catalog", "openrouter"):
@@ -3050,6 +3122,7 @@ def build_catalog(
     session_cost_mode="skipped",
     index_version=None,
     catalog_generated_at=None,
+    catalog_quality=None,
 ):
     """Assemble the full-catalog document (see README "Catalog output").
 
@@ -3065,6 +3138,9 @@ def build_catalog(
     AA envelope's intelligence_index_version (number or null) and
     catalog_generated_at the published catalog's generated_at when this
     run hydrated from it (else None); both pass verbatim into sources.aa.
+    catalog_quality is the hydrated record map (or None): candidates read
+    it through resolve_quality, and build_schedules falls back to it for
+    non-candidates.
     """
     now = datetime.now(timezone.utc)
     weights = catalog_weights(candidates, quality_by_id)
@@ -3092,8 +3168,8 @@ def build_catalog(
     if unknown:
         raise ValueError(f"unknown quality source: {unknown[0]!r}")
     # mode is the run's quality chain, not a match outcome: "aa" when the
-    # AA API was consulted, "catalog" when unkeyed runs hydrated the
-    # published catalog, "none" when neither tier yielded anything.
+    # AA API returned usable entries, "catalog" when unkeyed runs hydrated
+    # the published catalog, "none" when neither tier produced data.
     # OpenRouter's benchmarks are the chain's shared last resort, never a
     # mode of their own -- matched_openrouter carries their count. The
     # catalog branch also fires on the counts alone: hydrated records are
@@ -3236,7 +3312,7 @@ def build_catalog(
 
     return {
         "schedules": build_schedules(
-            models, args, quality_by_id, aa_by_id, balanced_by_id
+            models, args, quality_by_id, aa_by_id, balanced_by_id, catalog_quality
         ),
         "schema_version": CATALOG_SCHEMA_VERSION,
         "tool": "model-compare",
@@ -3544,6 +3620,7 @@ def run(args, models, or_cached) -> int:
                 session_cost_mode,
                 aa_index_version,
                 catalog_generated_at,
+                catalog_quality,
             )
         )
         return 0

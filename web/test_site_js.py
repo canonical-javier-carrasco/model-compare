@@ -985,14 +985,16 @@ def test_quality_tooltip_names_source_and_as_of_per_source():
     # CLI footer's per-source forms: live AA shows the time of day only
     # ("checked HH:MMZ" -- one fetch timestamp for the whole fetch, so the
     # date is today), catalog rows the full stamp, OpenRouter's YYYYMMDD
-    # benchmark date the plain date.
+    # benchmark date the plain date. A date-only stamp renders as a plain
+    # date for any source (catalog rows hydrated from OR rows carry the
+    # same YYYYMMDD stamp) and never fabricates a time of day.
     assert (
         run_js(
             "qualityTooltip({quality_source: 'aa',"
             " quality_as_of: '2026-10-23T13:15:07Z', quality_drift: null,"
             " quality_or_index: null, quality_or_as_of: null})"
         )
-        == "AA intelligence index - source: aa, as of checked 13:15Z"
+        == "AA intelligence index - source: aa, checked 13:15Z"
     )
     assert (
         run_js(
@@ -1009,6 +1011,14 @@ def test_quality_tooltip_names_source_and_as_of_per_source():
             " quality_or_index: null, quality_or_as_of: null})"
         )
         == "AA intelligence index - source: openrouter, as of 2026-10-17"
+    )
+    assert (
+        run_js(
+            "qualityTooltip({quality_source: 'catalog',"
+            " quality_as_of: '20261017', quality_drift: null,"
+            " quality_or_index: null, quality_or_as_of: null})"
+        )
+        == "AA intelligence index - source: catalog, as of 2026-10-17"
     )
     # Delivery: the rendered QUAL cell carries the tooltip in both views
     # (the column stays visible in simple view as QUALITY). The stub tbody
@@ -1029,8 +1039,8 @@ def test_quality_tooltip_names_source_and_as_of_per_source():
         "})()"
     )
     assert out == {
-        "expertTitle": "AA intelligence index - source: aa, as of checked 13:15Z",
-        "simpleTitle": "AA intelligence index - source: aa, as of checked 13:15Z",
+        "expertTitle": "AA intelligence index - source: aa, checked 13:15Z",
+        "simpleTitle": "AA intelligence index - source: aa, checked 13:15Z",
     }
     # Both QUAL column headers advertise the provenance hover (the cells'
     # own title is where the details live).
@@ -1080,7 +1090,7 @@ def test_quality_tooltip_drift_appends_the_row_or_pair():
         "})()"
     )
     assert out == (
-        "AA intelligence index - source: aa, as of checked 13:15Z"
+        "AA intelligence index - source: aa, checked 13:15Z"
         " differs from OpenRouter snapshot (39.5, 2026-10-17)"
     )
 
@@ -1115,8 +1125,9 @@ def test_quality_tooltip_missing_fields_degrade_silently():
         "})()"
     )
     assert out == ""
-    # Deals table: same degradation. The schedules rows carry no
-    # provenance fields at all today, so the cell must stay bare.
+    # Deals table: same degradation. A schedules row without provenance
+    # (an older data.json, or a row whose quality came without any) must
+    # leave the cell bare.
     deals_fix = {"priorities": {"balanced": []}, "schedules": [dict(DEALS_ROW)]}
     out = run_js(
         "(function () {"
@@ -1134,6 +1145,37 @@ def test_quality_tooltip_missing_fields_degrade_silently():
         "})()"
     )
     assert out == ""
+
+
+def test_quality_tooltip_deals_row_with_provenance():
+    # A deals row that carries provenance (the schedules pipeline threads
+    # quality_source/quality_as_of through the catalog into data.json)
+    # renders the same QUAL tooltip as the main table: source label and
+    # the stamp in the CLI footer's per-source form.
+    deal = dict(DEALS_ROW)
+    deal.update(
+        {
+            "quality_source": "catalog",
+            "quality_as_of": "20261017",
+        }
+    )
+    deals_fix = {"priorities": {"balanced": []}, "schedules": [deal]}
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(deals_fix)};"
+        " var captured = null;"
+        " var realGet = document.getElementById;"
+        " document.getElementById = function (id) {"
+        "   var e = realGet(id);"
+        '   if (id === "deals-tbody") captured = e;'
+        "   return e;"
+        " };"
+        " renderDeals();"
+        " document.getElementById = realGet;"
+        " return captured.children[0].children[3].title;"
+        "})()"
+    )
+    assert out == "AA intelligence index - source: catalog, as of 2026-10-17"
 
 
 # ---------------------------------------------------------------------------

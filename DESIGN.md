@@ -161,12 +161,13 @@ catalog, the footer ("; drift vs OpenRouter snapshot (N)") and the site
 tooltip ("differs from OpenRouter snapshot (<or_index>, <or_as_of>)").
 
 The `sources.aa` block (reshaped in catalog v4) describes the **run's
-chain, not a match outcome**: `mode` is `aa` when the AA API was consulted,
-`catalog` when an unkeyed run hydrated the published catalog (the branch
-fires on the counts alone, so hydrated rows still credit the catalog when
-its `generated_at` was unusable), `none` when neither tier yielded
-anything. OpenRouter is never a mode — its count lives in
-`matched_openrouter`. The three counts are disjoint buckets (strict rank
+chain, not a match outcome**: `mode` names the tier that yielded — `aa`
+when the AA API returned usable entries (a keyed run whose fetch failed
+publishes `none`), `catalog` when an unkeyed run hydrated the published
+catalog (the branch fires on the counts alone, so hydrated rows still
+credit the catalog when its `generated_at` was unusable), `none` when
+neither tier produced data. OpenRouter is never a mode — its count lives
+in `matched_openrouter`. The three counts are disjoint buckets (strict rank
 gives every candidate at most one record); their sum is exactly the number
 of entries with a non-null `quality_match`, an invariant
 `web/build_site_data.py` enforces. `catalog_generated_at` and
