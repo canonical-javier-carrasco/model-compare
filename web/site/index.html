@@ -46,7 +46,9 @@
           <th title="Ranking position">RANK</th>
           <th title="Rank change in the last 7 days">7-DAY</th>
           <th title="Provider-qualified model id">MODEL</th>
-          <th title="Intelligence index (Artificial Analysis)">
+          <th
+            title="Intelligence index (Artificial Analysis) — hover a cell for its source and as-of date"
+          >
             <span class="lbl-expert">QUAL</span>
             <span class="lbl-simple">QUALITY</span>
           </th>
@@ -96,6 +98,12 @@
       Prices shown are what a long session pays: several models bill at a higher
       rate once the prompt outgrows their cheap short-context tier.
     </p>
+    <p class="hint">
+      <strong>QUAL</strong> is the intelligence index (Artificial Analysis).
+      Hover a cell to see where the number came from: the source and the
+      as-of date. A cell whose number differs from OpenRouter's snapshot by
+      3 or more index points says so.
+    </p>
     <p class="hint hide-simple">
       <strong><span class="tier">TIER</span></strong> marks how prices vary: a
       token threshold is the prompt size above which the higher rate applies; a
@@ -134,7 +142,11 @@
               OFF-PEAK
             </th>
             <th title="When the discounted rate applies (UTC)">SCHEDULE</th>
-            <th title="Intelligence index (Artificial Analysis)">QUAL</th>
+            <th
+              title="Intelligence index (Artificial Analysis) — hover a cell for its source and as-of date"
+            >
+              QUAL
+            </th>
             <th
               title="Discounted input price during the listed windows, USD per 1M tokens"
             >

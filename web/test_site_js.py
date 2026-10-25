@@ -13,11 +13,12 @@ Limitation: the pure helpers, the built-element shape (endpointRow,
 render on a stub tbody), the named render helpers that mutate captured
 elements (renderFooter's revision/stamp flow), and the event wiring
 (stubs record handlers per type; a driver fires clicks on the
-view/consent buttons) are exercised; tooltip delivery (the td.title
-assignment inside render) and the fetch-driven flow are not: the fetch
-stub rejects so init()'s render() never runs and querySelectorAll
+view/consent buttons) are exercised; the fetch-driven flow is not: the
+fetch stub rejects so init()'s render() never runs and querySelectorAll
 returns []. The stubs cache one element per id, so a driver can read
-back what a helper wrote through els or document.getElementById.
+back what a helper wrote through els or document.getElementById -- the
+QUAL provenance tests read the tooltip the render loop assigned to
+td.title the same way.
 """
 
 import json
@@ -965,6 +966,219 @@ def test_render_deals_rows_are_view_independent():
 
 
 # ---------------------------------------------------------------------------
+# QUAL provenance tooltip: per-source as_of, drift note, silent degradation
+
+# The provenance fields data.json rows carry since the quality source
+# reconciliation: the winner's source label, its as_of, the drift verdict
+# against OpenRouter's check value and the check pair itself.
+AA_PROVENANCE = {
+    "quality_source": "aa",
+    "quality_as_of": "2026-10-23T13:15:07Z",
+    "quality_drift": False,
+    "quality_or_index": 57.5,
+    "quality_or_as_of": "20260915",
+}
+
+
+def test_quality_tooltip_names_source_and_as_of_per_source():
+    # The tooltip names the metric, the source label and the as_of in the
+    # CLI footer's per-source forms: live AA shows the time of day only
+    # ("checked HH:MMZ" -- one fetch timestamp for the whole fetch, so the
+    # date is today), catalog rows the full stamp, OpenRouter's YYYYMMDD
+    # benchmark date the plain date. A date-only stamp renders as a plain
+    # date for any source (catalog rows hydrated from OR rows carry the
+    # same YYYYMMDD stamp) and never fabricates a time of day.
+    assert (
+        run_js(
+            "qualityTooltip({quality_source: 'aa',"
+            " quality_as_of: '2026-10-23T13:15:07Z', quality_drift: null,"
+            " quality_or_index: null, quality_or_as_of: null})"
+        )
+        == "AA intelligence index - source: aa, checked 13:15Z"
+    )
+    assert (
+        run_js(
+            "qualityTooltip({quality_source: 'catalog',"
+            " quality_as_of: '2026-10-23T13:15:07Z', quality_drift: false,"
+            " quality_or_index: 57.5, quality_or_as_of: '20260915'})"
+        )
+        == "AA intelligence index - source: catalog, as of 2026-10-23 13:15Z"
+    )
+    assert (
+        run_js(
+            "qualityTooltip({quality_source: 'openrouter',"
+            " quality_as_of: '20261017', quality_drift: null,"
+            " quality_or_index: null, quality_or_as_of: null})"
+        )
+        == "AA intelligence index - source: openrouter, as of 2026-10-17"
+    )
+    assert (
+        run_js(
+            "qualityTooltip({quality_source: 'catalog',"
+            " quality_as_of: '20261017', quality_drift: null,"
+            " quality_or_index: null, quality_or_as_of: null})"
+        )
+        == "AA intelligence index - source: catalog, as of 2026-10-17"
+    )
+    # Delivery: the rendered QUAL cell carries the tooltip in both views
+    # (the column stays visible in simple view as QUALITY). The stub tbody
+    # never clears its children, so the expert row lands at index 0 and
+    # the simple row at index 1; the movement td sits at children[1], so
+    # the QUAL cell is children[3].
+    row = dict(SIMPLE_VIEW_ROW)
+    row.update(AA_PROVENANCE)
+    data_fix = {"priorities": {"balanced": [row]}, "schedules": []}
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(data_fix)};"
+        ' view = "expert"; render();'
+        " var expertTitle = els.tbody.children[0].children[3].title;"
+        ' view = "simple"; render();'
+        " var simpleTitle = els.tbody.children[1].children[3].title;"
+        " return { expertTitle: expertTitle, simpleTitle: simpleTitle };"
+        "})()"
+    )
+    assert out == {
+        "expertTitle": "AA intelligence index - source: aa, checked 13:15Z",
+        "simpleTitle": "AA intelligence index - source: aa, checked 13:15Z",
+    }
+    # Both QUAL column headers advertise the provenance hover (the cells'
+    # own title is where the details live).
+    html = SITE_HTML.read_text()
+    assert (
+        html.count(
+            "Intelligence index (Artificial Analysis) — hover a cell for its"
+            " source and as-of date"
+        )
+        == 2
+    )
+
+
+def test_quality_tooltip_drift_appends_the_row_or_pair():
+    # A drift row (quality_drift true) appends the disagreement note built
+    # from the row's own OR pair: the check value at the table's
+    # one-decimal quality form and the OR benchmark date as a plain date.
+    assert run_js(
+        "qualityTooltip({quality_source: 'catalog',"
+        " quality_as_of: '2026-10-23T13:15:07Z', quality_drift: true,"
+        " quality_or_index: 39.5, quality_or_as_of: '20261017'})"
+    ) == (
+        "AA intelligence index - source: catalog, as of 2026-10-23 13:15Z"
+        " differs from OpenRouter snapshot (39.5, 2026-10-17)"
+    )
+    # false (agrees with OR) and null (the row IS the OR snapshot, or no
+    # OR value exists) stay note-free.
+    for verdict in ("false", "null"):
+        out = run_js(
+            "qualityTooltip({quality_source: 'aa',"
+            f" quality_as_of: '2026-10-23T13:15:07Z', quality_drift: {verdict},"
+            " quality_or_index: 39.5, quality_or_as_of: '20261017'})"
+        )
+        assert "differs from OpenRouter snapshot" not in out
+    # Delivery: the note rides on the rendered QUAL cell too.
+    row = dict(SIMPLE_VIEW_ROW)
+    row.update(AA_PROVENANCE)
+    row["quality_drift"] = True
+    row["quality_or_index"] = 39.5
+    row["quality_or_as_of"] = "20261017"
+    data_fix = {"priorities": {"balanced": [row]}, "schedules": []}
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(data_fix)};"
+        " render();"
+        " return els.tbody.children[0].children[3].title;"
+        "})()"
+    )
+    assert out == (
+        "AA intelligence index - source: aa, checked 13:15Z"
+        " differs from OpenRouter snapshot (39.5, 2026-10-17)"
+    )
+
+
+def test_quality_tooltip_missing_fields_degrade_silently():
+    # The currently published data.json predates the provenance fields: a
+    # row without them renders exactly as before -- no tooltip, no drift
+    # note, no JS error -- in both tables. A known source without a usable
+    # as_of keeps the source part and drops only the "as of" clause (the
+    # CLI footer's own handling of an unusable stamp).
+    assert run_js("qualityTooltip({})") is None
+    assert (
+        run_js(
+            "qualityTooltip({quality_source: 'openrouter', quality_as_of: null,"
+            " quality_drift: null, quality_or_index: null,"
+            " quality_or_as_of: null})"
+        )
+        == "AA intelligence index - source: openrouter"
+    )
+    # Main table: the pre-provenance row shape leaves the QUAL cell's
+    # title empty (the column header's title is the only hint left). A
+    # throw here would fail the driver before the assert.
+    data_fix = {
+        "priorities": {"balanced": [dict(SIMPLE_VIEW_ROW)]},
+        "schedules": [],
+    }
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(data_fix)};"
+        " render();"
+        " return els.tbody.children[0].children[3].title;"
+        "})()"
+    )
+    assert out == ""
+    # Deals table: same degradation. A schedules row without provenance
+    # (an older data.json, or a row whose quality came without any) must
+    # leave the cell bare.
+    deals_fix = {"priorities": {"balanced": []}, "schedules": [dict(DEALS_ROW)]}
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(deals_fix)};"
+        " var captured = null;"
+        " var realGet = document.getElementById;"
+        " document.getElementById = function (id) {"
+        "   var e = realGet(id);"
+        '   if (id === "deals-tbody") captured = e;'
+        "   return e;"
+        " };"
+        " renderDeals();"
+        " document.getElementById = realGet;"
+        " return captured.children[0].children[3].title;"
+        "})()"
+    )
+    assert out == ""
+
+
+def test_quality_tooltip_deals_row_with_provenance():
+    # A deals row that carries provenance (the schedules pipeline threads
+    # quality_source/quality_as_of through the catalog into data.json)
+    # renders the same QUAL tooltip as the main table: source label and
+    # the stamp in the CLI footer's per-source form.
+    deal = dict(DEALS_ROW)
+    deal.update(
+        {
+            "quality_source": "catalog",
+            "quality_as_of": "20261017",
+        }
+    )
+    deals_fix = {"priorities": {"balanced": []}, "schedules": [deal]}
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(deals_fix)};"
+        " var captured = null;"
+        " var realGet = document.getElementById;"
+        " document.getElementById = function (id) {"
+        "   var e = realGet(id);"
+        '   if (id === "deals-tbody") captured = e;'
+        "   return e;"
+        " };"
+        " renderDeals();"
+        " document.getElementById = realGet;"
+        " return captured.children[0].children[3].title;"
+        "})()"
+    )
+    assert out == "AA intelligence index - source: catalog, as of 2026-10-17"
+
+
+# ---------------------------------------------------------------------------
 # Consent-first view cookie
 
 
@@ -1005,7 +1219,16 @@ def test_deals_table_immune_to_view_toggle():
     assert "lbl-expert" not in deals
     assert "lbl-simple" not in deals
     assert "hide-simple" not in deals
-    assert '<th title="Intelligence index (Artificial Analysis)">QUAL</th>' in deals
+    # The QUAL header carries the provenance hint like the main table's
+    # (Task 6); CTX stays bare.
+    ths = re.findall(r"<th.*?</th>", deals, re.DOTALL)
+    qual_th = next(
+        (t for t in ths if re.search(r">\s*QUAL\s*<", t)),
+        None,
+    )
+    assert qual_th is not None, "no <th> for QUAL"
+    assert "Intelligence index (Artificial Analysis)" in qual_th
+    assert "hover a cell for its source and as-of date" in qual_th
     assert '<th title="Context window in tokens">CTX</th>' in deals
 
 

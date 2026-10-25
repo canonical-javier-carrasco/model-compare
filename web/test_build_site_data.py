@@ -29,6 +29,14 @@ def make_row(**overrides):
         "price_spread": None,
         "session_cost_usd": None,
         "quant_note": None,
+        # data.json v2 additive provenance (quality source reconciliation):
+        # print_json emits the record's label, as_of, drift verdict and OR
+        # check pair; the nulls are the no-record degradation it prints.
+        "quality_source": "openrouter",
+        "quality_as_of": None,
+        "quality_drift": None,
+        "quality_or_index": None,
+        "quality_or_as_of": None,
     }
     row.update(overrides)
     return row
@@ -199,6 +207,8 @@ def _three_model_catalog():
         make_catalog_entry(id=model_id) for model_id in ("acme/a", "acme/b", "acme/c")
     ]
     doc["pool"].update(listed=4, candidates=3)
+    # All three entries carry the OR label: keep the disjoint buckets honest.
+    doc["sources"]["aa"]["matched_openrouter"] = 3
     doc["rankings"] = _ranked_catalog()["rankings"]
     bsd.validate_catalog(doc)
     return doc
@@ -336,6 +346,10 @@ def make_catalog_entry(**overrides):
             "agentic_index": 48.5,
         },
         "quality_match": "openrouter",
+        # Schema v4 provenance: the record's own as_of and drift verdict,
+        # null for this OR-matched row (no second source to disagree with).
+        "quality_as_of": None,
+        "quality_drift": None,
         "scores": {
             "price": 0.9,
             "quality": 0.78,
@@ -356,7 +370,7 @@ def make_catalog_entry(**overrides):
 
 def make_catalog():
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "tool": "model-compare",
         "generated_at": "2026-09-02T09:15:00+00:00",
         "parameters": {
@@ -377,11 +391,16 @@ def make_catalog():
         },
         "sources": {
             "openrouter": "ok",
+            # Catalog v4: the keyed CI producer's normal chain, its three
+            # disjoint label buckets (the one matched entry is OR-labeled)
+            # and the provenance meta (no hydration, AA index v4.3).
             "aa": {
-                "mode": "openrouter",
-                "fallback": "api",
-                "matched": 1,
+                "mode": "aa",
+                "matched_aa": 0,
+                "matched_catalog": 0,
                 "matched_openrouter": 1,
+                "catalog_generated_at": None,
+                "intelligence_index_version": 4.3,
             },
             "zdr": "ok",
             "discounts": "ok",
@@ -419,30 +438,97 @@ def test_validate_catalog_happy_path():
     bsd.validate_catalog(make_catalog())  # must not raise
 
 
-@pytest.mark.parametrize("fallback", ["api", "none"])
-def test_validate_catalog_accepts_aa_fallback(fallback):
+def test_build_site_data_accepts_new_row_keys():
+    # The five provenance keys are ROW_KEYS members: build_data demands
+    # them on every row (the fail-loudly missing-key contract) and passes
+    # them through to data.json verbatim -- the schema stays 2, additive.
+    for key in (
+        "quality_source",
+        "quality_as_of",
+        "quality_drift",
+        "quality_or_index",
+        "quality_or_as_of",
+    ):
+        assert key in bsd.ROW_KEYS
+    priorities = make_priorities()
+    del priorities["balanced"][0]["quality_source"]
+    with pytest.raises(ValueError, match="quality_source"):
+        bsd.build_data("acme/model-a", priorities)
+    data = bsd.build_data("acme/model-a", make_priorities())
+    row = data["priorities"]["balanced"][0]
+    assert row["quality_source"] == "openrouter"
+    assert row["quality_as_of"] is None
+    assert row["quality_drift"] is None
+    assert row["quality_or_index"] is None
+    assert row["quality_or_as_of"] is None
+
+
+def test_build_site_data_rejects_v3_sources_aa_shape():
+    # The v3 fallback/matched block predates the disjoint buckets: no v4
+    # producer can emit it, so the validator must reject it fail-loudly
+    # instead of silently validating a shape the site cannot trust.
     doc = make_catalog()
-    doc["sources"]["aa"]["fallback"] = fallback
+    doc["sources"]["aa"] = {
+        "mode": "openrouter",
+        "fallback": "aa",
+        "matched": 1,
+        "matched_openrouter": 1,
+    }
+    with pytest.raises(ValueError):
+        bsd.validate_catalog(doc)
+
+
+def test_build_site_data_enforces_disjoint_bucket_invariant():
+    # The three counts are disjoint label buckets (strict rank counts each
+    # model once): their sum must equal the number of entries with a
+    # non-null quality_match. An inflated bucket would let the document
+    # claim more matched models than it lists.
+    doc = make_catalog()
+    doc["sources"]["aa"]["matched_aa"] = 5
+    with pytest.raises(ValueError, match="disjoint"):
+        bsd.validate_catalog(doc)
+
+
+@pytest.mark.parametrize(
+    "mode,counts",
+    [
+        ("aa", {"matched_aa": 1, "matched_catalog": 0, "matched_openrouter": 0}),
+        ("catalog", {"matched_aa": 0, "matched_catalog": 1, "matched_openrouter": 0}),
+        ("none", {"matched_aa": 0, "matched_catalog": 0, "matched_openrouter": 0}),
+    ],
+)
+def test_validate_catalog_accepts_aa_modes(mode, counts):
+    doc = make_catalog()
+    doc["sources"]["aa"].update(mode=mode, **counts)
+    if mode == "none":
+        doc["models"][0]["quality_match"] = None
+        doc["models"][0]["quality_as_of"] = None
+        doc["models"][0]["quality_drift"] = None
+    else:
+        # The bucket must agree with the entries' own labels: an aa-matched
+        # entry carries the aa label, a catalog-hydrated one the catalog
+        # label, each with the record's own as_of and drift verdict.
+        doc["models"][0]["quality_match"] = mode
+        doc["models"][0]["quality_as_of"] = "2026-10-23T13:15:07Z"
+        doc["models"][0]["quality_drift"] = False
     bsd.validate_catalog(doc)  # must not raise
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda aa: aa.pop("fallback"),
-        lambda aa: aa.update(fallback="psychic"),
-        # "openrouter" is a mode, never a fallback
-        lambda aa: aa.update(fallback="openrouter"),
-        lambda aa: aa.update(fallback=None),
-        lambda aa: aa.update(fallback=["api"]),
-        # the AA page scrape was removed; it can no longer be produced
-        lambda aa: aa.update(fallback="scrape"),
+        lambda aa: aa.pop("matched_aa"),
+        lambda aa: aa.update(matched_aa="three"),
+        lambda aa: aa.update(matched_aa=True),
+        lambda aa: aa.update(catalog_generated_at="Sept 2"),
+        lambda aa: aa.update(intelligence_index_version="v4"),
+        lambda aa: aa.update(intelligence_index_version=True),
     ],
 )
-def test_validate_catalog_rejects_bad_aa_fallback(mutate):
+def test_validate_catalog_rejects_bad_aa_sources_block(mutate):
     doc = make_catalog()
     mutate(doc["sources"]["aa"])
-    with pytest.raises(ValueError, match="sources.aa.fallback"):
+    with pytest.raises(ValueError, match="sources.aa"):
         bsd.validate_catalog(doc)
 
 
@@ -454,16 +540,24 @@ def test_validate_catalog_accepts_null_aa_fields_and_all_provenances():
         "agentic_index": None,
     }
     doc["models"][0]["quality_match"] = None
+    doc["models"][0]["quality_as_of"] = None
+    doc["models"][0]["quality_drift"] = None
     doc["sources"]["aa"] = {
         "mode": "none",
-        "fallback": "none",
-        "matched": 0,
+        "matched_aa": 0,
+        "matched_catalog": 0,
         "matched_openrouter": 0,
+        "catalog_generated_at": None,
+        "intelligence_index_version": None,
     }
     bsd.validate_catalog(doc)  # must not raise
-    doc["models"][0]["quality_match"] = "api"
+    doc["models"][0]["quality_match"] = "aa"
+    doc["models"][0]["quality_as_of"] = "2026-10-23T13:15:07Z"
+    doc["models"][0]["quality_drift"] = False
     doc["sources"]["aa"].update(
-        mode="api", fallback="api", matched=1, matched_openrouter=0
+        mode="aa",
+        matched_aa=1,
+        catalog_generated_at="2026-10-01T00:00:00Z",
     )
     bsd.validate_catalog(doc)  # must not raise
 
@@ -471,11 +565,39 @@ def test_validate_catalog_accepts_null_aa_fields_and_all_provenances():
 @pytest.mark.parametrize(
     "mutate, field",
     [
+        (lambda doc: doc["models"][0].update(quality_as_of=13.15), "quality_as_of"),
+        (lambda doc: doc["models"][0].update(quality_as_of=True), "quality_as_of"),
+        (lambda doc: doc["models"][0].update(quality_drift="no"), "quality_drift"),
+        (lambda doc: doc["models"][0].update(quality_drift=1), "quality_drift"),
+    ],
+)
+def test_validate_catalog_rejects_bad_quality_provenance(mutate, field):
+    # Schema v4 provenance is presence-checked via CATALOG_ENTRY_KEYS; the
+    # value types are pinned here so a malformed document fails loudly:
+    # quality_as_of is a string stamp or null, quality_drift a boolean
+    # verdict or null.
+    doc = make_catalog()
+    mutate(doc)
+    with pytest.raises(ValueError, match=field):
+        bsd.validate_catalog(doc)
+
+
+@pytest.mark.parametrize("bad", [-50.0, 200.0, 1e308, float("inf"), "45.1"])
+def test_validate_catalog_rejects_out_of_range_models_quality(bad):
+    # models[].quality is an AA intelligence index and carries the same
+    # 0..100 range the schedules rows enforce -- the validator used to
+    # range-check schedules[].quality only, so a catalog with
+    # models[0].quality = -50.0 passed.
+    doc = make_catalog()
+    doc["models"][0]["quality"] = bad
+    with pytest.raises(ValueError, match="quality"):
+        bsd.validate_catalog(doc)
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
         (lambda doc: doc["sources"]["aa"].update(mode="scrape"), "sources.aa.mode"),
-        (
-            lambda doc: doc["sources"]["aa"].update(mode="scrape", fallback="scrape"),
-            "sources.aa.mode",
-        ),
         (lambda doc: doc["models"][0].update(quality_match="scrape"), "quality_match"),
     ],
 )
@@ -524,7 +646,7 @@ def test_validate_catalog_rejects_removed_scrape_values(mutate, field):
         lambda doc: doc["models"][0].update(quality_match="psychic"),
         lambda doc: doc["sources"]["aa"].update(mode="psychic"),
         lambda doc: doc["sources"]["aa"].update(matched_openrouter=5),
-        lambda doc: doc["sources"]["aa"].update(matched=-1),
+        lambda doc: doc["sources"]["aa"].update(matched_aa=-1),
         lambda doc: doc["sources"]["aa"].update(matched_openrouter=True),
         # pricing values must be usable in arithmetic downstream: the diff
         # builder and history snapshots consume them as numbers
@@ -552,6 +674,9 @@ def test_validate_catalog_rejects(mutate):
 def _add_second_model(doc):
     doc["models"].append(make_catalog_entry(id="acme/model-b"))
     doc["pool"].update(listed=3, candidates=2)
+    # Keep the disjoint-bucket invariant honest: one more OR-labeled entry,
+    # one more openrouter count.
+    doc["sources"]["aa"]["matched_openrouter"] += 1
     return doc
 
 
@@ -610,7 +735,7 @@ def test_main_writes_catalog_next_to_data_json(tmp_path):
     assert bsd.main(argv) == 0
     catalog_path = out.parent / "catalog.json"
     written = json.loads(catalog_path.read_text())
-    assert written["schema_version"] == 3
+    assert written["schema_version"] == 4
     assert written["models"][0]["id"] == "acme/model-a"
     assert out.exists()  # data.json still written
 
@@ -764,6 +889,9 @@ def test_build_snapshot_projects_rankings_not_a_sort():
         entry("acme/c-low", 0.1, 30.0, 3.0),
     ]
     doc["pool"].update(listed=4, candidates=3)
+    # All three entries carry the OR label, so the disjoint buckets must
+    # count them (the base fixture counts only its single entry).
+    doc["sources"]["aa"]["matched_openrouter"] = 3
     doc["rankings"] = {
         "balanced": ["acme/c-low", "acme/a-top", "acme/b-mid"],
         "price": ["acme/b-mid", "acme/c-low", "acme/a-top"],
@@ -1254,10 +1382,12 @@ def _invariant_catalog():
     doc["models"] = models
     doc["pool"] = {"listed": 6, "candidates": 5, "dropped": {"context": 1}}
     doc["sources"]["aa"] = {
-        "mode": "openrouter",
-        "fallback": "api",
-        "matched": 3,
+        "mode": "aa",
+        "matched_aa": 0,
+        "matched_catalog": 0,
         "matched_openrouter": 3,
+        "catalog_generated_at": None,
+        "intelligence_index_version": 4.3,
     }
     doc["rankings"] = {
         "balanced": ["acme/a", "acme/b", "acme/c", "acme/e", "acme/d"],
@@ -1355,6 +1485,10 @@ def _schedule_entry(model_id, discount, off_in=0.66, off_out=1.98):
         "name": model_id.split("/")[1],
         "context": 262144,
         "quality": None,
+        # Provenance for the deals QUAL tooltip: null like a row whose
+        # quality came without any (the producer emits the keys always).
+        "quality_source": None,
+        "quality_as_of": None,
         "score": None,
         "max_discount": discount,
         "sched_note": f"-{discount:.0%}",
@@ -1585,6 +1719,10 @@ def test_validate_catalog_schedules_entries():
         ("context", "262144"),
         ("context", True),
         ("context", float("nan")),
+        ("quality_source", "scrape"),
+        ("quality_source", 42),
+        ("quality_as_of", 42),
+        ("quality_as_of", ["20261017"]),
     ):
         doc = make_catalog()
         schedules = make_schedules()
@@ -1599,6 +1737,18 @@ def test_validate_catalog_schedules_entries():
     schedules[0]["context"] = None
     doc["schedules"] = schedules
     bsd.validate_catalog(doc)  # must not raise
+    # Provenance (QUAL tooltip): null or the winner's label and stamp; the
+    # keys are required like the rest (the producer always emits them).
+    doc = make_catalog()
+    schedules = make_schedules()
+    schedules[0].update(
+        quality=50.0, quality_source="catalog", quality_as_of="20261017"
+    )
+    doc["schedules"] = schedules
+    bsd.validate_catalog(doc)  # must not raise
+    del schedules[0]["quality_source"]
+    with pytest.raises(ValueError, match="quality_source"):
+        bsd.validate_catalog(doc)
 
 
 def test_project_schedules():
@@ -1614,7 +1764,21 @@ def test_project_schedules():
     assert big["input_per_1m"] == 0.66  # cheapest off-peak prices
     assert big["output_per_1m"] == 1.98
     assert big["quality"] is None and big["score"] is None
+    # Provenance rides through to data.json verbatim (null without a
+    # winner), so the deals QUAL tooltip can render on the site.
+    assert big["quality_source"] is None and big["quality_as_of"] is None
     assert big["context"] == 262144
+    schedules = make_schedules()
+    schedules[0].update(
+        quality=30.0, quality_source="catalog", quality_as_of="20261017"
+    )
+    catalog["schedules"] = schedules
+    (projected,) = [
+        row for row in bsd.project_schedules(catalog) if row["model"] == "acme/big-deal"
+    ]
+    assert projected["quality"] == 30.0
+    assert projected["quality_source"] == "catalog"
+    assert projected["quality_as_of"] == "20261017"
 
 
 def test_project_schedules_top10_cap():

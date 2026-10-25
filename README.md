@@ -69,13 +69,49 @@ plus weekly `history.json` and `highlights.json`. How that pipeline works:
 ## How it works
 
 OpenRouter's public catalog provides prices, context windows and listing
-dates; model quality comes from the Artificial Analysis intelligence index
-(read via OpenRouter's own published benchmarks first, with graceful
-fallbacks). Each candidate is scored on quality, blended price, context
-headroom and listing age with weights depending on `--priority`, after hard
-filters (context floor, text-only, tool-calling, ZDR by default). The full
-scoring formulas, filter list, the `--catalog` JSON contract and the test
-setup are in [DESIGN.md](DESIGN.md).
+dates; model quality comes from the Artificial Analysis intelligence index,
+resolved through a three-source hierarchy with visible provenance (see
+[Model quality](#model-quality) below). Each candidate is scored on quality,
+blended price, context headroom and listing age with weights depending on
+`--priority`, after hard filters (context floor, text-only, tool-calling,
+ZDR by default). The full scoring formulas, filter list, the `--catalog`
+JSON contract and the test setup are in [DESIGN.md](DESIGN.md).
+
+## Model quality
+
+Quality is the [Artificial Analysis](https://artificialanalysis.ai/models)
+intelligence index (0–100). Each model's value is resolved through three
+sources in a strict order — rank, not freshness: a higher-ranked source
+always wins, even when a lower-ranked one is newer.
+
+1. **Live AA API** — with `--aa-api-key` (or `AA_API_KEY`) set, the AA v2
+   API is consulted first; this is the live index.
+2. **Our published catalog** — without a key, quality hydrates from
+   [model-compare.dev/catalog.json](https://model-compare.dev/catalog.json),
+   the artifact this repo's keyed CI runs publish, joined by exact model id.
+3. **OpenRouter snapshot** — the AA indices OpenRouter republishes per
+   listing, used only for models neither AA path covers.
+
+Every quality value carries its provenance end to end: `--json` rows carry
+`quality_source` and `quality_as_of`, `catalog.json` entries and the site's
+QUAL tooltips show them, and the CLI's footer note lists how many models
+came from each source and when each was checked.
+
+**Why our QUAL can differ from openrouter.ai:** OpenRouter republishes a
+**frozen copy** of the intelligence index per dated listing, while the AA
+API is live — a model whose index has moved since OpenRouter's snapshot
+will legitimately show different numbers here. When the winning value and
+OpenRouter's snapshot for the same model differ by 3 or more index points,
+the row is flagged as drift (`quality_drift`, with `quality_or_index` and
+`quality_or_as_of` naming the snapshot it was compared against) — visible as
+a tooltip note on the site and counted in the CLI footer. Prices can differ
+from the website too, for a different reason: this tool ranks at the
+cheapest eligible endpoint, not the default one (see
+[Tiered pricing](#tiered-pricing)). Provenance — the source plus its as-of —
+makes every such discrepancy explainable instead of mysterious; the
+background is in issues
+[#17](https://github.com/canonical/model-compare/issues/17) and
+[#18](https://github.com/canonical/model-compare/issues/18).
 
 ## Tiered pricing
 

@@ -71,7 +71,16 @@ def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
 
 # What the stubbed `model_compare.py --catalog` run prints: the AA and
 # endpoint-drop gates read it from scratch before any other step runs.
-HEALTHY_AA = {"mode": "openrouter", "fallback": "api"}
+# Catalog v4 shape: the keyed run's chain is "aa" and its three disjoint
+# match buckets sum to the pool's matched entries (12 + 0 + 8 = 20).
+HEALTHY_AA = {
+    "mode": "aa",
+    "matched_aa": 12,
+    "matched_catalog": 0,
+    "matched_openrouter": 8,
+    "catalog_generated_at": None,
+    "intelligence_index_version": 4.3,
+}
 
 # The scratch catalog's pool (Task 8): 20 candidates entered the endpoint
 # stage and none dropped for endpoint reasons -- the healthy happy path.
@@ -558,14 +567,8 @@ def test_best_gate_rejects_unusable_rankings(tmp_path, monkeypatch, catalog_text
         publish.build_site(tmp_path / "site")
 
 
-_ABSENT = object()
-
-
-def _catalog_run(mode, calls, fallback=_ABSENT):
+def _catalog_run(aa, calls):
     """Stub the pipeline; the --catalog run prints the given AA sources."""
-    aa = {"mode": mode}
-    if fallback is not _ABSENT:
-        aa["fallback"] = fallback
     return _fake_run(calls, aa=aa)
 
 
@@ -594,96 +597,110 @@ FAVICON_FILES = (
 )
 
 
-@pytest.mark.parametrize(
-    "mode, fallback",
-    [
-        ("api", "api"),
-        # "openrouter" is what healthy runs publish whenever OpenRouter
-        # benchmarks cover a matched model -- the gate must not
-        # false-positive on it while the AA API works.
-        ("openrouter", "api"),
-    ],
-)
-def test_build_site_aa_gate_passes_live_fallback(tmp_path, monkeypatch, mode, fallback):
+def test_publish_healthy_aa_v4_fixture(tmp_path, monkeypatch):
+    # The fixture every pipeline test publishes through the AA gate must
+    # stay producer-faithful: exactly the v4 sources.aa shape build_catalog
+    # emits for a keyed run, and the gate accepts it with the key set.
+    assert set(HEALTHY_AA) == {
+        "mode",
+        "matched_aa",
+        "matched_catalog",
+        "matched_openrouter",
+        "catalog_generated_at",
+        "intelligence_index_version",
+    }
     calls = []
-    monkeypatch.setattr(publish.subprocess, "run", _catalog_run(mode, calls, fallback))
+    monkeypatch.setattr(publish.subprocess, "run", _catalog_run(HEALTHY_AA, calls))
+    monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
+    monkeypatch.setenv("AA_API_KEY", "dummy-key")
+    publish.build_site(tmp_path / "site")
+
+
+@pytest.mark.parametrize("matched_aa", [12, 1])
+def test_build_site_aa_gate_passes_live_aa(tmp_path, monkeypatch, matched_aa):
+    # The only live shape: the AA chain ran (mode "aa") and at least one
+    # model's quality came from it (matched_aa > 0).
+    calls = []
+    monkeypatch.setattr(
+        publish.subprocess,
+        "run",
+        _catalog_run({"mode": "aa", "matched_aa": matched_aa}, calls),
+    )
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     monkeypatch.setenv("AA_API_KEY", "dummy-key")
     publish.build_site(tmp_path / "site")
 
 
 def test_build_site_aa_gate_fails_when_aa_absent_despite_key(tmp_path, monkeypatch):
+    # mode "none" says no live AA data stands behind the quality -- a keyed
+    # publish must not deploy it.
     calls = []
-    monkeypatch.setattr(publish.subprocess, "run", _catalog_run("none", calls, "none"))
+    monkeypatch.setattr(
+        publish.subprocess,
+        "run",
+        _catalog_run({"mode": "none", "matched_aa": 0}, calls),
+    )
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     monkeypatch.setenv("AA_API_KEY", "dummy-key")
     with pytest.raises(RuntimeError, match="AA_API_KEY is set"):
         publish.build_site(tmp_path / "site")
 
 
-def test_build_site_aa_gate_fails_when_openrouter_masks_failed_fallback(
-    tmp_path, monkeypatch
-):
-    # Regression: mode "openrouter" says only that some candidate's AA data
-    # came from OpenRouter. A rejected key used to pass behind it.
+def test_build_site_aa_gate_fails_when_aa_yields_no_matches(tmp_path, monkeypatch):
+    # Regression (the v3 gate read the fallback label alone): mode "aa"
+    # with zero AA-matched models means the quality actually came from
+    # OpenRouter's snapshot, not from the live AA API the key paid for.
     calls = []
     monkeypatch.setattr(
-        publish.subprocess, "run", _catalog_run("openrouter", calls, "none")
+        publish.subprocess, "run", _catalog_run({"mode": "aa", "matched_aa": 0}, calls)
     )
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     monkeypatch.setenv("AA_API_KEY", "dummy-key")
     with pytest.raises(RuntimeError, match="AA_API_KEY is set") as exc:
         publish.build_site(tmp_path / "site")
-    assert "'none'" in str(exc.value)
-    assert "sources.aa.fallback" in str(exc.value)
-
-
-@pytest.mark.parametrize("fallback", [_ABSENT, None, "psychic", "openrouter"])
-def test_build_site_aa_gate_fails_closed_on_unknown_fallback(
-    tmp_path, monkeypatch, fallback
-):
-    calls = []
-    monkeypatch.setattr(
-        publish.subprocess, "run", _catalog_run("openrouter", calls, fallback)
-    )
-    monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
-    monkeypatch.setenv("AA_API_KEY", "dummy-key")
-    with pytest.raises(RuntimeError, match="AA_API_KEY is set"):
-        publish.build_site(tmp_path / "site")
+    assert "matched_aa" in str(exc.value)
 
 
 @pytest.mark.parametrize(
-    "mode, fallback", [("scrape", "scrape"), ("openrouter", "scrape")]
+    "aa",
+    [
+        {},  # the block is missing entirely
+        {"mode": None, "matched_aa": 3},  # mode is not a chain name
+        # the page scrape was removed; its label can no longer be produced
+        {"mode": "scrape", "matched_aa": 3},
+        {"mode": "psychic", "matched_aa": 1},  # unknown chain
+        {"mode": "aa", "matched_aa": "3"},  # a count that is not an integer
+        {"mode": "aa", "matched_aa": True},  # bools are not counts
+    ],
 )
-def test_build_site_aa_gate_rejects_removed_scrape_fallback(
-    tmp_path, monkeypatch, mode, fallback
-):
-    # The page scrape was removed: with the key set, only the AA API itself
-    # counts, so a "scrape" fallback (impossible now) cannot mask a rejected key.
+def test_build_site_aa_gate_fails_closed_on_unusable_block(tmp_path, monkeypatch, aa):
     calls = []
-    monkeypatch.setattr(publish.subprocess, "run", _catalog_run(mode, calls, fallback))
+    monkeypatch.setattr(publish.subprocess, "run", _catalog_run(aa, calls))
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     monkeypatch.setenv("AA_API_KEY", "dummy-key")
-    with pytest.raises(RuntimeError, match="AA_API_KEY is set") as exc:
+    with pytest.raises(RuntimeError, match="AA_API_KEY is set"):
         publish.build_site(tmp_path / "site")
-    assert "'scrape'" in str(exc.value)
 
 
 @pytest.mark.parametrize("key", [None, ""])
 def test_build_site_aa_gate_inactive_without_key(tmp_path, monkeypatch, key):
     calls = []
-    monkeypatch.setattr(publish.subprocess, "run", _catalog_run("none", calls, "none"))
+    monkeypatch.setattr(
+        publish.subprocess,
+        "run",
+        _catalog_run({"mode": "none", "matched_aa": 0}, calls),
+    )
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     if key is not None:
         monkeypatch.setenv("AA_API_KEY", key)
     publish.build_site(tmp_path / "site")
 
 
-def test_build_site_aa_gate_inactive_without_key_even_if_fallback_missing(
+def test_build_site_aa_gate_inactive_without_key_even_if_block_unusable(
     tmp_path, monkeypatch
 ):
     calls = []
-    monkeypatch.setattr(publish.subprocess, "run", _catalog_run("openrouter", calls))
+    monkeypatch.setattr(publish.subprocess, "run", _catalog_run({}, calls))
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     publish.build_site(tmp_path / "site")
 
@@ -691,7 +708,9 @@ def test_build_site_aa_gate_inactive_without_key_even_if_fallback_missing(
 def test_build_site_aa_gate_runs_before_any_artifact_is_written(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
-        publish.subprocess, "run", _catalog_run("openrouter", calls, "none")
+        publish.subprocess,
+        "run",
+        _catalog_run({"mode": "none", "matched_aa": 0}, calls),
     )
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     monkeypatch.setenv("AA_API_KEY", "dummy-key")

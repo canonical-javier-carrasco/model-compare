@@ -11,24 +11,27 @@ How the tool works under the hood. End-user docs live in the
    catalog: per-token input/output prices, context window, listing date,
    supported parameters (used for the tool-calling check) and modality info.
 2. **Artificial Analysis** — the [AA intelligence index](https://artificialanalysis.ai/models),
-   a 0–100 composite of reasoning/coding/knowledge benchmarks. Obtained via:
-   - **OpenRouter benchmarks (primary)**: the same undocumented frontend API
-     behind the [`?discount=true`](https://openrouter.ai/models?discount=true)
-     and ZDR filters also republishes the AA intelligence/coding/agentic
-     indices per model (`benchmarks.aa`), keyed by exact OpenRouter id.
-     Consumed first — no separate fetch, and exact keys make conflation
-     impossible.
-   - **AA API v2** (`artificialanalysis.ai/api/v2/language/models/free`) for
-     models OpenRouter does not cover, when an API key is supplied through
-     `--aa-api-key` or the `AA_API_KEY` env var
+   a 0–100 composite of reasoning/coding/knowledge benchmarks. Reached
+   through three ranked quality sources (precedence, matching rules and
+   provenance live in "Quality sources and reconciliation" below):
+   - **AA API v2 (primary, keyed)**
+     (`artificialanalysis.ai/api/v2/language/models/free`), when an API key
+     is supplied through `--aa-api-key` or the `AA_API_KEY` env var
      ([free key](https://artificialanalysis.ai)); full model coverage. It
      matches to OpenRouter ids by exact slug/name only. The previous
      token-overlap fuzzy pass is gone: it paired `z-ai/glm-5.3-flash` with
-     AA's `glm-5-3` entry and published the wrong model's index. Without a
-     key there is no AA fallback: keyless runs get AA data only through the
-     OpenRouter benchmarks, and do so silently (the catalog records the
-     absence in `sources.aa.fallback`). Unmatched models simply score 0 on
-     quality — the tool degrades gracefully rather than failing.
+     AA's `glm-5-3` entry and published the wrong model's index. An API
+     failure or an empty result warns and leaves the fill to the next tier.
+   - **The published catalog (unkeyed runs)** — the repo's own
+     `catalog.json` at `https://model-compare.dev/catalog.json`, built by
+     keyed CI runs and hydrated by keyless local runs, joined by exact
+     catalog id.
+   - **OpenRouter benchmarks (last resort)**: the same undocumented frontend
+     API behind the [`?discount=true`](https://openrouter.ai/models?discount=true)
+     and ZDR filters also republishes the AA intelligence/coding/agentic
+     indices per model (`benchmarks.aa`), keyed by exact catalog slug. Used
+     only for models neither AA path covers. Unmatched models simply score
+     0 on quality — the tool degrades gracefully rather than failing.
 
 If no quality data is obtainable at all, the quality weight is dropped and the
 remaining weights renormalize.
@@ -71,21 +74,121 @@ good for interactive agents; `--include-batch` to keep them), models without
 a zero-data-retention (ZDR) endpoint by default (`--no-zdr` to consider
 everything), and (with `--exclude-free`) rate-limited `:free` variants.
 
-## Artificial Analysis data, in short
+## Quality sources and reconciliation
 
-The intelligence index no longer needs a separate source: OpenRouter
-republishes the AA indices alongside its own benchmark data, keyed by exact
-OpenRouter id, and the script reads them from the frontend API it already
-fetches. Only models missing there fall back to the AA API — the supported
-V2 free-tier endpoint
-[`/api/v2/language/models/free`](https://artificialanalysis.ai/data-api/docs)
-(key required; any tier key works, free is enough; responses paginate at 200
-models per page and are followed), matched by exact slug/name only. Without
-a key there is no fallback and no warning: OpenRouter is the primary source.
-With a key, an AA API failure or an empty result prints a warning on stderr.
-Both paths are cached identically; models without a value rank on
-price/context/age only. `--quality-ref` controls how
-generous the quality normalization is.
+Every quality value is a record, not a bare float:
+`{"index", "source", "as_of", "drift", "or_index", "or_as_of"}`. The record
+travels end to end: `--json` rows carry the five provenance fields
+(`quality_source`, `quality_as_of`, `quality_drift`, `quality_or_index`,
+`quality_or_as_of`), catalog v4 entries carry `quality_as_of` and
+`quality_drift` verbatim plus the winning source label in `quality_match`,
+the CLI footer's quality note names each source with its own as-of, and the
+site's QUAL tooltip renders it. Scoring reads only `record["index"]`:
+`cand["quality"]` stays the float index downstream consumers already
+expect, and `build_schedules` stores that float into the deals index —
+never the record dict.
+
+Precedence is a strict rank, never freshness — `as_of` never outranks
+precedence; it is display-only provenance. The chain is mode-scoped:
+
+- **Keyed runs** (`--aa-api-key`/`AA_API_KEY` set): live AA API → OpenRouter
+  benchmarks → none. The published catalog is **never fetched** on a keyed
+  run: a CI/site build hydrating from its own published output would be a
+  self-reference loop.
+- **Unkeyed runs**: published catalog → OpenRouter benchmarks → none. The
+  AA API is not consulted at all (there is no key), so keyless local runs
+  agree with the published site, which is itself built keyed.
+
+OpenRouter's benchmarks are the shared last resort for models neither AA
+path covers — never a competitor of a higher tier.
+
+Per-source matching and `as_of` semantics:
+
+1. **`aa` — live AA API** (`/api/v2/language/models/free`; any tier key
+   works, free is enough; responses paginate at 200 models per page and are
+   followed). Matched by exact slug/name tiers only — the fuzzy pass exists
+   in code but stays off in production (it is the proven variant-conflation
+   bug that paired `z-ai/glm-5.3-flash` with AA's `glm-5-3` entry).
+   `as_of` is the **fetch timestamp**: the Free API exposes no evaluation
+   date (checked against its OpenAPI spec — only `release_date` and the
+   envelope), so the fetch stamps itself; one ISO timestamp covers the
+   whole fetch and a cache hit reuses the stamped payload verbatim. The
+   envelope's `intelligence_index_version` (number or null; AA types it as
+   a number, displayed as "v4.3") is captured for the footer and
+   `sources.aa`. An API failure or an empty result warns and drops to the
+   next tier.
+2. **`catalog` — the published catalog** (`https://model-compare.dev/catalog.json`;
+   the github.io host 301s to plain http — an unauthenticated downgrade on
+   ranking-critical data — so the direct https URL is used deliberately).
+   The values were produced by a keyed CI run, so hydration is an exact
+   catalog-id join with no re-matching. Gates: `schema_version` must be an
+   int ≥ 3 (older warns "published catalog schema vX, expected >= 3" and
+   skips — accepting v3 is the deploy-day skew case); v3 rows are
+   normalized (`quality_match` "api" → "aa", `as_of` = the catalog's
+   `generated_at` — the live v3 artifact's null `quality_as_of` is ignored,
+   not passed through); v4+ rows keep their recorded `quality_as_of`. The
+   row labels are the keyed CI run's row-level truth inside the artifact
+   (`aa`/`openrouter` — a real catalog row never carries `catalog`); the
+   catalog tier labels every hydrated record `catalog` — the run-level
+   provenance is the source chain (read from our published catalog), not
+   the row's own label. A `generated_at` older than 14 days warns but is
+   used — the records' `as_of` makes the staleness visible downstream (the
+   check runs only when rows actually hydrate). Any shape surprise — a non-dict
+   document, a non-list `models`, a matched row whose quality is not a
+   finite number — skips the **whole artifact** with a warning: never a
+   partial hydration, never a raise; one malformed row means this is not
+   the artifact we think it is. A transport failure returns None; a
+   fetched-but-unusable artifact returns an empty map. The two sentinels
+   are deliberately indistinguishable downstream — both degrade to "catalog
+   unavailable" — and only a usable (non-empty) result is ever cached, so a
+   degraded payload self-heals on the next run.
+3. **`openrouter` — the frontend benchmarks**: keyed by exact catalog slug
+   via the frontend payload's slug/permaslug pairs, mapped in three passes
+   (permaslug pairs first; undated keys map to themselves only when
+   unclaimed; dated keys date-strip only when unambiguous — ambiguous
+   strips are dropped, never borrowed, and same-slug dated permaslugs
+   resolve latest-date-wins). `as_of` is the permaslug date (YYYYMMDD):
+   the listing's snapshot date, a proxy for the AA measurement date.
+   Matched via `base_model_id`, so a `:variant` suffix inherits its base's
+   trio.
+
+Drift is always winner-vs-OR: when the winner is `aa` or `catalog` and the
+OR trio for the same base id has a finite index, the record carries
+`or_index`/`or_as_of` and `drift = |index − or_index| ≥ 3.0`. When the
+winner IS `openrouter`, or no OR value exists, the drift pair is None —
+there is no second source to disagree with. Drift surfaces in `--json`, the
+catalog, the footer ("; drift vs OpenRouter snapshot (N)") and the site
+tooltip ("differs from OpenRouter snapshot (<or_index>, <or_as_of>)").
+
+The `sources.aa` block (reshaped in catalog v4) describes the **run's
+chain, not a match outcome**: `mode` names the tier that yielded — `aa`
+when the AA API returned usable entries (a keyed run whose fetch failed
+publishes `none`), `catalog` when an unkeyed run hydrated the published
+catalog (the branch fires on the counts alone, so hydrated rows still
+credit the catalog when its `generated_at` was unusable), `none` when
+neither tier produced data. OpenRouter is never a mode — its count lives
+in `matched_openrouter`. The three counts are disjoint buckets (strict rank
+gives every candidate at most one record); their sum is exactly the number
+of entries with a non-null `quality_match`, an invariant
+`web/build_site_data.py` enforces. `catalog_generated_at` and
+`intelligence_index_version` are null when their source was not consulted.
+The v3 block's `fallback` and `matched` keys are gone, and with them the
+old gate's vocabulary: `web/publish.py`'s `check_aa_source` now fails
+closed when `AA_API_KEY` is set but the published catalog shows no live AA
+data — `mode` not `aa` or `matched_aa` ≤ 0 — so a rejected key or an
+AA-less chain can no longer deploy silently; it checks right after the
+`--catalog` step, before any artifact is written, and never raises without
+the key.
+
+Cache keys pin the shapes: `aa-intelligence-v3` (AA entries carry `as_of`
+and the envelope version), `openrouter-frontend-aa-v2` (slug-keyed records
+with `as_of`), `published-catalog` (the hydration envelope). Payloads
+cached under earlier keys predate those fields and are never read. The
+source label `api` was renamed `aa` with the reconciliation; consumers
+(`web/build_site_data.py`) accept exactly `aa`/`catalog`/`openrouter`.
+Models without a resolved record stay quality-blind and rank on
+price/context/age only; `--quality-ref` controls how generous the quality
+normalization is.
 
 ## Caching
 
@@ -155,25 +258,42 @@ only its `priorities` mapping (rows with a string `model` id, optional
 `quality_index`, optional `discount`), validating nothing about
 `schema_version` — a v2 `data.json` therefore needs no downstream work. The
 catalog's strict consumer is the [model-compare OpenCode
-plugin](https://www.npmjs.com/package/model-compare-opencode-plugin), which
-rejects any catalog whose `schema_version` is not `2` and degrades gracefully
-(cached older document, then no pick, with warnings); a v3-accepting plugin
-release must land before or with the first v3 publish. Both facts were
-investigated against the live consumer repos on 2026-10-20 — see
-`docs/superpowers/notes/2026-10-20-downstream-investigations.md`. Same
+plugin](https://www.npmjs.com/package/model-compare-opencode-plugin). Its
+only published release (npm 0.1.3, `latest` as of 2026-10-23; the
+2026-10-20 investigation audited 0.1.1) pins `schema_version === 2` and
+degrades gracefully on anything else (cached older document, then no pick,
+with warnings). Its default `auto` source runs the vendored upstream pin
+(`vendor/model_compare.py`, byte-identical to upstream v0.3.1, which emits
+v2 catalogs), so default installs are unaffected by catalog schema bumps;
+the vendored pin is re-pinned via the plugin's `sync-vendor.mjs` flow when
+upstream cuts a release. The plugin's remote source fetches the published
+catalog and has therefore rejected every published catalog since the v3
+publish — the v3-accepting plugin release the v3 cutover required never
+shipped — and v4 extends that rejection: remote-source users keep serving
+their last cached document until a plugin release accepts the published
+schema and is installed. Both facts were investigated against the live
+consumer repos on 2026-10-20 — see
+`docs/superpowers/notes/2026-10-20-downstream-investigations.md` — and the
+npm 0.1.3 source (`src/core/catalog.ts` rejects any document whose
+`schema_version` is not `2`) was re-verified on 2026-10-23. Same
 inputs still produce the same output apart from `generated_at` and the age
 score (`age_days`/`listed_at` use UTC date precision, but `scores.age` decays
 continuously, so two runs on the same day differ slightly in `scores.age`).
-`schema_version` is now `3` (v1 pinned the pricing scalars to the base tier;
-v2 added the top-level `schedules` index): fields may be added without
-notice, but renaming, removing, **or changing the meaning of** one bumps the
-version. v3 changes the meaning of the per-model `pricing` block — see below.
+`schema_version` is now `4` (v1 pinned the pricing scalars to the base tier;
+v2 added the top-level `schedules` index; v3 made the per-model `pricing`
+block describe the baseline endpoint — see below; v4 added the quality
+provenance fields and reshaped `sources.aa` — see "Quality sources and
+reconciliation"): fields may be added without notice, but renaming,
+removing, **or changing the meaning of** one bumps the version.
 
 Top level: `schema_version`, `tool`, `generated_at`, `parameters` (all knobs
 plus the **effective** per-priority `weights` — reproducing `scores.overall`
 needs nothing else), `sources` (`openrouter`, `aa` with `mode`
-`openrouter`/`api`/`none`, `fallback` `api`/`none`, plus
-the `matched` and `matched_openrouter` counts, `zdr` `ok`/`skipped`, `discounts`
+`aa`/`catalog`/`none` — the run's quality chain, not a match outcome; see
+"Quality sources and reconciliation" — plus the disjoint counts
+`matched_aa`, `matched_catalog` and `matched_openrouter` and the provenance
+meta `catalog_generated_at`/`intelligence_index_version`, `zdr`
+`ok`/`skipped`, `discounts`
 `ok`/`unavailable` — where `unavailable` covers both a failed discount fetch
 and a live pool with zero discounts, `endpoints` always `ok` — endpoint-stage
 failures surface as pool drops, never as source state, `session_cost`
@@ -208,18 +328,16 @@ for candidates, else `null`), `max_discount` (4-decimal-rounded), `sched_note`,
 cheapest window) and the full `schedule` window list. Downstream
 time-weighted price for a window list: `Σ coverage × price` (per key).
 
-`sources.aa.mode` is `openrouter` whenever at least one candidate's AA data
-came from OpenRouter, and otherwise names the fallback. It says nothing about
-whether the AA API worked. `sources.aa.fallback` records that on its own:
-`api` when the AA API yielded entries, `none` when no key was set or the API
-failed or returned nothing. It is an additive field, so it arrived without a
-`schema_version` bump. Earlier releases could also report `scrape` (a JSON-LD
-page-scrape fallback, now removed); that value can no longer be produced and
-`web/build_site_data.py` rejects it, which needed no `schema_version` bump
-because no emitted document changes. With `AA_API_KEY` set,
-`web/publish.py` fails the run unless `fallback` is `api` — a rejected key
-yields `none` — and
-checks this right after the `--catalog` step, before any artifact is written.
+`sources.aa` was reshaped in v4 — the `fallback` and `matched` keys are
+gone, and with them the vocabulary that could report the removed JSON-LD
+page-scrape `scrape` mode. The block now names the run's quality chain, not
+a match outcome; the full semantics — the mode enum, the disjoint bucket
+counts and their sum invariant — are in "Quality sources and
+reconciliation" above. With `AA_API_KEY` set, `web/publish.py`
+(`check_aa_source`) fails the run unless the block shows live AA data —
+`mode` `aa` with `matched_aa` > 0; a rejected key or an AA-less chain fails
+closed — and it checks right after the `--catalog` step, before any
+artifact is written.
 
 `rankings` maps each priority (`balanced`, `price`, `quality`) to the full
 ordered list of candidate ids for that priority (every `models` id exactly
@@ -236,7 +354,10 @@ baseline endpoint's price structure in full** (see below) — `context`,
 `listed_at`, `age_days`, `tool_calling`, `zdr`, `discount`, `expired`,
 `quality` (AA intelligence index or `null`), `aa` (the OpenRouter-published
 trio `intelligence_index`/`coding_index`/`agentic_index`, each possibly
-`null`), `quality_match` (`openrouter`/`api`/`null`), `scores` —
+`null`), `quality_match` (`aa`/`catalog`/`openrouter` — the winning
+source's label — or `null`) with the v4 additive `quality_as_of` and
+`quality_drift` (the record's fields verbatim; `null` when unmatched),
+`scores` —
 the four component scores plus
 `overall` for all three priorities, so downstream consumers never re-run
 the scorer — and the v3 additive per-model blocks `endpoints`,
@@ -335,14 +456,17 @@ pool-accounting invariant (`sum(dropped) + candidates == listed`, enforced by
 `web/build_site_data.py`) and the publish drop-rate gate below, which read
 `pool.dropped`, break if a reason is produced but not registered.
 
-Version gates at the v3 cutover: catalog `schema_version` 3, `data.json` 2,
-`history.json` 3 — each a strict identity check accepting exactly that value
-and rejecting anything else. `web/publish.py` also fails the run when more
+Version gates: catalog `schema_version` 4, `data.json` 2, `history.json` 3
+— each a strict identity check accepting exactly that value and rejecting
+anything else (catalog 3 was the pricing cutover; the quality reconciliation
+bumped it to 4 without touching the other two — `data.json`'s new row keys
+are additive, so no downstream version moved). `web/publish.py` also fails the run when more
 than 5% of the entered pool (`candidates` + the two endpoint-stage drops) is
 dropped for an endpoint-derived reason (`no_baseline_eligible_endpoint` or
 `endpoint_fetch_failed`; constant `MAX_ENDPOINT_DROP_RATE = 0.05`) — a
 transient API outage or a first-party-detection miss must shrink the public
-ranking loudly, never silently. The history bump resets ALL snapshot
+ranking loudly, never silently. The history bump at the pricing cutover
+resets ALL snapshot
 history: prices, rank movement, the AA index and pool ids. Old snapshots
 describe old price semantics (advertised models-API scalars), so mixing them
 with baseline-endpoint prices would fabricate a fake price trend; no

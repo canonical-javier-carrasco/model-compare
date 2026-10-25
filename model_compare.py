@@ -68,6 +68,22 @@ OPENROUTER_ZDR_URL = "https://openrouter.ai/api/v1/endpoints/zdr"
 # (legacy endpoints 410 after 2026-11-04; see
 # https://artificialanalysis.ai/data-api/migrate-v2-data).
 AA_API_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
+# Cache key for the AA API entries envelope. v3 adds the per-fetch `as_of`
+# timestamp on every entry and the envelope's intelligence_index_version;
+# payloads under the pre-v3 keys predate those fields and must never be read.
+AA_ENTRIES_CACHE = "aa-intelligence-v3"
+# The repo's own published catalog.json -- built by keyed CI runs, hydrated
+# by unkeyed local runs (design: quality source reconciliation, source 2).
+# The github.io host 301s to plain http://model-compare.dev/catalog.json, an
+# unauthenticated downgrade on ranking-critical data; the https direct URL is
+# verified 200 application/json. Do not point this back at github.io.
+QUALITY_CATALOG_URL = "https://model-compare.dev/catalog.json"
+# Cache key for the hydration envelope {"by_id", "generated_at",
+# "schema_version"}. Only usable (non-empty by_id) results are ever written.
+QUALITY_CATALOG_CACHE = "published-catalog"
+# A published catalog generated more than this many days ago is stale:
+# warn but use -- the records' as_of makes the staleness visible downstream.
+QUALITY_CATALOG_MAX_AGE_DAYS = 14
 VERSION = "0.4.0"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
@@ -87,7 +103,7 @@ PRIORITY_WEIGHTS = {
     "quality": {"quality": 0.60, "price": 0.20, "context": 0.10, "age": 0.10},
 }
 
-CATALOG_SCHEMA_VERSION = 3
+CATALOG_SCHEMA_VERSION = 4
 
 # The drop-reason keys build_candidates counts, verbatim -- keep in sync with
 # its drop() call sites. pool.dropped lists all of them zero-filled so the
@@ -1197,6 +1213,183 @@ def fetch_session_cost(args) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Published catalog quality (hydration for unkeyed runs)
+# ---------------------------------------------------------------------------
+
+
+# Pre-reconciliation published catalogs (schema v3, written before the AA
+# tier was relabeled) record the AA tier as "api"; hydration normalizes it
+# to the final "aa" label. Every other recorded label passes through as-is.
+_QUALITY_SOURCE_NORMALIZATION = {"api": "aa"}
+
+
+def catalog_quality_by_id(doc) -> dict:
+    """Pure parser: a published catalog document -> {id: quality record}.
+
+    No fetch, no cache, no args object -- the fetcher owns transport and
+    freshness; this owns shape. Records are {"index", "source", "as_of"}
+    and feed resolve_quality's catalog_quality parameter on unkeyed runs;
+    the values were produced by a keyed CI run, so hydration is an exact
+    catalog-id join with no re-matching.
+
+    Gates (design: failure modes):
+    - schema_version must be an int >= 3; anything older warns
+      "published catalog schema vX, expected >= 3; skipping hydration"
+      and yields {}. Accepting v3 is the deploy-day skew case: the live
+      artifact predates the v4 per-row quality_as_of.
+    - Any shape surprise -- a non-dict document, a non-int schema_version,
+      a non-list models, a row without a usable id, or a matched row whose
+      quality is not a finite number or whose quality_match is not a
+      non-empty string -- warns and yields {} for the WHOLE artifact.
+      Never a partial hydration, never a raise: the catalog is
+      machine-generated, so one malformed row means this is not the
+      artifact we think it is.
+    - Rows with quality None and quality_match None are legitimate
+      unmatched models; they are skipped silently (nothing to hydrate).
+
+    Normalization: v3 rows map quality_match "api" -> "aa" and date every
+    row with the catalog's generated_at -- the live v3 artifact carries
+    quality_as_of: null, which must be ignored, not passed through.
+    v4+ rows keep their recorded quality_as_of (None when absent) and
+    source label as-is: that label is the row-level truth inside the
+    published artifact (a keyed CI run emits "aa"/"openrouter", never
+    "catalog"). resolve_quality's catalog tier owns the run-level label:
+    it relabels every hydrated record to the chain label "catalog".
+    """
+    if not isinstance(doc, dict):
+        warn("published catalog returned an unexpected response shape")
+        return {}
+    schema_version = doc.get("schema_version")
+    if type(schema_version) is not int:
+        warn("published catalog returned an unexpected response shape")
+        return {}
+    if schema_version < 3:
+        warn(
+            f"published catalog schema v{schema_version}, expected >= 3; "
+            "skipping hydration"
+        )
+        return {}
+    models = doc.get("models")
+    if not isinstance(models, list):
+        warn("published catalog returned an unexpected response shape")
+        return {}
+    generated_at = doc.get("generated_at")
+    v3_as_of = generated_at if isinstance(generated_at, str) and generated_at else None
+    by_id: dict = {}
+    for entry in models:
+        if not isinstance(entry, dict):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        model_id = entry.get("id")
+        if not (isinstance(model_id, str) and model_id):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        quality = entry.get("quality")
+        match = entry.get("quality_match")
+        if match is None and quality is None:
+            continue  # legitimate unmatched row: nothing to hydrate
+        if not (isinstance(match, str) and match):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        if not isinstance(quality, (int, float)) or isinstance(quality, bool):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        try:
+            index = float(quality)  # huge ints raise OverflowError
+        except OverflowError:
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        # Non-finite indexes would serialize as NaN and poison quality.
+        if not math.isfinite(index):
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        # The AA indexes run 0..100 (the range the catalog validator
+        # enforces on quality); an out-of-range value is poisoned data and
+        # degrades the whole artifact. The surface is unkeyed runs: only
+        # they hydrate from the published catalog.
+        if not 0.0 <= index <= 100.0:
+            warn("published catalog returned an unexpected response shape")
+            return {}
+        if schema_version == 3:
+            as_of = v3_as_of
+        else:
+            recorded = entry.get("quality_as_of")
+            as_of = recorded if isinstance(recorded, str) and recorded else None
+        by_id[model_id] = {
+            "index": index,
+            "source": _QUALITY_SOURCE_NORMALIZATION.get(match, match),
+            "as_of": as_of,
+        }
+    return by_id
+
+
+def fetch_quality_catalog(args) -> dict | None:
+    """Quality records from the published catalog.json, or None.
+
+    The third quality source (design: source 2): the repo's own published
+    catalog artifact, built by keyed CI runs and hydrated by unkeyed local
+    runs. Never called on keyed runs -- a CI/site build hydrating from the
+    published catalog would consume its own output (self-reference loop);
+    Task 4 owns that wiring.
+
+    Returns None only on TRANSPORT failure (after fetch_json's retries);
+    otherwise the envelope {"by_id": {id: record}, "generated_at":
+    str|None, "schema_version": int}. An empty by_id means
+    fetched-but-unusable (schema gate fail, malformed shape) -- Task 4's
+    footer treats None and empty by_id identically ("catalog unavailable").
+
+    The envelope is cached under QUALITY_CATALOG_CACHE with the standard
+    TTL, and only a usable (non-empty by_id) result is ever written: a
+    degraded payload must self-heal on the next run. --no-cache neither
+    reads nor writes. Staleness: generated_at older than
+    QUALITY_CATALOG_MAX_AGE_DAYS warns but uses -- as_of makes the
+    staleness visible downstream (the check runs only when rows actually
+    hydrate -- warning about the age of a catalog we are not using is
+    noise); an unusable generated_at warns that
+    staleness cannot be checked and still uses the rows (their as_of then
+    shows None rather than a wrong date).
+    """
+    if not args.no_cache:
+        cached = load_cache(QUALITY_CATALOG_CACHE, args.cache_ttl)
+        if isinstance(cached, dict) and isinstance(cached.get("by_id"), dict):
+            return cached
+    try:
+        doc = fetch_json(QUALITY_CATALOG_URL, timeout=30, retries=3)
+    except Exception as exc:
+        warn(f"published catalog request failed ({exc})")
+        return None
+    by_id = catalog_quality_by_id(doc)
+    generated_at = doc.get("generated_at") if isinstance(doc, dict) else None
+    if not isinstance(generated_at, str):
+        generated_at = None
+    schema_version = doc.get("schema_version") if isinstance(doc, dict) else 0
+    if type(schema_version) is not int:
+        schema_version = 0
+    result = {
+        "by_id": by_id,
+        "generated_at": generated_at,
+        "schema_version": schema_version,
+    }
+    if by_id:
+        generated = parse_iso_datetime(generated_at)
+        if generated is None:
+            warn(
+                "published catalog generated_at is missing or unparseable; "
+                "cannot check staleness"
+            )
+        else:
+            age_days = (datetime.now(timezone.utc) - generated).total_seconds() / 86400
+            if age_days > QUALITY_CATALOG_MAX_AGE_DAYS:
+                warn(
+                    f"published catalog is stale (generated {generated_at}, "
+                    f"{age_days:.0f} days old); using it anyway"
+                )
+        if not args.no_cache:
+            save_cache(QUALITY_CATALOG_CACHE, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # OpenRouter catalog
 # ---------------------------------------------------------------------------
 
@@ -1215,7 +1408,9 @@ def fetch_openrouter_models(args):
 
 
 FRONTEND_DISCOUNTS_CACHE = "openrouter-frontend-discounts"
-FRONTEND_AA_CACHE = "openrouter-frontend-aa"
+# v2: AA records are keyed by exact catalog slug and carry as_of (#17);
+# v1 cached the conflated date-stripped shape, so the old key is never read.
+FRONTEND_AA_CACHE = "openrouter-frontend-aa-v2"
 
 
 def fetch_openrouter_frontend(args):
@@ -1273,7 +1468,8 @@ def fetch_openrouter_frontend(args):
                 key = slug if variant in ("", "standard") else f"{slug}:{variant}"
                 fresh_discounts.setdefault(key, float(raw))
             fresh_aa = build_aa_benchmarks(
-                data.get("benchmarks") if isinstance(data, dict) else None
+                data.get("benchmarks") if isinstance(data, dict) else None,
+                entries,
             )
             if fresh_discounts:
                 discounts = fresh_discounts
@@ -1764,7 +1960,7 @@ def parse_iso_datetime(value):
 # ---------------------------------------------------------------------------
 
 
-def aa_api_entries(api_key: str) -> list:
+def aa_api_entries(api_key: str) -> tuple[list, float | int | None]:
     """Intelligence entries from AA's V2 language models endpoint.
 
     Documented envelope: {tier, intelligence_index_version, pagination,
@@ -1775,8 +1971,16 @@ def aa_api_entries(api_key: str) -> list:
     has_more/total_pages contract with a 25-page hard cap; a failure past
     page 1 is best-effort (warn, keep earlier pages), a page-1 failure
     propagates.
+
+    Returns (entries, version): version is the envelope's
+    intelligence_index_version (number-or-null) -- provenance for the whole
+    fetch. Every surviving entry carries `as_of`, one ISO fetch timestamp
+    shared by the whole fetch, so the cache and any downstream record can
+    date the data even after the envelope's version is lost.
     """
     entries = {}
+    version = None
+    as_of = datetime.now(timezone.utc).isoformat()
     page = 1
     while page <= 25:  # hard cap: halt after processing page 25
         try:
@@ -1791,6 +1995,15 @@ def aa_api_entries(api_key: str) -> list:
             warn(f"AA API page {page} failed ({exc}); using entries collected so far")
             break
         data = payload.get("data") if isinstance(payload, dict) else None
+        # The envelope's version is one provenance fact for the whole
+        # fetch; the last page's value wins (they are identical in practice).
+        raw_version = (
+            payload.get("intelligence_index_version")
+            if isinstance(payload, dict)
+            else None
+        )
+        if isinstance(raw_version, (int, float)) and not isinstance(raw_version, bool):
+            version = raw_version
         for item in data if isinstance(data, list) else []:
             if not isinstance(item, dict):
                 continue
@@ -1823,6 +2036,10 @@ def aa_api_entries(api_key: str) -> list:
                     "key": key,
                     "name": name if isinstance(name, str) and name else key,
                     "index": index,
+                    # One fetch timestamp for the whole fetch: every entry
+                    # from this run shares it, so the cache payload and any
+                    # downstream record can date the data exactly.
+                    "as_of": as_of,
                 },
             )
         pag = payload.get("pagination") if isinstance(payload, dict) else None
@@ -1834,37 +2051,53 @@ def aa_api_entries(api_key: str) -> list:
         if isinstance(total_pages, int) and page >= total_pages:
             break
         page += 1
-    return list(entries.values())
+    return list(entries.values()), version
 
 
 def fetch_aa_entries(args):
     """AA intelligence entries from the keyed AA API v2, or nothing.
 
-    Returns (entries, source, cached). With a key, an API failure or an
-    empty result warns and yields ([], None, False). Without a key this is
-    silent and yields ([], None, False): OpenRouter's benchmarks are the
-    primary source and the catalog records the absence (sources.aa).
+    Returns (entries, source, cached, index_version). With a key, an API
+    failure or an empty result warns and yields ([], None, False, None).
+    Without a key this is silent and yields ([], None, False, None):
+    OpenRouter's benchmarks cover what they cover and the catalog records
+    the absence (sources.aa).
+
+    `index_version` is the envelope's intelligence_index_version (number
+    or null) -- provenance for the whole fetch. Entries carry `as_of`, one
+    ISO fetch timestamp for the whole fetch; a cache hit reuses the
+    stamped payload verbatim so cached rows stay dated exactly like fresh
+    ones.
     """
     if not args.no_cache:
-        # v2: entries cached under the old key predate the V2 endpoint
-        # migration and must never be read. Only AA API entries are read;
-        # build_catalog rejects any other source as unknown.
-        cached = load_cache("aa-intelligence-v2", args.cache_ttl)
+        # v3: payloads cached under earlier keys predate the as_of stamp and
+        # the intelligence_index_version capture and must never be read.
+        # Only AA API entries are read; build_catalog rejects any other
+        # source as unknown.
+        cached = load_cache(AA_ENTRIES_CACHE, args.cache_ttl)
         if isinstance(cached, dict) and cached.get("source") == "AA API v2":
-            return cached.get("entries", []), cached.get("source"), True
+            return (
+                cached.get("entries", []),
+                cached.get("source"),
+                True,
+                cached.get("version"),
+            )
     api_key = args.aa_api_key or os.environ.get("AA_API_KEY")
     if not api_key:
-        return [], None, False
+        return [], None, False, None
     try:
-        entries = aa_api_entries(api_key)
+        entries, version = aa_api_entries(api_key)
     except Exception as exc:
         warn(f"AA API request failed ({exc})")
-        return [], None, False
+        return [], None, False, None
     if not entries:
         warn("AA API returned no intelligence scores")
-        return [], None, False
-    save_cache("aa-intelligence-v2", {"entries": entries, "source": "AA API v2"})
-    return entries, "AA API v2", False
+        return [], None, False, None
+    save_cache(
+        AA_ENTRIES_CACHE,
+        {"entries": entries, "source": "AA API v2", "version": version},
+    )
+    return entries, "AA API v2", False, version
 
 
 # ---------------------------------------------------------------------------
@@ -1873,6 +2106,13 @@ def fetch_aa_entries(args):
 
 
 def build_aa_lookup(entries):
+    """Index the AA entries into exact and fuzzy lookup maps.
+
+    Values are (index, as_of) pairs, not bare floats: the as_of travels
+    with the match so resolve_quality can date every AA-sourced record
+    without re-scanning the raw entry list. Entries without a usable key
+    or a finite numeric index are skipped.
+    """
     exact = {}
     fuzzy = []
     for entry in entries:
@@ -1885,11 +2125,12 @@ def build_aa_lookup(entries):
         # Non-finite indexes would serialize as NaN and poison quality.
         if not math.isfinite(index):
             continue
+        as_of = entry.get("as_of") if isinstance(entry.get("as_of"), str) else None
 
         def put(tier, raw):
             normalized = norm_key(raw)
             if normalized:
-                exact.setdefault((tier, normalized), index)
+                exact.setdefault((tier, normalized), (index, as_of))
 
         if "/" in key:
             put(0, key)
@@ -1900,11 +2141,17 @@ def build_aa_lookup(entries):
         put(3, PAREN_RE.sub(" ", name))
         tokens = set(norm_key(key).split()) | set(norm_key(name).split())
         if tokens:
-            fuzzy.append((tokens, index))
+            fuzzy.append((tokens, (index, as_of)))
     return exact, fuzzy
 
 
 def match_quality(model, exact, fuzzy, allow_fuzzy=False):
+    """Match a candidate to an AA entry; exact tiers only unless fuzzy is on.
+
+    Returns the winning entry's (index, as_of) pair, or None when no tier
+    matches. Values come straight out of build_aa_lookup's maps, so the
+    as_of is the entry's own fetch stamp, never a re-lookup.
+    """
     model_id = model["id"]
     name = model.get("name") or ""
     display = PROVIDER_PREFIX_RE.sub("", name).strip()
@@ -1927,14 +2174,14 @@ def match_quality(model, exact, fuzzy, allow_fuzzy=False):
     own = set(norm_key(base).split()) | set(norm_key(display).split())
     if own:
         best = 0.0
-        best_index = None
-        for tokens, index in fuzzy:
+        best_match = None
+        for tokens, match in fuzzy:
             overlap = len(own & tokens) / len(own | tokens)
             if overlap > best:
                 best = overlap
-                best_index = index
-        if best >= 0.5 and best_index is not None:
-            return best_index
+                best_match = match
+        if best >= 0.5 and best_match is not None:
+            return best_match
     return None
 
 
@@ -1946,24 +2193,37 @@ def base_model_id(model_id: str) -> str:
 AA_BENCHMARK_FIELDS = ("intelligence_index", "coding_index", "agentic_index")
 
 
-def build_aa_benchmarks(benchmarks) -> dict:
-    """Map bare OpenRouter id -> OR-published AA trio from data.benchmarks.
+def build_aa_benchmarks(benchmarks, models=None) -> dict:
+    """Map exact catalog slug -> OR-published AA trio from data.benchmarks.
 
-    Keys are dated permaslugs (z-ai/glm-5.3-flash-20260826): the trailing
-    -YYYYMMDD is stripped and undated keys map to themselves; when two keys
-    strip to the same id the latest date wins. Values failing the
-    finite-number guard are treated as absent; entries with at least one
-    valid field are kept.
+    Benchmark keys are dated permaslugs (deepseek/deepseek-v4.1-flash-
+    20261017) whose date-stripped form can collide across listings of one
+    model family: the snapshot listing deepseek/deepseek-v4.1-flash-1017
+    and the base listing deepseek/deepseek-v4.1-flash both strip to
+    deepseek/deepseek-v4.1-flash, so blind stripping with latest-date-wins
+    made the base listing borrow the snapshot's score (#17). Keys resolve
+    through three explicit passes over the surviving entries, and every
+    accepted id is claimed by the pass that resolved it, so later passes
+    never overwrite an earlier one:
+
+    1. Primary: a key equal to a models entry's permaslug maps to that
+       entry's slug -- the catalog's own pairing, no guessing. Several
+       dated permaslugs may legitimately pair with one slug (snapshot
+       variants of one listing); among those the latest date wins.
+    2. Undated: a key without a -YYYYMMDD suffix maps to itself, unless
+       pass 1 claimed the id.
+    3. Dated fallback: a dated key the catalog does not pair strips via
+       strip_permaslug_date, accepted only when the stripped id is
+       unclaimed and no other pass-3 key strips to the same id -- an
+       ambiguous strip is the #17 conflation shape, so every candidate
+       for that id drops rather than guess.
+
+    Entries whose values fail the finite-number guard are treated as
+    absent before the passes run; entries with at least one valid field
+    are kept. Records carry "as_of": the YYYYMMDD of the permaslug the
+    trio came from, or None for undated keys.
     """
-    aa_by_id = {}
-    seen_date = {}
-
-    def accept(bare, date, trio):
-        if bare in seen_date and seen_date[bare] >= date:
-            return
-        seen_date[bare] = date
-        aa_by_id[bare] = trio
-
+    valid = {}  # benchmark key -> (trio, permaslug date or "")
     for key, node in (benchmarks or {}).items():
         aa = node.get("aa") if isinstance(node, dict) else None
         if not isinstance(aa, dict):
@@ -1979,36 +2239,152 @@ def build_aa_benchmarks(benchmarks) -> dict:
                 trio[field] = float(value)
         if not trio:
             continue
-        match = re.match(r"^(.*)-(\d{8})$", key)
-        if match:
-            accept(match.group(1), match.group(2), trio)
-        else:
-            accept(key, "", trio)
+        bare = strip_permaslug_date(key)
+        # strip_permaslug_date removed a trailing -YYYYMMDD exactly when
+        # the key was dated; the date is then the final 8 characters.
+        valid[key] = (trio, "" if bare == key else key[-8:])
+
+    permaslug_to_slug = {}  # the catalog's own slug/permaslug pairing
+    for entry in models or []:
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get("slug") or ""
+        permaslug = entry.get("permaslug") or ""
+        if slug and permaslug:
+            # standard and batch variants repeat an identical pair; the
+            # overwrite is the dedup
+            permaslug_to_slug[permaslug] = slug
+
+    aa_by_id = {}
+    claimed = set()
+
+    def record(trio, date):
+        return {**trio, "as_of": date or None}
+
+    # Pass 1: permaslug keys pair with their own slug; same-slug
+    # snapshots resolve to the latest date (first wins on an equal date).
+    seen_date = {}
+    for key, (trio, date) in valid.items():
+        slug = permaslug_to_slug.get(key)
+        if slug is None or (slug in seen_date and seen_date[slug] >= date):
+            continue
+        seen_date[slug] = date
+        aa_by_id[slug] = record(trio, date)
+        claimed.add(slug)
+
+    # Pass 2: undated keys self-map unless pass 1 claimed the id.
+    for key, (trio, date) in valid.items():
+        if date or key in permaslug_to_slug or key in claimed:
+            continue
+        aa_by_id[key] = record(trio, date)
+        claimed.add(key)
+
+    # Pass 3: unpaired dated keys strip, but only onto an unclaimed id
+    # and only when the strip is unambiguous.
+    strip_candidates = {}
+    for key, (trio, date) in valid.items():
+        if not date or key in permaslug_to_slug:
+            continue
+        stripped = strip_permaslug_date(key)
+        strip_candidates.setdefault(stripped, []).append((date, trio))
+    for bare, candidates in strip_candidates.items():
+        if bare in claimed or len(candidates) > 1:
+            continue
+        date, trio = candidates[0]
+        aa_by_id[bare] = record(trio, date)
+        claimed.add(bare)
+
     return aa_by_id
 
 
-def resolve_quality(candidates, aa_by_id, exact, fuzzy, aa_source):
-    """Per-candidate quality: OR benchmarks first, AA exact fallback, else None.
+def resolve_quality(
+    candidates, aa_by_id, exact, fuzzy, aa_source, catalog_quality=None
+):
+    """Per-candidate quality records: AA API primary, catalog next, OR last.
 
-    OR's per-slug values cannot mispair; the AA fallback is exact-tier only
-    (match_quality's fuzzy tier is the proven variant-conflation bug and
-    stays off in production). Source values match the catalog contract:
-    "openrouter", "api".
+    Resolution order per candidate (inverted from the pre-reconciliation
+    behavior where OpenRouter's benchmarks won):
+      1. AA API entries -- match_quality's exact tiers (fuzzy stays off in
+         production: it is the proven variant-conflation bug).
+      2. catalog_quality -- records hydrated from the published catalog on
+         unkeyed runs. Every winner is labeled "catalog": the run-level
+         provenance is the source chain (read from our published catalog),
+         overriding the row's own "aa"/"openrouter" label -- that label is
+         the keyed CI run's row-level truth inside the artifact, and no
+         real catalog row ever carries "catalog". as_of stays the row's
+         own stamp.
+      3. OpenRouter's benchmark trio -- per-slug, matched via
+         base_model_id, so a :variant suffix inherits its base's trio.
+      4. No match -- the candidate stays quality-blind downstream.
+
+    Every winner is a record {"index", "source", "as_of", "drift",
+    "or_index", "or_as_of"}; compute_scores and build_schedules read
+    record["index"], so cand["quality"] stays the float index they already
+    expect. Drift is computed only when the winner is NOT OpenRouter: the
+    OR trio for the same base model acts as the check value, and a
+    disagreement of >= 3.0 points flags the record. When the winner IS
+    OpenRouter (or no OR value exists) the drift pair is None -- there is
+    no second source to disagree with.
     """
-    fallback_source = {"AA API v2": "api"}.get(aa_source)
     quality_by_id = {}
     source_by_id = {}
     for cand in candidates:
-        bench = aa_by_id.get(base_model_id(cand["id"]))
-        intelligence = bench.get("intelligence_index") if bench else None
-        if intelligence is not None:
-            quality_by_id[cand["id"]] = intelligence
-            source_by_id[cand["id"]] = "openrouter"
+        record = None
+        # Tier 1: AA API exact match. match_quality returns the winning
+        # entry's (index, as_of) pair.
+        match = match_quality({"id": cand["id"], "name": cand["name"]}, exact, fuzzy)
+        if match is not None:
+            index, as_of = match
+            record = {"index": index, "source": "aa", "as_of": as_of}
+        # Tier 2: catalog record (unkeyed runs hydrate from the published
+        # catalog). The run-level provenance label is the source chain:
+        # every hydrated record is tagged "catalog" -- read from our
+        # published catalog -- overriding the row's own label, which is
+        # the keyed CI run's row-level truth inside the artifact ("aa"/
+        # "openrouter"; no real catalog row ever carries "catalog").
+        # as_of stays the row's own stamp (v4 rows carry the CI run's
+        # recorded quality_as_of; v3 rows the catalog's generated_at --
+        # catalog_quality_by_id normalizes that).
+        if record is None and catalog_quality is not None:
+            catalog_record = catalog_quality.get(cand["id"])
+            if catalog_record is not None:
+                record = {
+                    "index": catalog_record["index"],
+                    "source": "catalog",
+                    "as_of": catalog_record["as_of"],
+                }
+        # Tier 3: OpenRouter's per-slug benchmark trio (last resort).
+        if record is None:
+            bench = aa_by_id.get(base_model_id(cand["id"]))
+            intelligence = bench.get("intelligence_index") if bench else None
+            if intelligence is not None:
+                record = {
+                    "index": intelligence,
+                    "source": "openrouter",
+                    "as_of": bench.get("as_of"),
+                }
+        if record is None:
             continue
-        index = match_quality({"id": cand["id"], "name": cand["name"]}, exact, fuzzy)
-        if index is not None:
-            quality_by_id[cand["id"]] = index
-            source_by_id[cand["id"]] = fallback_source
+
+        # Drift: only meaningful when the winner is not OpenRouter itself.
+        bench = aa_by_id.get(base_model_id(cand["id"])) or {}
+        or_intelligence = bench.get("intelligence_index")
+        if (
+            record["source"] in ("aa", "catalog")
+            and isinstance(or_intelligence, (int, float))
+            and not isinstance(or_intelligence, bool)
+            and math.isfinite(or_intelligence)
+        ):
+            record["or_index"] = or_intelligence
+            record["or_as_of"] = bench.get("as_of")
+            record["drift"] = abs(record["index"] - or_intelligence) >= 3.0
+        else:
+            record["or_index"] = None
+            record["or_as_of"] = None
+            record["drift"] = None
+
+        quality_by_id[cand["id"]] = record
+        source_by_id[cand["id"]] = record["source"]
     return quality_by_id, source_by_id
 
 
@@ -2033,7 +2409,9 @@ def _per_1m(price_per_token: float) -> float:
     return round(price_per_token * 1_000_000.0, 6)
 
 
-def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
+def build_schedules(
+    models, args, quality_by_id, aa_by_id, balanced_by_id, catalog_quality=None
+):
     """Catalog-wide off-peak index built from the RAW model list (spec 5.4).
 
     Deliberately unfiltered by the candidate pool: sub-floor-context and
@@ -2041,6 +2419,12 @@ def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
     schedule models mostly sit below the 1M context floor). Router aliases
     (~ids) and malformed ids are excluded; :batch variants are included as
     distinct deals. Sorted by id.
+
+    Quality falls back through the same chain resolve_quality walks, minus
+    its AA tier (the AA lookup only ever matched candidates): candidate
+    records, then the hydrated catalog (unkeyed runs), then OpenRouter's
+    benchmark trio. Every schedule row carries the winner's provenance
+    (quality_source/quality_as_of) so the site's QUAL tooltip can render.
     """
     entries = []
     for model in models:
@@ -2065,10 +2449,38 @@ def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
             continue
         peak = max(windows, key=lambda window: window["blended"])
         offpeak = min(windows, key=lambda window: window["blended"])
-        quality = quality_by_id.get(model_id)
+        # quality_by_id values are records {"index", "source", ...}; the
+        # schedule row keeps the bare float index verbatim (never a dict)
+        # and echoes the winning record's provenance for the QUAL tooltip.
+        # Fallback chain mirrors resolve_quality's minus its AA tier:
+        # candidate record, hydrated catalog record (unkeyed runs; every
+        # hydrated record is relabeled with the run-level chain label
+        # "catalog", exactly like resolve_quality's catalog tier), then
+        # OpenRouter's benchmark trio (row label "openrouter").
+        record = quality_by_id.get(model_id)
+        if isinstance(record, dict):
+            quality = record.get("index")
+            quality_source = record.get("source")
+            quality_as_of = record.get("as_of")
+        else:
+            quality = record
+            quality_source = None
+            quality_as_of = None
+        if quality is None and catalog_quality is not None:
+            catalog_record = catalog_quality.get(model_id)
+            if catalog_record is not None:
+                quality = catalog_record["index"]
+                quality_source = "catalog"
+                quality_as_of = catalog_record["as_of"]
         if quality is None:
             benchmark = aa_by_id.get(base_model_id(model_id)) or {}
             quality = benchmark.get("intelligence_index")
+            if quality is not None:
+                quality_source = "openrouter"
+                quality_as_of = benchmark.get("as_of")
+            else:
+                quality_source = None
+                quality_as_of = None
         name = model.get("name") or model_id
         entries.append(
             {
@@ -2076,6 +2488,10 @@ def build_schedules(models, args, quality_by_id, aa_by_id, balanced_by_id):
                 "name": PROVIDER_PREFIX_RE.sub("", name).strip() or name,
                 "context": coerce_int(model.get("context_length"), 0),
                 "quality": quality,
+                # Provenance for the site's QUAL tooltip (null when the
+                # quality came without any -- e.g. a bare-float test map).
+                "quality_source": quality_source,
+                "quality_as_of": quality_as_of,
                 "score": balanced_by_id.get(model_id),
                 "max_discount": eff["max_discount"],
                 "sched_note": fmt_sched_note(eff["max_discount"]),
@@ -2285,11 +2701,19 @@ def compute_scores(candidates, args, quality_by_id):
                 0.0, min(1.0, 1.0 - (math.log10(price + 0.01) - low) / price_span)
             )
         quality = quality_by_id.get(cand["id"])
-        cand["quality"] = quality
-        if quality is None:
+        # quality_by_id values are records {"index", "source", ...}; the
+        # candidate keeps the bare float index (that is what ranking_key,
+        # build_catalog's quality field and print_json's quality_index all
+        # expect) and the full record travels alongside for provenance.
+        record = quality if isinstance(quality, dict) else None
+        cand["quality"] = record["index"] if record else quality
+        cand["quality_record"] = record
+        if cand["quality"] is None:
             cand["quality_score"] = 0.0
         else:
-            cand["quality_score"] = max(0.0, min(1.0, quality / args.quality_ref))
+            cand["quality_score"] = max(
+                0.0, min(1.0, cand["quality"] / args.quality_ref)
+            )
         context = cand["context"]
         cand["context_score"] = (
             max(0.0, min(1.0, math.log(context / floor_ctx) / ctx_span))
@@ -2427,6 +2851,109 @@ def fmt_quant_note(annotations: dict) -> str | None:
     return note
 
 
+def _footer_as_of(source, value):
+    """Format a record's as_of for its footer block (None when unusable).
+
+    Two stamp shapes circulate. A YYYYMMDD date (OpenRouter's benchmark
+    date, and catalog rows hydrated from OR rows) renders as a plain date
+    ("as of 2026-10-17") for ANY source -- a date-only stamp never
+    fabricates a time of day. ISO stamps: live AA records carry one fetch
+    timestamp for the whole fetch (checked today), so their block shows
+    the time of day only; other rows carry the full stamp ("as of
+    2026-10-23 13:15Z").
+    """
+    if not value:
+        return None
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    if source == "aa":
+        return parsed.strftime("%H:%MZ")
+    return parsed.strftime("%Y-%m-%d %H:%MZ")
+
+
+def _as_of_instant(value):
+    """Parse an as_of stamp to a comparable UTC instant (None when unusable).
+
+    The pipeline carries ISO stamps and the YYYYMMDD benchmark date; a
+    date-only stamp means "that day" and compares as midnight UTC.
+    """
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return parse_iso_datetime(f"{text[:4]}-{text[4:6]}-{text[6:]}")
+    return parse_iso_datetime(value)
+
+
+def _later_as_of(value, current) -> bool:
+    """True when the value stamp names a later instant than current.
+
+    Parsed instants, never raw strings: a YYYYMMDD stamp must not
+    lexicographically beat a fresher ISO stamp ("20261017" sorts above
+    every "2026-..." string). Ties keep the earlier pick; an unparseable
+    stamp never displaces anything.
+    """
+    new, old = _as_of_instant(value), _as_of_instant(current)
+    if new is None or old is None:
+        return new is not None
+    return new > old
+
+
+def quality_footer_note(quality_by_id, aa_index_version, unmatched):
+    """Compose the footer's quality note from the resolved records.
+
+    Lists per-source counts, each source's own as_of and the AA index
+    version when known, e.g. "AA index v4.3 - live AA (58, checked 13:15Z)
+    | our catalog (12, as of 2026-10-23 13:15Z) | OpenRouter snapshot (2,
+    as of 2026-10-17)". A trailing "unmatched score 0" names candidates
+    with no quality record, and a drift footnote appears when any resolved
+    record disagrees with the OpenRouter check value. Returns None when no
+    record resolved -- run() falls back to the quality-blind note.
+    """
+    labels = {
+        "aa": "live AA",
+        "catalog": "our catalog",
+        "openrouter": "OpenRouter snapshot",
+    }
+    stamp_words = {"aa": "checked", "catalog": "as of", "openrouter": "as of"}
+    counts = {}
+    latest = {}
+    for record in quality_by_id.values():
+        source = record.get("source")
+        if source not in labels:
+            continue
+        counts[source] = counts.get(source, 0) + 1
+        value = record.get("as_of")
+        if value:
+            current = latest.get(source)
+            if current is None or _later_as_of(value, current):
+                latest[source] = value
+    blocks = []
+    for source in ("aa", "catalog", "openrouter"):
+        count = counts.get(source, 0)
+        if not count:
+            continue
+        stamp = _footer_as_of(source, latest.get(source))
+        if stamp:
+            blocks.append(f"{labels[source]} ({count}, {stamp_words[source]} {stamp})")
+        else:
+            blocks.append(f"{labels[source]} ({count})")
+    if not blocks:
+        return None
+    note = "quality: "
+    if aa_index_version is not None:
+        note += f"AA index v{aa_index_version} - "
+    note += " | ".join(blocks)
+    if unmatched:
+        note += "; unmatched score 0"
+    drift = sum(1 for record in quality_by_id.values() if record.get("drift"))
+    if drift:
+        note += f"; drift vs OpenRouter snapshot ({drift})"
+    return note
+
+
 def print_table(top, total_candidates, weights, quality_note):
     headers = [
         "RANK",
@@ -2514,6 +3041,15 @@ def print_json(top):
             "name": cand["name"],
             "score": round(cand["score"], 4),
             "quality_index": cand["quality"],
+            # Provenance block, verbatim from the quality record resolved
+            # in compute_scores: the winning tier's source and as_of plus
+            # the drift check against OpenRouter's benchmarks. Rows without
+            # a record (pre-endpoint test paths) degrade to None.
+            "quality_source": (cand.get("quality_record") or {}).get("source"),
+            "quality_as_of": (cand.get("quality_record") or {}).get("as_of"),
+            "quality_drift": (cand.get("quality_record") or {}).get("drift"),
+            "quality_or_index": (cand.get("quality_record") or {}).get("or_index"),
+            "quality_or_as_of": (cand.get("quality_record") or {}).get("or_as_of"),
             "input_usd_per_m": round(cand["price_in"], 6),
             "output_usd_per_m": round(cand["price_out"], 6),
             "blended_usd_per_m": round(cand["blended"], 6),
@@ -2584,6 +3120,9 @@ def build_catalog(
     quality_source_by_id,
     session_cost=None,
     session_cost_mode="skipped",
+    index_version=None,
+    catalog_generated_at=None,
+    catalog_quality=None,
 ):
     """Assemble the full-catalog document (see README "Catalog output").
 
@@ -2595,22 +3134,52 @@ def build_catalog(
     session_cost is the Task 7 fetch envelope (verbatim, medians included)
     or None; session_cost_mode is run()'s resolution of the key-presence
     fact ("ok" / "unavailable" / "skipped") -- build_catalog stays pure and
-    never fetches or inspects the environment itself.
+    never fetches or inspects the environment itself. index_version is the
+    AA envelope's intelligence_index_version (number or null) and
+    catalog_generated_at the published catalog's generated_at when this
+    run hydrated from it (else None); both pass verbatim into sources.aa.
+    catalog_quality is the hydrated record map (or None): candidates read
+    it through resolve_quality, and build_schedules falls back to it for
+    non-candidates.
     """
     now = datetime.now(timezone.utc)
     weights = catalog_weights(candidates, quality_by_id)
-    aa_modes = {"AA API v2": "api"}
-    if aa_source is not None and aa_source not in aa_modes:
-        # Never claim mode "none" for a source we do not know: the document
-        # would contradict itself (mode none with matched quality scores).
+    if aa_source is not None and aa_source != "AA API v2":
+        # Never publish a document whose AA source we cannot name: the
+        # consumers' mode enum has no slot for it.
         raise ValueError(f"unknown AA source: {aa_source!r}")
+    # The three counts are disjoint label buckets: resolve_quality's strict
+    # rank gives every candidate at most one record, so their sum is exactly
+    # the number of entries with a non-null quality_match -- the invariant
+    # the site validator enforces. A label outside the buckets would break
+    # it silently, so it fails loudly here.
+    matched_aa = sum(1 for s in quality_source_by_id.values() if s == "aa")
+    matched_catalog = sum(1 for s in quality_source_by_id.values() if s == "catalog")
     matched_openrouter = sum(
         1 for s in quality_source_by_id.values() if s == "openrouter"
     )
-    # fallback is what the AA API yielded on its own; mode
-    # hides it behind "openrouter" as soon as one OpenRouter match exists.
-    aa_fallback = aa_modes.get(aa_source, "none")
-    aa_mode = "openrouter" if matched_openrouter else aa_fallback
+    unknown = sorted(
+        {
+            s
+            for s in quality_source_by_id.values()
+            if s not in ("aa", "catalog", "openrouter")
+        }
+    )
+    if unknown:
+        raise ValueError(f"unknown quality source: {unknown[0]!r}")
+    # mode is the run's quality chain, not a match outcome: "aa" when the
+    # AA API returned usable entries, "catalog" when unkeyed runs hydrated
+    # the published catalog, "none" when neither tier produced data.
+    # OpenRouter's benchmarks are the chain's shared last resort, never a
+    # mode of their own -- matched_openrouter carries their count. The
+    # catalog branch also fires on the counts alone: hydrated records are
+    # proof of a usable catalog even when its generated_at was unusable.
+    if aa_source is not None:
+        aa_mode = "aa"
+    elif catalog_generated_at is not None or matched_catalog or matched_aa:
+        aa_mode = "catalog"
+    else:
+        aa_mode = "none"
 
     entries = []
     for cand in candidates:
@@ -2641,6 +3210,12 @@ def build_catalog(
                 4,
             )
         bench = aa_by_id.get(base_model_id(cand["id"])) or {}
+        # The quality record map is already a parameter; the winning
+        # record's as_of and drift verdict become entry fields verbatim.
+        # Unmatched candidates degrade to null -- same shape as the v3
+        # additive blocks below.
+        record = quality_by_id.get(cand["id"])
+        record = record if isinstance(record, dict) else None
         entries.append(
             {
                 "id": cand["id"],
@@ -2708,6 +3283,11 @@ def build_catalog(
                 },
                 "quality": cand["quality"],
                 "quality_match": quality_source_by_id.get(cand["id"]),
+                # Provenance (schema v4), verbatim from the record: the
+                # winning source's own as_of and the drift verdict against
+                # OpenRouter's check value.
+                "quality_as_of": record["as_of"] if record else None,
+                "quality_drift": record["drift"] if record else None,
                 "scores": {**scores, "overall": overall},
                 # Additive provider-aware blocks (schema v3), verbatim from
                 # the candidate. Candidates that never went through the
@@ -2732,7 +3312,7 @@ def build_catalog(
 
     return {
         "schedules": build_schedules(
-            models, args, quality_by_id, aa_by_id, balanced_by_id
+            models, args, quality_by_id, aa_by_id, balanced_by_id, catalog_quality
         ),
         "schema_version": CATALOG_SCHEMA_VERSION,
         "tool": "model-compare",
@@ -2753,9 +3333,15 @@ def build_catalog(
             "openrouter": "ok",
             "aa": {
                 "mode": aa_mode,
-                "fallback": aa_fallback,
-                "matched": len(quality_by_id),
+                "matched_aa": matched_aa,
+                "matched_catalog": matched_catalog,
                 "matched_openrouter": matched_openrouter,
+                # Provenance meta (schema v4): the published catalog's stamp
+                # when this run hydrated from it, and the AA envelope's
+                # intelligence index version when the AA API ran. Both null
+                # when their source was not consulted.
+                "catalog_generated_at": catalog_generated_at,
+                "intelligence_index_version": index_version,
             },
             "zdr": "skipped" if args.no_zdr else "ok",
             "discounts": "ok" if discounts else "unavailable",
@@ -2941,7 +3527,30 @@ def run(args, models, or_cached) -> int:
             "(--no-zdr to override)"
         )
         return 1
-    aa_entries, aa_source, aa_cached = fetch_aa_entries(args)
+    # Mode-scoped quality chains: a keyed run consults the AA API only; an
+    # unkeyed run hydrates from the published catalog only. The catalog
+    # fetcher must NEVER run on keyed builds -- a CI/site build hydrating
+    # from the published catalog would consume its own output (a
+    # self-reference loop). Both chains end in OpenRouter's benchmarks as
+    # the last resort, then nothing.
+    if args.aa_api_key or os.environ.get("AA_API_KEY"):
+        aa_entries, aa_source, aa_cached, aa_index_version = fetch_aa_entries(args)
+        catalog_quality = None
+        catalog_generated_at = None
+    else:
+        aa_entries, aa_source, aa_cached, aa_index_version = [], None, False, None
+        # None (transport failure) and an empty by_id (fetched-but-unusable
+        # artifact) both degrade to no catalog tier -- resolve_quality and
+        # the footer treat them identically as "catalog unavailable".
+        catalog_doc = fetch_quality_catalog(args)
+        catalog_quality = (catalog_doc or {}).get("by_id") or None
+        # The catalog meta only means something when hydration actually
+        # produced rows: an unusable artifact contributes no meta, so the
+        # sources block and the mode never credit a catalog that yielded
+        # nothing.
+        catalog_generated_at = (
+            (catalog_doc or {}).get("generated_at") if catalog_quality else None
+        )
     exact, fuzzy = build_aa_lookup(aa_entries)
 
     filtered = []
@@ -2967,7 +3576,7 @@ def run(args, models, or_cached) -> int:
         return 2
 
     quality_by_id, quality_source_by_id = resolve_quality(
-        candidates, aa_by_id, exact, fuzzy, aa_source
+        candidates, aa_by_id, exact, fuzzy, aa_source, catalog_quality
     )
     weights = compute_scores(candidates, args, quality_by_id)
 
@@ -3009,6 +3618,9 @@ def run(args, models, or_cached) -> int:
                 quality_source_by_id,
                 session_cost,
                 session_cost_mode,
+                aa_index_version,
+                catalog_generated_at,
+                catalog_quality,
             )
         )
         return 0
@@ -3027,23 +3639,14 @@ def run(args, models, or_cached) -> int:
                 f"{v} {k}" for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])
             )
             drop_note = f" (dropped: {bits})"
-        matched_or = sum(1 for s in quality_source_by_id.values() if s == "openrouter")
-        matched_aa = len(quality_by_id) - matched_or
+        # The footer lists per-source counts, each source's own as_of and
+        # the AA index version when known; unmatched candidates and drift
+        # get trailing footnotes. No record resolved -> the quality-blind
+        # fallback note.
         unmatched = len(candidates) - len(quality_by_id)
-        bits = []
-        if matched_or:
-            bits.append(f"OpenRouter benchmarks ({matched_or})")
-        if matched_aa:
-            bits.append(f"{aa_source} exact ({matched_aa})")
-        if bits:
-            quality_note = (
-                f"quality via {' + '.join(bits)}: matched "
-                f"{len(quality_by_id)}/{len(candidates)} candidates"
-            )
-            if unmatched:
-                quality_note += "; unmatched candidates score 0 on quality"
-        else:
-            quality_note = "quality data unavailable, ranked on price/context/age"
+        quality_note = quality_footer_note(
+            quality_by_id, aa_index_version, unmatched
+        ) or ("quality data unavailable, ranked on price/context/age")
         source_note = []
         if or_cached:
             source_note.append("catalog cached")
