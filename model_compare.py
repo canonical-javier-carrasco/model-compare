@@ -3044,7 +3044,7 @@ LEGENDS = {
             "$IN/$OUT",
             [
                 "USD per 1M tokens at the cheapest eligible endpoint, blended",
-                "75% input / 25% output (--input-share); differs from the",
+                "{in_pct} input / {out_pct} output (--input-share); differs from the",
                 "openrouter.ai default-endpoint price by design. A higher rate",
                 "may apply once the prompt outgrows a model's short-context tier.",
             ],
@@ -3070,7 +3070,7 @@ LEGENDS = {
     ),
     "simple": (
         ("RANK", ["position in this ranking"]),
-        ("MODEL", ["provider-qualified id (openrouter/<provider>/<model>)"]),
+        ("MODEL", ["provider/model id as listed; --best prefixes openrouter/"]),
         (
             "QUALITY",
             ['Artificial Analysis intelligence index; "-" = unknown (scores 0)'],
@@ -3079,7 +3079,7 @@ LEGENDS = {
             "IN/OUT $/M",
             [
                 "USD per 1M tokens at the cheapest eligible endpoint, blended",
-                "75% input / 25% output (--input-share)",
+                "{in_pct} input / {out_pct} output (--input-share)",
             ],
         ),
         ("DISCOUNT", ["active discount, if any"]),
@@ -3112,7 +3112,15 @@ def table_cells(cand, rank):
     }
 
 
-def print_table(top, weights, quality_note, detail="expert", style=None, bare=False):
+def print_table(
+    top,
+    weights,
+    quality_note,
+    detail="expert",
+    style=None,
+    bare=False,
+    input_share=0.75,
+):
     style = style or Style(False)
     columns = TABLE_COLUMNS[detail]
     rows = [table_cells(cand, rank) for rank, cand in enumerate(top, 1)]
@@ -3154,7 +3162,13 @@ def print_table(top, weights, quality_note, detail="expert", style=None, bare=Fa
     print()
     legend = LEGENDS[detail]
     width = max(len(term) for term, _ in legend)
+    in_pct = f"{input_share:.0%}"
+    out_pct = f"{1 - input_share:.0%}"
     for term, lines in legend:
+        lines = [
+            line.replace("{in_pct}", in_pct).replace("{out_pct}", out_pct)
+            for line in lines
+        ]
         print(style.bold(term.ljust(width)) + "  " + lines[0])
         for extra in lines[1:]:
             print(" " * (width + 2) + extra)
@@ -3214,13 +3228,21 @@ def print_deals(rows, style=None, bare=False):
             )
         )
         print()
-    print("  ".join(style.bold(pad(col, col)) for col in DEALS_COLUMNS))
+    header = []
+    for col in DEALS_COLUMNS:
+        text = pad(col, col)
+        header.append(text if col == "SCORE" else style.bold(text))
+    print("  ".join(header))
     print(style.dim("  ".join("-" * widths[col] for col in DEALS_COLUMNS)))
     for cell in cells:
         out = []
         for col in DEALS_COLUMNS:
             text = pad(col, cell[col])
-            out.append(style.bold(text) if col == "OFF-PEAK" else text)
+            if col == "OFF-PEAK":
+                text = style.bold(text)
+            elif col == "QUAL" and cell[col] == "-":
+                text = style.dim(text)
+            out.append(text)
         print("  ".join(out))
     if bare:
         return
@@ -3935,6 +3957,7 @@ def run(args, models, or_cached) -> int:
             detail=args.detail,
             style=style,
             bare=args.bare,
+            input_share=args.input_share,
         )
         if args.off_peak:
             catalog_w = catalog_weights(candidates, quality_by_id)
@@ -3945,6 +3968,14 @@ def run(args, models, or_cached) -> int:
             schedules = build_schedules(
                 models, args, quality_by_id, aa_by_id, balanced, catalog_quality
             )
+            # build_schedules fills quality for any listed model; the deals
+            # table shows "-" for models outside the ranked pool (web parity),
+            # so blank it here without touching the catalog's behavior.
+            candidate_ids = {cand["id"] for cand in candidates}
+            schedules = [
+                row if row["id"] in candidate_ids else {**row, "quality": None}
+                for row in schedules
+            ]
             print_deals(off_peak_deals(schedules), style=style, bare=args.bare)
     return 0
 

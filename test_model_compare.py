@@ -2364,8 +2364,8 @@ def test_print_table_color_rules(capsys):
     lines = capsys.readouterr().out.splitlines()
     header = lines[0]
     assert header.startswith("\x1b[1mRANK\x1b[0m")
-    assert "\x1b[1mSCORE\x1b[0m" not in header
     assert "SCORE" in header
+    assert not re.search(r"\x1b\[1m\s*SCORE", header)
     first_row = next(line for line in lines if top[0]["id"] in line)
     assert "\x1b[32m" in first_row
     assert re.search(r"\x1b\[1m\s*1\x1b\[0m", first_row)
@@ -6797,37 +6797,39 @@ def test_parse_args_output_flag_defaults():
     assert args.bare is False
 
 
-def test_parse_args_rejects_unknown_detail_and_color():
-    for argv in (["--detail", "fancy"], ["--color", "sometimes"]):
-        with pytest.raises(SystemExit):
-            mc.parse_args(argv)
+@pytest.mark.parametrize(
+    "argv,flag,value",
+    [(["--detail", "fancy"], "--detail", "fancy"), (["--color", "sometimes"], "--color", "sometimes")],
+)
+def test_parse_args_rejects_unknown_detail_and_color(argv, flag, value, capsys):
+    with pytest.raises(SystemExit) as exc:
+        mc.parse_args(argv)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert f"argument {flag}: invalid choice: '{value}'" in err
 
 
 def test_help_groups_output_options(capsys):
     with pytest.raises(SystemExit):
         mc.parse_args(["--help"])
     out = capsys.readouterr().out
-    for heading in (
-        "output:",
-        "ranking:",
-        "filters:",
-        "data sources & cache:",
-    ):
+    headings = {
+        name: f"\n{name}:\n"
+        for name in ("output", "ranking", "filters", "data sources & cache")
+    }
+    for heading in headings.values():
         assert heading in out
     # Search after each heading: the usage line lists every option up front.
+    at = {name: out.index(heading) for name, heading in headings.items()}
+    assert at["output"] < out.index("--bare", at["output"]) < at["ranking"]
+    assert at["ranking"] < out.index("--priority", at["ranking"]) < at["filters"]
     assert (
-        out.index("output:")
-        < out.index("--bare", out.index("output:"))
-        < out.index("ranking:")
+        at["filters"]
+        < out.index("--min-context", at["filters"])
+        < at["data sources & cache"]
     )
-    assert (
-        out.index("ranking:")
-        < out.index("--priority", out.index("ranking:"))
-        < out.index("filters:")
-    )
-    assert out.index("filters:") < out.index("--min-context", out.index("filters:"))
-    assert out.index("data sources & cache:") < out.index(
-        "--cache-ttl", out.index("data sources & cache:")
+    assert at["data sources & cache"] < out.index(
+        "--cache-ttl", at["data sources & cache"]
     )
 
 
@@ -6954,10 +6956,47 @@ def test_print_deals_dashes_out_of_pool_score_and_quality(capsys):
         }
     ]
     mc.print_deals(rows)
-    row = next(
-        line for line in capsys.readouterr().out.splitlines() if "acme/deal" in line
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("MODEL"))
+    row = next(line for line in lines if "acme/deal" in line)
+    for column in ("QUAL", "SCORE"):
+        end = header.index(column) + len(column)
+        assert row[:end].endswith(" -")  # right-aligned cell under its header
+    assert row.endswith("-")  # SCORE is the last column
+
+
+def _deal_row(**overrides):
+    row = {
+        "id": "acme/deal",
+        "sched_note": "-45%",
+        "sched_detail": "daily 01:00-05:00 UTC",
+        "quality": 38.9,
+        "offpeak": {"input_per_1m": 0.017, "output_per_1m": 0.066},
+        "context": 256000,
+        "score": 0.661,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_print_deals_color_header_and_placeholders(capsys):
+    mc.print_deals(
+        [_deal_row(), _deal_row(id="acme/unknown", quality=None, score=None)],
+        style=mc.Style(True),
     )
-    assert row.count("-") >= 3  # sched "-45%" plus QUAL and SCORE placeholders
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if "SCORE" in line and "MODEL" in line)
+    assert re.search(r"\x1b\[1m\s*OFF-PEAK\s*\x1b\[0m", header)
+    assert re.search(r"\x1b\[1m\s*QUAL\s*\x1b\[0m", header)
+    assert not re.search(r"\x1b\[1m\s*SCORE", header)
+    known = next(line for line in lines if "acme/deal" in line)
+    assert re.search(r"\x1b\[1m\s*-45%\x1b\[0m", known)
+    assert "\x1b[2m" not in known
+    unknown = next(line for line in lines if "acme/unknown" in line)
+    assert re.search(r"\x1b\[2m\s*-\x1b\[0m", unknown)  # QUAL placeholder
+    assert not re.search(r"\x1b\[1m[^\x1b]*SCORE", unknown)
+    assert unknown.endswith("-")  # SCORE placeholder stays plain
+    assert not unknown.endswith("\x1b[0m")
 
 
 def test_run_off_peak_appends_deals(monkeypatch, capsys):
@@ -6990,3 +7029,151 @@ def test_run_bare_off_peak_suppresses_title_and_legend(monkeypatch, capsys):
     assert "Off-peak deals" not in out
     assert "largest scheduled discount" not in out
     assert "acme/deal" in out
+
+
+def test_run_off_peak_non_candidate_deal_dashes_quality_and_score(monkeypatch, capsys):
+    # build_schedules fills QUAL from the hydrated catalog even for models
+    # outside the ranked pool; the deals table must still show "-" for both
+    # QUAL and SCORE there, while a ranked deal keeps its numbers.
+    models = [
+        make_model(id="acme/ranked", name="Acme: Ranked", pricing=deepseek_pricing()),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+        ),
+    ]
+    catalog_doc = _catalog_doc(
+        [
+            {"id": "acme/ranked", "quality": 41.0, "quality_match": "aa"},
+            {
+                "id": "acme/sched-only",
+                "quality": 30.0,
+                "quality_match": "openrouter",
+                "quality_as_of": "20261017",
+            },
+        ],
+        schema_version=4,
+    )
+    catalog = {
+        "by_id": mc.catalog_quality_by_id(catalog_doc),
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schema_version": 4,
+    }
+    _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
+    args = make_args(off_peak=True, bare=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("MODEL"))
+    qual_end = header.index("QUAL") + len("QUAL")
+    ranked = next(line for line in lines if line.startswith("acme/ranked"))
+    sched_only = next(line for line in lines if line.startswith("acme/sched-only"))
+    assert ranked[:qual_end].endswith("41.0")
+    assert not ranked.endswith("-")
+    assert sched_only[:qual_end].endswith(" -")
+    assert "30.0" not in sched_only
+    assert sched_only.endswith("-")  # SCORE
+
+
+def test_run_off_peak_catalog_output_keeps_non_candidate_quality(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/candidate", name="Acme: Candidate"),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+        ),
+    ]
+    catalog_doc = _catalog_doc(
+        [{"id": "acme/sched-only", "quality": 30.0, "quality_match": "openrouter"}],
+        schema_version=4,
+    )
+    catalog = {
+        "by_id": mc.catalog_quality_by_id(catalog_doc),
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schema_version": 4,
+    }
+    _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
+    args = make_args(catalog=True, off_peak=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    (sched,) = json.loads(capsys.readouterr().out)["schedules"]
+    assert sched["quality"] == 30.0
+
+
+@pytest.mark.parametrize("detail", ["expert", "simple"])
+def test_print_table_legend_shows_actual_input_share(detail, capsys):
+    mc.print_table(
+        _scored_candidates(),
+        mc.PRIORITY_WEIGHTS["balanced"],
+        None,
+        detail=detail,
+        input_share=0.5,
+    )
+    out = capsys.readouterr().out
+    assert "50% input / 50% output (--input-share)" in out
+    assert "75% input" not in out
+
+
+def test_print_table_legend_defaults_to_75_25(capsys):
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
+    assert "75% input / 25% output (--input-share)" in capsys.readouterr().out
+
+
+def test_run_legend_uses_args_input_share(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(input_share=0.9), models, False) == 0
+    assert "90% input / 10% output (--input-share)" in capsys.readouterr().out
+
+
+def test_print_table_simple_model_legend_matches_printed_ids(capsys):
+    top = _scored_candidates()
+    mc.print_table(
+        top, mc.PRIORITY_WEIGHTS["balanced"], None, detail="simple"
+    )
+    out = capsys.readouterr().out
+    assert "openrouter/<provider>/<model>" not in out
+    assert "MODEL       provider/model id as listed; --best prefixes openrouter/" in out
+    assert top[0]["id"] in out  # the table prints the bare id
+
+
+def test_run_bare_suppresses_cached_note(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(bare=True), models, True) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_run_cached_note_printed_when_not_bare(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(), models, True) == 0
+    assert "note: catalog cached (use --no-cache to refresh)" in capsys.readouterr().err
+
+
+def test_run_bare_keeps_zdr_refusal_warning(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    monkeypatch.setattr(
+        mc, "fetch_openrouter_frontend", lambda a: ({}, set(), {}, set())
+    )
+    assert mc.run(make_args(bare=True), models, False) == 1
+    captured = capsys.readouterr()
+    assert "ZDR data unavailable; refusing to rank" in captured.err
+    assert captured.out == ""
+
+
+def test_run_color_on_dims_dropped_line_on_stderr(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/short", name="Acme: Short", context_length=1000),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(color="on", min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    err = capsys.readouterr().err
+    assert "\x1b[2m(dropped: 1 context)\x1b[0m" in err
+    assert "1 of 2 listed models ranked" in err
+    assert "\x1b[" not in err.replace("\x1b[2m(dropped: 1 context)\x1b[0m", "")
