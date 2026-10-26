@@ -68,6 +68,10 @@ def make_args(**overrides):
         # parse_args always provides this (mirror the production shape);
         # None means the keyless fast path in fetch_session_cost.
         openrouter_api_key=None,
+        detail="expert",
+        off_peak=False,
+        bare=False,
+        color="auto",
     )
     base.update(overrides)
     return Namespace(**base)
@@ -6660,3 +6664,45 @@ def test_run_no_network_quality_blind_ranking_unchanged(monkeypatch, capsys):
     out = capsys.readouterr().out
     pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
     assert "quality data unavailable, ranked on price/context/age" in pool_line
+
+
+def test_parse_args_output_flag_defaults():
+    args = mc.parse_args([])
+    assert args.color == "auto"
+    assert args.detail == "expert"
+    assert args.off_peak is False
+    assert args.bare is False
+
+
+def test_parse_args_rejects_unknown_detail_and_color():
+    for argv in (["--detail", "fancy"], ["--color", "sometimes"]):
+        with pytest.raises(SystemExit):
+            mc.parse_args(argv)
+
+
+def test_help_groups_output_options(capsys):
+    with pytest.raises(SystemExit):
+        mc.parse_args(["--help"])
+    out = capsys.readouterr().out
+    for heading in (
+        "output:",
+        "ranking:",
+        "filters:",
+        "data sources & cache:",
+    ):
+        assert heading in out
+    # Search after each heading: the usage line lists every option up front.
+    assert (
+        out.index("output:")
+        < out.index("--bare", out.index("output:"))
+        < out.index("ranking:")
+    )
+    assert (
+        out.index("ranking:")
+        < out.index("--priority", out.index("ranking:"))
+        < out.index("filters:")
+    )
+    assert out.index("filters:") < out.index("--min-context", out.index("filters:"))
+    assert out.index("data sources & cache:") < out.index(
+        "--cache-ttl", out.index("data sources & cache:")
+    )

@@ -3438,99 +3438,127 @@ def parse_args(argv=None):
         action="version",
         version=f"%(prog)s {VERSION}",
     )
-    parser.add_argument(
+    output = parser.add_argument_group("output")
+    ranking = parser.add_argument_group("ranking")
+    filters = parser.add_argument_group("filters")
+    sources = parser.add_argument_group("data sources & cache")
+    filters.add_argument(
         "--min-context",
         type=int,
         default=1_000_000,
         help="hard minimum context window in tokens (default: 1000000)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--priority",
         choices=sorted(PRIORITY_WEIGHTS),
         default="balanced",
         help="ranking emphasis (default: balanced)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--top", type=int, default=5, help="how many models to list (default: 5)"
     )
-    parser.add_argument(
+    output.add_argument(
         "--best",
         action="store_true",
         help="print only the #1 model as an opencode id (openrouter/<model>), for scripting",
     )
-    parser.add_argument(
+    output.add_argument(
         "--json", action="store_true", help="print the ranked candidates as JSON"
     )
-    parser.add_argument(
+    output.add_argument(
         "--catalog",
         action="store_true",
         help="print the full model catalog (ranked candidates and filtered-out models with reasons) as one JSON document; ignores --top and --priority, cannot be combined with --best or --json",
     )
-    parser.add_argument(
+    output.add_argument(
+        "--detail",
+        choices=("simple", "expert"),
+        default="expert",
+        help="table density (default: expert; simple hides PREC, TIER, CTX and "
+        "SCORE, mimicking the web page's simple view)",
+    )
+    output.add_argument(
+        "--off-peak",
+        action="store_true",
+        help="also list scheduled off-peak deals, ranked by discount size",
+    )
+    output.add_argument(
+        "--bare",
+        action="store_true",
+        help="print just the table(s), no summary or legend",
+    )
+    output.add_argument(
+        "--color",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="colorize the table output (default: auto; honors NO_COLOR, and on "
+        "forces color when piping through less -R)",
+    )
+    ranking.add_argument(
         "--input-share",
         type=float,
         default=0.75,
         help="input-token share used for the blended price, 0-1 (default: 0.75)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--recency-half-life",
         type=float,
         default=120.0,
         help="age decay half-life in days (default: 120)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--max-age-days",
         type=float,
         default=0.0,
         help="drop models listed more than this many days ago (0 = off)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--quality-ref",
         type=float,
         default=70.0,
         help="AA intelligence index that counts as full quality score (default: 70)",
     )
-    parser.add_argument(
+    sources.add_argument(
         "--aa-api-key",
         default=None,
         help="Artificial Analysis API key (or set AA_API_KEY; free at artificialanalysis.ai)",
     )
-    parser.add_argument(
+    sources.add_argument(
         "--openrouter-api-key",
         default=None,
         help="OpenRouter API key (or set OPENROUTER_API_KEY; free at openrouter.ai/keys)",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--no-require-tools",
         action="store_true",
         help="do not require tool-calling support (coding agents want it)",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--exclude-free",
         action="store_true",
         help="drop zero-cost listings such as rate-limited :free variants",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--include-batch",
         action="store_true",
         help="keep ':batch' variants (asynchronous completion; cheaper but unsuitable for interactive agents)",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--discount",
         action="store_true",
         help="only list models with an active discount",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--no-zdr",
         action="store_true",
         help="consider all models, not just zero-data-retention (ZDR) ones",
     )
-    parser.add_argument(
+    sources.add_argument(
         "--no-cache",
         action="store_true",
         help="bypass the local response cache and refetch",
     )
-    parser.add_argument(
+    sources.add_argument(
         "--cache-ttl",
         type=int,
         default=6 * 3600,
