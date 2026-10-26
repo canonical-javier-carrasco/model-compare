@@ -2983,7 +2983,10 @@ def quality_footer_note(quality_by_id, aa_index_version, unmatched):
             blocks.append(f"{labels[source]} ({count} model{plural})")
     if not blocks:
         return None
-    if aa_index_version is not None:
+    if aa_index_version is not None and counts.get("aa"):
+        # Only the AA block gets the index-version prefix; a run whose first
+        # (or only) source is the OpenRouter snapshot must not be mislabelled
+        # as an AA index version.
         blocks[0] = f"AA index v{aa_index_version} - {blocks[0]}"
     clauses = []
     if unmatched:
@@ -3092,10 +3095,23 @@ def fmt_quality(value) -> str:
     return "-" if value is None else f"{value:.1f}"
 
 
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def display_text(value) -> str:
+    """Return untrusted text safe to print: strip C0/C1 control characters.
+
+    Model ids come from the OpenRouter API. An id carrying ESC (SGR/CSI
+    injection) or a newline (forged output lines) must never reach the
+    terminal raw. Normal ids pass through unchanged.
+    """
+    return _CONTROL_CHARS_RE.sub("", str(value))
+
+
 def table_cells(cand, rank):
     return {
         "RANK": str(rank),
-        "MODEL": cand["id"],
+        "MODEL": display_text(cand["id"]),
         "QUAL": fmt_quality(cand["quality"]),
         "QUALITY": fmt_quality(cand["quality"]),
         "$IN/M": fmt_price(cand["price_in"]),
@@ -3110,6 +3126,31 @@ def table_cells(cand, rank):
         "AGE": fmt_age(cand["age_days"]),
         "SCORE": f"{cand['score']:.3f}",
     }
+
+
+def format_weights(weights) -> str:
+    """Render weights as integer percentages that sum to exactly 100.
+
+    Naive per-item ``:.0%`` rounding can print 101% (or 99%) because each
+    share rounds independently. Largest-remainder rounding floors every
+    share, then hands the leftover points to the largest fractional parts
+    (deterministic name tie-break) so the line is always self-consistent.
+    """
+    items = sorted(weights.items(), reverse=True)
+    total = sum(value for _, value in items)
+    if total <= 0:
+        return ", ".join(f"{name} 0%" for name, _ in items)
+    exact = [(name, value / total * 100) for name, value in items]
+    floors = [
+        (name, math.floor(share), share - math.floor(share)) for name, share in exact
+    ]
+    remainder = 100 - sum(floor for _, floor, _ in floors)
+    order = sorted(range(len(floors)), key=lambda i: (-floors[i][2], floors[i][0]))
+    bumped = set(order[:remainder])
+    return ", ".join(
+        f"{name} {floor + (1 if index in bumped else 0)}%"
+        for index, (name, floor, _) in enumerate(floors)
+    )
 
 
 def print_table(
@@ -3143,6 +3184,8 @@ def print_table(
             text = pad(col, row[col])
             if col == "RANK":
                 text = style.bold(text)
+                if rank == 1:
+                    text = style.green(text)
             elif rank == 1:
                 text = style.green(text)
             elif col in ("QUAL", "QUALITY") and row[col] == "-":
@@ -3152,10 +3195,7 @@ def print_table(
     if bare:
         return
     print()
-    print(
-        "Weights: "
-        + ", ".join(f"{k} {v:.0%}" for k, v in sorted(weights.items(), reverse=True))
-    )
+    print("Weights: " + format_weights(weights))
     warn = not quality_note or quality_note.get("warn")
     for line in quality_source_lines(quality_note):
         print(style.yellow(line) if warn else line)
@@ -3194,11 +3234,13 @@ DEALS_LEGEND = (
 def print_deals(rows, style=None, bare=False):
     style = style or Style(False)
     if not rows:
+        if not bare:
+            print()
         print("No scheduled off-peak discounts in the current data.")
         return
     cells = [
         {
-            "MODEL": row["id"],
+            "MODEL": display_text(row["id"]),
             "OFF-PEAK": row["sched_note"],
             "SCHEDULE": row["sched_detail"] or "--",
             "QUAL": fmt_quality(row["quality"]),
@@ -3230,7 +3272,9 @@ def print_deals(rows, style=None, bare=False):
         print()
     header = []
     for col in DEALS_COLUMNS:
-        text = pad(col, col)
+        # Every deals header is left-aligned (matching the main table and
+        # the frozen mockup); only the data cells keep numeric right-align.
+        text = col.ljust(widths[col])
         header.append(text if col == "SCORE" else style.bold(text))
     print("  ".join(header))
     print(style.dim("  ".join("-" * widths[col] for col in DEALS_COLUMNS)))
@@ -3910,7 +3954,7 @@ def run(args, models, or_cached) -> int:
     top = candidates[:limit]
 
     if args.best:
-        print(opencode_model_id(top[0]["id"]))
+        print(display_text(opencode_model_id(top[0]["id"])))
     elif args.json:
         print_json(top)
     else:
@@ -3961,21 +4005,20 @@ def run(args, models, or_cached) -> int:
         )
         if args.off_peak:
             catalog_w = catalog_weights(candidates, quality_by_id)
+            # Use the exact unrounded weighted score (not overall_scores,
+            # whose rounded components can disagree by 0.001) so a candidate
+            # in both tables always prints the same SCORE under balanced.
+            balanced_w = catalog_w["balanced"]
             balanced = {
-                cand["id"]: overall_scores(cand, catalog_w)["balanced"]
-                for cand in candidates
+                cand["id"]: weighted_score(cand, balanced_w) for cand in candidates
             }
             schedules = build_schedules(
                 models, args, quality_by_id, aa_by_id, balanced, catalog_quality
             )
-            # build_schedules fills quality for any listed model; the deals
-            # table shows "-" for models outside the ranked pool (web parity),
-            # so blank it here without touching the catalog's behavior.
-            candidate_ids = {cand["id"] for cand in candidates}
-            schedules = [
-                row if row["id"] in candidate_ids else {**row, "quality": None}
-                for row in schedules
-            ]
+            # build_schedules resolves quality for any listed model; the web
+            # page's deals table shows that resolved value even for models
+            # outside the ranked pool, so keep it here too. Only SCORE is
+            # blanked for non-candidates (balanced is None for them).
             print_deals(off_peak_deals(schedules), style=style, bare=args.bare)
     return 0
 
