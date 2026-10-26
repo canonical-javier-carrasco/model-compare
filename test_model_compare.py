@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -2165,12 +2166,7 @@ def test_cli_table_shows_prec_column_and_risk_marker(monkeypatch, capsys):
     candidates, _ = mc.build_candidates(models, args, {}, {m["id"] for m in models}, [])
     candidates, _ = mc.apply_endpoint_pricing(candidates, args, [])
     mc.compute_scores(candidates, args, {})
-    mc.print_table(
-        candidates[:2],
-        len(candidates),
-        mc.PRIORITY_WEIGHTS["balanced"],
-        "quality data unavailable, ranked on price/context/age",
-    )
+    mc.print_table(candidates[:2], mc.PRIORITY_WEIGHTS["balanced"], None)
     out = capsys.readouterr().out
     header = out.splitlines()[0]
     assert "PREC" in header
@@ -2179,12 +2175,8 @@ def test_cli_table_shows_prec_column_and_risk_marker(monkeypatch, capsys):
     assert "fp8!" in risk_row
     plain_row = next(line for line in out.splitlines() if "anthropic/claude" in line)
     assert "n/a" in plain_row
-    assert (
-        "PREC = precision the ranked price is quoted at (maker's default when "
-        "disclosed, best available otherwise; ! = default routing favors "
-        "cheaper sub-default endpoints); prices are the cheapest live endpoint "
-        "at that precision."
-    ) in out
+    assert 'PREC      quoted precision ("!" = default routing favors cheaper' in out
+    assert "sub-default endpoints)" in out
 
 
 def test_json_rows_carry_quant_note(monkeypatch, capsys):
@@ -2327,7 +2319,7 @@ def test_json_time_schedule_string(capsys):
 
 
 def test_table_has_tier_column(capsys):
-    mc.print_table(_scored_candidates(), 2, mc.PRIORITY_WEIGHTS["balanced"], "note")
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
     out = capsys.readouterr().out
     lines = out.splitlines()
     header = lines[0]
@@ -2337,6 +2329,89 @@ def test_table_has_tier_column(capsys):
     assert ">100k" in tiered_row
     plain_row = next(line for line in lines if "acme/plain" in line)
     assert ">100k" not in plain_row
+
+
+def test_print_table_expert_columns_and_legend(capsys):
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
+    out = capsys.readouterr().out
+    header = out.splitlines()[0]
+    for column in ("RANK", "MODEL", "QUAL", "$IN/M", "$OUT/M", "DISC", "PREC", "TIER", "CTX", "AGE", "SCORE"):
+        assert column in header
+    assert header.index("DISC") < header.index("PREC") < header.index("TIER") < header.index("CTX")
+    assert "PREC      quoted precision" in out
+    assert "TIER      how prices vary" in out
+    assert "SCORE     weighted blend of the four criteria above" in out
+    assert "Weights: " in out
+
+
+def test_print_table_simple_view_drops_expert_columns(capsys):
+    mc.print_table(
+        _scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None, detail="simple"
+    )
+    out = capsys.readouterr().out
+    header = out.splitlines()[0]
+    assert "QUALITY" in header and "DISCOUNT" in header
+    for column in ("PREC", "TIER", "CTX", "SCORE"):
+        assert column not in header
+    assert "RANK        position in this ranking" in out
+    assert "IN/OUT $/M  USD per 1M tokens" in out
+    assert "PREC" not in out
+
+
+def test_print_table_color_rules(capsys):
+    top = _scored_candidates()
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    lines = capsys.readouterr().out.splitlines()
+    header = lines[0]
+    assert header.startswith("\x1b[1mRANK\x1b[0m")
+    assert "\x1b[1mSCORE\x1b[0m" not in header
+    assert "SCORE" in header
+    first_row = next(line for line in lines if top[0]["id"] in line)
+    assert "\x1b[32m" in first_row
+    assert re.search(r"\x1b\[1m\s*1\x1b\[0m", first_row)
+    second_row = next(line for line in lines if top[1]["id"] in line)
+    assert "\x1b[32m" not in second_row
+
+
+def test_print_table_green_wins_over_dim_on_top_row(capsys):
+    top = _scored_candidates()
+    top[0]["quality"] = None
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    first_row = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if top[0]["id"] in line
+    )
+    assert "\x1b[32m" in first_row
+    assert "\x1b[2m" not in first_row
+
+
+def test_print_table_color_preserves_alignment(capsys):
+    top = _scored_candidates()
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None)
+    plain = capsys.readouterr().out
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    colored = capsys.readouterr().out
+    assert re.sub(r"\x1b\[[0-9;]*m", "", colored) == plain
+
+
+def test_print_table_dims_unknown_quality(capsys):
+    top = _scored_candidates()
+    top[1]["quality"] = None
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    row = next(line for line in capsys.readouterr().out.splitlines() if top[1]["id"] in line)
+    assert re.search(r"\x1b\[2m\s*-\x1b\[0m", row)
+
+
+def test_print_table_bare_prints_table_only(capsys):
+    mc.print_table(
+        _scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None, bare=True
+    )
+    out = capsys.readouterr().out.rstrip("\n")
+    assert out.splitlines()[0].startswith("RANK")
+    assert "Weights:" not in out
+    assert "QUALITY" not in out  # no legend
+    assert "SCORE     weighted" not in out
 
 
 class _FakeStream:
@@ -2387,23 +2462,13 @@ def test_color_off_forces_plain():
 
 
 def test_footer_legend_lines(capsys):
-    mc.print_table(_scored_candidates(), 2, mc.PRIORITY_WEIGHTS["balanced"], "note")
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
     out = capsys.readouterr().out
-    assert (
-        "Prices shown are what a long session pays: several models bill at a "
-        "higher rate once the prompt outgrows their cheap short-context tier."
-    ) in out
-    assert (
-        "TIER marks how prices vary: a token threshold is the prompt size "
-        "above which the higher rate applies; a percentage is a scheduled "
-        "off-peak discount (price shown: the standard rate); SCHED marks a "
-        "schedule whose discount is under 1%. --json lists each model's "
-        "schedule."
-    ) in out
+    assert "TIER      how prices vary: >Nk = pricier above that prompt size; -N% =" in out
+    assert "SCHED = schedule with a discount under 1% (--off-peak lists them)" in out
+    assert "A higher rate" in out
     legend_lines = [
-        line
-        for line in out.splitlines()
-        if line.startswith(("Prices shown", "TIER marks"))
+        line for line in out.splitlines() if line.startswith(("TIER", "$IN/$OUT"))
     ]
     assert legend_lines and all(line.isascii() for line in legend_lines)
 
@@ -3129,7 +3194,7 @@ def test_fmt_discount(value, expected):
 def test_print_table_shows_disc_column(capsys):
     top = [_cand("a/x", 1.0)]
     top[0].update({"score": 0.9, "quality": None, "discount": 0.5})
-    mc.print_table(top, 1, {"price": 1.0}, "note")
+    mc.print_table(top, {"price": 1.0}, None)
     out = capsys.readouterr().out
     assert "DISC" in out
     assert "50%" in out
@@ -3138,7 +3203,7 @@ def test_print_table_shows_disc_column(capsys):
 def test_print_table_dash_without_discount(capsys):
     top = [_cand("a/x", 1.0)]
     top[0].update({"score": 0.9, "quality": None, "discount": None})
-    mc.print_table(top, 1, {"price": 1.0}, "note")
+    mc.print_table(top, {"price": 1.0}, None)
     out = capsys.readouterr().out
     data_row = next(line for line in out.splitlines() if line.strip().startswith("1"))
     assert "DISC" in out

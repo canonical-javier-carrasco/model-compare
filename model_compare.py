@@ -2982,83 +2982,124 @@ def quality_source_lines(note) -> list[str]:
     return lines
 
 
-def print_table(top, total_candidates, weights, quality_note):
-    headers = [
-        "RANK",
-        "MODEL",
-        "QUAL",
-        "$IN/M",
-        "$OUT/M",
-        "DISC",
-        "PREC",
-        "TIER",
-        "CTX",
-        "AGE",
-        "SCORE",
-    ]
-    rows = []
-    for rank, cand in enumerate(top, 1):
-        rows.append(
-            [
-                str(rank),
-                cand["id"],
-                "-" if cand["quality"] is None else f"{cand['quality']:.1f}",
-                fmt_price(cand["price_in"]),
-                fmt_price(cand["price_out"]),
-                fmt_discount(cand["discount"]),
-                fmt_prec(cand),
-                cand["tier_note"] or cand["sched_note"] or "--",
-                fmt_context(cand["context"]),
-                fmt_age(cand["age_days"]),
-                f"{cand['score']:.3f}",
-            ]
-        )
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+TABLE_COLUMNS = {
+    "expert": (
+        "RANK", "MODEL", "QUAL", "$IN/M", "$OUT/M", "DISC",
+        "PREC", "TIER", "CTX", "AGE", "SCORE",
+    ),
+    "simple": ("RANK", "MODEL", "QUALITY", "IN $/M", "OUT $/M", "DISCOUNT", "AGE"),
+}
 
-    def emit(row):
-        if row[1] == "MODEL":
-            line = "  ".join(h.ljust(w) for h, w in zip(row, widths))
-            print(line)
-            print("  ".join("-" * w for w in widths))
-        else:
-            cells = [row[0].rjust(widths[0]), row[1].ljust(widths[1])]
-            cells += [c.rjust(w) for c, w in zip(row[2:], widths[2:])]
-            print("  ".join(cells))
+LEGENDS = {
+    "expert": (
+        ("QUALITY", ['Artificial Analysis intelligence index; "-" = unknown (scores 0)']),
+        ("$IN/$OUT", [
+            "USD per 1M tokens at the cheapest eligible endpoint, blended",
+            "75% input / 25% output (--input-share); differs from the",
+            "openrouter.ai default-endpoint price by design. A higher rate",
+            "may apply once the prompt outgrows a model's short-context tier.",
+        ]),
+        ("DISC", ["active discount"]),
+        ("PREC", [
+            'quoted precision ("!" = default routing favors cheaper',
+            "sub-default endpoints)",
+        ]),
+        ("TIER", [
+            "how prices vary: >Nk = pricier above that prompt size; -N% =",
+            "scheduled off-peak discount (price shown: the standard rate);",
+            "SCHED = schedule with a discount under 1% (--off-peak lists them)",
+        ]),
+        ("CTX", ["context window; AGE = days since listed on OpenRouter"]),
+        ("SCORE", ["weighted blend of the four criteria above"]),
+    ),
+    "simple": (
+        ("RANK", ["position in this ranking"]),
+        ("MODEL", ["provider-qualified id (openrouter/<provider>/<model>)"]),
+        ("QUALITY", ['Artificial Analysis intelligence index; "-" = unknown (scores 0)']),
+        ("IN/OUT $/M", [
+            "USD per 1M tokens at the cheapest eligible endpoint, blended",
+            "75% input / 25% output (--input-share)",
+        ]),
+        ("DISCOUNT", ["active discount, if any"]),
+        ("AGE", ["days since listed on OpenRouter"]),
+    ),
+}
 
-    emit(headers)
-    for row in rows:
-        emit(row)
-    weight_bits = ", ".join(
-        f"{k} {v:.0%}" for k, v in sorted(weights.items(), reverse=True)
-    )
+
+def fmt_quality(value) -> str:
+    return "-" if value is None else f"{value:.1f}"
+
+
+def table_cells(cand, rank):
+    return {
+        "RANK": str(rank),
+        "MODEL": cand["id"],
+        "QUAL": fmt_quality(cand["quality"]),
+        "QUALITY": fmt_quality(cand["quality"]),
+        "$IN/M": fmt_price(cand["price_in"]),
+        "IN $/M": fmt_price(cand["price_in"]),
+        "$OUT/M": fmt_price(cand["price_out"]),
+        "OUT $/M": fmt_price(cand["price_out"]),
+        "DISC": fmt_discount(cand["discount"]),
+        "DISCOUNT": fmt_discount(cand["discount"]),
+        "PREC": fmt_prec(cand),
+        "TIER": cand["tier_note"] or cand["sched_note"] or "--",
+        "CTX": fmt_context(cand["context"]),
+        "AGE": fmt_age(cand["age_days"]),
+        "SCORE": f"{cand['score']:.3f}",
+    }
+
+
+def print_table(
+    top, weights, quality_note, detail="expert", style=None, bare=False
+):
+    style = style or Style(False)
+    columns = TABLE_COLUMNS[detail]
+    rows = [table_cells(cand, rank) for rank, cand in enumerate(top, 1)]
+    widths = {
+        col: max([len(col)] + [len(row[col]) for row in rows]) for col in columns
+    }
+
+    def pad(col, value):
+        if col == "MODEL":
+            return value.ljust(widths[col])
+        return value.rjust(widths[col])
+
+    header = []
+    for col in columns:
+        text = col.ljust(widths[col])
+        header.append(text if col == "SCORE" else style.bold(text))
+    print("  ".join(header))
+    print(style.dim("  ".join("-" * widths[col] for col in columns)))
+    for rank, row in enumerate(rows, 1):
+        cells = []
+        for col in columns:
+            text = pad(col, row[col])
+            if col == "RANK":
+                text = style.bold(text)
+            elif rank == 1:
+                text = style.green(text)
+            elif col in ("QUAL", "QUALITY") and row[col] == "-":
+                text = style.dim(text)
+            cells.append(text)
+        print("  ".join(cells))
+    if bare:
+        return
     print()
     print(
-        f"pool: {total_candidates} candidates | weights: {weight_bits} | {quality_note}"
+        "Weights: "
+        + ", ".join(f"{k} {v:.0%}" for k, v in sorted(weights.items(), reverse=True))
     )
-    print(
-        "quality: Artificial Analysis intelligence index (- = unknown); prices in USD per 1M tokens; "
-        "DISC = active discount; AGE = time since listed on OpenRouter"
-    )
-    print(
-        "Prices shown are what a long session pays: several models bill at a "
-        "higher rate once the prompt outgrows their cheap short-context tier."
-    )
-    print(
-        "TIER marks how prices vary: a token threshold is the prompt size "
-        "above which the higher rate applies; a percentage is a scheduled "
-        "off-peak discount (price shown: the standard rate); SCHED marks a "
-        "schedule whose discount is under 1%. --json lists each model's "
-        "schedule."
-    )
-    print(
-        "PREC = precision the ranked price is quoted at (maker's default when "
-        "disclosed, best available otherwise; ! = default routing favors "
-        "cheaper sub-default endpoints); prices are the cheapest live endpoint "
-        "at that precision."
-    )
+    warn = not quality_note or quality_note.get("warn")
+    for line in quality_source_lines(quality_note):
+        print(style.yellow(line) if warn else line)
+    print()
+    legend = LEGENDS[detail]
+    width = max(len(term) for term, _ in legend)
+    for term, lines in legend:
+        print(style.bold(term.ljust(width)) + "  " + lines[0])
+        for extra in lines[1:]:
+            print(" " * (width + 2) + extra)
 
 
 def print_json(top):
