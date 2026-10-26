@@ -6,4 +6,5 @@ venv/
 .worktrees/
 _site/
 docs/superpowers/
+.superpowers/
 .DS_Store

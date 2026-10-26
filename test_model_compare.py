@@ -8,8 +8,10 @@ These cover pure functions only -- no network access is performed. Run with:
 from __future__ import annotations
 
 import json
+import io
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -68,6 +70,10 @@ def make_args(**overrides):
         # parse_args always provides this (mirror the production shape);
         # None means the keyless fast path in fetch_session_cost.
         openrouter_api_key=None,
+        detail="expert",
+        off_peak=False,
+        bare=False,
+        color="auto",
     )
     base.update(overrides)
     return Namespace(**base)
@@ -2161,12 +2167,7 @@ def test_cli_table_shows_prec_column_and_risk_marker(monkeypatch, capsys):
     candidates, _ = mc.build_candidates(models, args, {}, {m["id"] for m in models}, [])
     candidates, _ = mc.apply_endpoint_pricing(candidates, args, [])
     mc.compute_scores(candidates, args, {})
-    mc.print_table(
-        candidates[:2],
-        len(candidates),
-        mc.PRIORITY_WEIGHTS["balanced"],
-        "quality data unavailable, ranked on price/context/age",
-    )
+    mc.print_table(candidates[:2], mc.PRIORITY_WEIGHTS["balanced"], None)
     out = capsys.readouterr().out
     header = out.splitlines()[0]
     assert "PREC" in header
@@ -2175,12 +2176,8 @@ def test_cli_table_shows_prec_column_and_risk_marker(monkeypatch, capsys):
     assert "fp8!" in risk_row
     plain_row = next(line for line in out.splitlines() if "anthropic/claude" in line)
     assert "n/a" in plain_row
-    assert (
-        "PREC = precision the ranked price is quoted at (maker's default when "
-        "disclosed, best available otherwise; ! = default routing favors "
-        "cheaper sub-default endpoints); prices are the cheapest live endpoint "
-        "at that precision."
-    ) in out
+    assert 'PREC      quoted precision ("!" = default routing favors cheaper' in out
+    assert "sub-default endpoints)" in out
 
 
 def test_json_rows_carry_quant_note(monkeypatch, capsys):
@@ -2323,7 +2320,7 @@ def test_json_time_schedule_string(capsys):
 
 
 def test_table_has_tier_column(capsys):
-    mc.print_table(_scored_candidates(), 2, mc.PRIORITY_WEIGHTS["balanced"], "note")
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
     out = capsys.readouterr().out
     lines = out.splitlines()
     header = lines[0]
@@ -2335,24 +2332,269 @@ def test_table_has_tier_column(capsys):
     assert ">100k" not in plain_row
 
 
+def test_print_table_expert_columns_and_legend(capsys):
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
+    out = capsys.readouterr().out
+    header = out.splitlines()[0]
+    for column in (
+        "RANK",
+        "MODEL",
+        "QUAL",
+        "$IN/M",
+        "$OUT/M",
+        "DISC",
+        "PREC",
+        "TIER",
+        "CTX",
+        "AGE",
+        "SCORE",
+    ):
+        assert column in header
+    assert (
+        header.index("DISC")
+        < header.index("PREC")
+        < header.index("TIER")
+        < header.index("CTX")
+    )
+    assert "PREC      quoted precision" in out
+    assert "TIER      how prices vary" in out
+    assert "SCORE     weighted blend of the four criteria above" in out
+    assert "Weights: " in out
+
+
+def test_print_table_simple_view_drops_expert_columns(capsys):
+    mc.print_table(
+        _scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None, detail="simple"
+    )
+    out = capsys.readouterr().out
+    header = out.splitlines()[0]
+    assert "QUALITY" in header and "DISCOUNT" in header
+    for column in ("PREC", "TIER", "CTX", "SCORE"):
+        assert column not in header
+    assert "RANK        position in this ranking" in out
+    assert "IN/OUT $/M  USD per 1M tokens" in out
+    assert "PREC" not in out
+
+
+def test_print_table_color_rules(capsys):
+    top = _scored_candidates()
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    lines = capsys.readouterr().out.splitlines()
+    header = lines[0]
+    assert header.startswith("\x1b[1mRANK\x1b[0m")
+    assert "SCORE" in header
+    assert not re.search(r"\x1b\[1m\s*SCORE", header)
+    first_row = next(line for line in lines if top[0]["id"] in line)
+    assert "\x1b[32m" in first_row
+    rank_cell = first_row.split("  ")[0]
+    assert "\x1b[1m" in rank_cell  # rank is bold inside the green #1 row
+    assert "\x1b[32m" in rank_cell
+    second_row = next(line for line in lines if top[1]["id"] in line)
+    assert "\x1b[32m" not in second_row
+
+
+def test_print_table_green_wins_over_dim_on_top_row(capsys):
+    top = _scored_candidates()
+    top[0]["quality"] = None
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    first_row = next(
+        line for line in capsys.readouterr().out.splitlines() if top[0]["id"] in line
+    )
+    assert "\x1b[32m" in first_row
+    assert "\x1b[2m" not in first_row
+
+
+def test_print_table_color_preserves_alignment(capsys):
+    top = _scored_candidates()
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None)
+    plain = capsys.readouterr().out
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    colored = capsys.readouterr().out
+    assert re.sub(r"\x1b\[[0-9;]*m", "", colored) == plain
+
+
+def test_print_table_dims_unknown_quality(capsys):
+    top = _scored_candidates()
+    top[1]["quality"] = None
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, style=mc.Style(True))
+    row = next(
+        line for line in capsys.readouterr().out.splitlines() if top[1]["id"] in line
+    )
+    assert re.search(r"\x1b\[2m\s*-\x1b\[0m", row)
+
+
+def test_print_table_yellow_quality_source_block_when_warn(capsys):
+    note = {
+        "sources": ["live AA (1 model, checked 13:15Z)"],
+        "clauses": ["1 model unmatched (no quality data; quality score 0)"],
+        "warn": True,
+    }
+    mc.print_table(
+        _scored_candidates(),
+        mc.PRIORITY_WEIGHTS["balanced"],
+        note,
+        style=mc.Style(True),
+    )
+    lines = capsys.readouterr().out.splitlines()
+    source_line = next(line for line in lines if "Quality source:" in line)
+    clause_line = next(line for line in lines if "unmatched" in line)
+    for line in (source_line, clause_line):
+        assert line.startswith("\x1b[33m")
+        assert line.endswith("\x1b[0m")
+
+
+def test_print_table_quality_source_not_yellow_when_not_warn(capsys):
+    note = {
+        "sources": ["live AA (1 model, checked 13:15Z)"],
+        "clauses": [],
+        "warn": False,
+    }
+    mc.print_table(
+        _scored_candidates(),
+        mc.PRIORITY_WEIGHTS["balanced"],
+        note,
+        style=mc.Style(True),
+    )
+    source_line = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "Quality source:" in line
+    )
+    assert "\x1b[33m" not in source_line
+
+
+def test_print_table_dims_dash_rule_under_header(capsys):
+    mc.print_table(
+        _scored_candidates(),
+        mc.PRIORITY_WEIGHTS["balanced"],
+        None,
+        style=mc.Style(True),
+    )
+    lines = capsys.readouterr().out.splitlines()
+    rule = lines[1]
+    assert rule.startswith("\x1b[2m")
+    assert rule.endswith("\x1b[0m")
+    stripped = rule.replace("\x1b[2m", "").replace("\x1b[0m", "").replace(" ", "")
+    assert set(stripped) == {"-"}
+
+
+def test_print_table_bolds_legend_terms(capsys):
+    mc.print_table(
+        _scored_candidates(),
+        mc.PRIORITY_WEIGHTS["balanced"],
+        None,
+        style=mc.Style(True),
+    )
+    out = capsys.readouterr().out
+    assert re.search(r"\x1b\[1mQUALITY\s*\x1b\[0m", out)
+    assert re.search(r"\x1b\[1mRANK\s*\x1b\[0m", out)
+
+
+def test_print_table_bare_prints_table_only(capsys):
+    mc.print_table(
+        _scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None, bare=True
+    )
+    out = capsys.readouterr().out.rstrip("\n")
+    assert out.splitlines()[0].startswith("RANK")
+    assert "Weights:" not in out
+    assert "QUALITY" not in out  # no legend
+    assert "SCORE     weighted" not in out
+
+
+class _FakeStream:
+    def __init__(self, tty):
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+def test_style_disabled_passes_text_through():
+    style = mc.Style(False)
+    for method in ("bold", "dim", "green", "yellow"):
+        assert getattr(style, method)("text") == "text"
+
+
+def test_style_enabled_wraps_in_sgr():
+    style = mc.Style(True)
+    assert style.bold("RANK") == "\x1b[1mRANK\x1b[0m"
+    assert style.dim("-") == "\x1b[2m-\x1b[0m"
+    assert style.green("row") == "\x1b[32mrow\x1b[0m"
+    assert style.yellow("warn") == "\x1b[33mwarn\x1b[0m"
+
+
+def test_color_auto_follows_tty(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert mc.color_enabled("auto", _FakeStream(True)) is True
+    assert mc.color_enabled("auto", _FakeStream(False)) is False
+
+
+def test_color_auto_honors_nonempty_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert mc.color_enabled("auto", _FakeStream(True)) is False
+
+
+def test_color_auto_ignores_empty_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "")
+    assert mc.color_enabled("auto", _FakeStream(True)) is True
+
+
+def test_color_on_overrides_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert mc.color_enabled("on", _FakeStream(False)) is True
+
+
+def test_color_off_forces_plain():
+    assert mc.color_enabled("off", _FakeStream(True)) is False
+
+
+class _TTYStringIO(io.StringIO):
+    """StringIO that pretends to be a terminal for color_enabled(auto)."""
+
+    def isatty(self):
+        return True
+
+
+def test_run_auto_colors_when_streams_are_ttys(monkeypatch):
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/short", name="Acme: Short", context_length=1000),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    out, err = _TTYStringIO(), _TTYStringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+    assert "\x1b[1m" in out.getvalue()  # bold header
+    assert "\x1b[2m(dropped: 1 context)\x1b[0m" in err.getvalue()
+
+
+def test_run_auto_honors_no_color_when_streams_are_ttys(monkeypatch):
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/short", name="Acme: Short", context_length=1000),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    out, err = _TTYStringIO(), _TTYStringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+    assert "\x1b[" not in out.getvalue()
+    assert "\x1b[" not in err.getvalue()
+
+
 def test_footer_legend_lines(capsys):
-    mc.print_table(_scored_candidates(), 2, mc.PRIORITY_WEIGHTS["balanced"], "note")
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
     out = capsys.readouterr().out
     assert (
-        "Prices shown are what a long session pays: several models bill at a "
-        "higher rate once the prompt outgrows their cheap short-context tier."
-    ) in out
-    assert (
-        "TIER marks how prices vary: a token threshold is the prompt size "
-        "above which the higher rate applies; a percentage is a scheduled "
-        "off-peak discount (price shown: the standard rate); SCHED marks a "
-        "schedule whose discount is under 1%. --json lists each model's "
-        "schedule."
-    ) in out
+        "TIER      how prices vary: >Nk = pricier above that prompt size; -N% =" in out
+    )
+    assert "SCHED = schedule with a discount under 1% (--off-peak lists them)" in out
+    assert "A higher rate" in out
     legend_lines = [
-        line
-        for line in out.splitlines()
-        if line.startswith(("Prices shown", "TIER marks"))
+        line for line in out.splitlines() if line.startswith(("TIER", "$IN/$OUT"))
     ]
     assert legend_lines and all(line.isascii() for line in legend_lines)
 
@@ -3078,7 +3320,7 @@ def test_fmt_discount(value, expected):
 def test_print_table_shows_disc_column(capsys):
     top = [_cand("a/x", 1.0)]
     top[0].update({"score": 0.9, "quality": None, "discount": 0.5})
-    mc.print_table(top, 1, {"price": 1.0}, "note")
+    mc.print_table(top, {"price": 1.0}, None)
     out = capsys.readouterr().out
     assert "DISC" in out
     assert "50%" in out
@@ -3087,7 +3329,7 @@ def test_print_table_shows_disc_column(capsys):
 def test_print_table_dash_without_discount(capsys):
     top = [_cand("a/x", 1.0)]
     top[0].update({"score": 0.9, "quality": None, "discount": None})
-    mc.print_table(top, 1, {"price": 1.0}, "note")
+    mc.print_table(top, {"price": 1.0}, None)
     out = capsys.readouterr().out
     data_row = next(line for line in out.splitlines() if line.strip().startswith("1"))
     assert "DISC" in out
@@ -3200,10 +3442,11 @@ def test_table_mode_prints_composed_quality_note(monkeypatch, capsys):
     argv = ["--top", "1", "--no-cache", "--min-context", "0", "--no-require-tools"]
     assert mc.main(argv) == 0
     captured = capsys.readouterr()
-    # Task 4's footer: per-source counts + as_of + index version when
-    # known. The OR benchmark carries no as_of here, so the block shows the
-    # bare count; model-b is unmatched and gets the trailing footnote.
-    assert "quality: OpenRouter snapshot (1); unmatched score 0" in captured.out
+    # Per-source counts + as_of + index version when known. The OR
+    # benchmark carries no as_of here, so the block shows the bare count;
+    # model-b is unmatched and gets the trailing clause.
+    assert "Quality source: OpenRouter snapshot (1 model);" in captured.out
+    assert "1 model unmatched (no quality data; quality score 0)" in captured.out
     assert "note:" not in captured.err  # --no-cache: nothing served from cache
 
 
@@ -6419,12 +6662,11 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     args = make_args(aa_api_key="dummy-key")
     assert mc.run(args, models, False) == 0
     out = capsys.readouterr().out
-    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
-    assert (
-        "| quality: AA index v4.3 - live AA (2, checked 13:15Z) "
-        "| OpenRouter snapshot (1, as of 2026-10-17); unmatched score 0; "
-        "drift vs OpenRouter snapshot (1)"
-    ) in pool_line
+    assert "pool:" not in out
+    assert "Quality source: AA index v4.3 - live AA (2 models, checked 13:15Z) |" in out
+    assert "                OpenRouter snapshot (1 model, as of 2026-10-17);" in out
+    assert "                1 model unmatched (no quality data; quality score 0)" in out
+    assert "                drift vs OpenRouter snapshot (1)" in out
 
     # Unkeyed: the catalog block shows the hydrated row's as_of (the v4
     # per-row stamp; the tier labels the record "catalog" regardless of
@@ -6454,11 +6696,11 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     args = make_args()
     assert mc.run(args, models, False) == 0
     out = capsys.readouterr().out
-    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
     assert (
-        "| quality: our catalog (1, as of 2026-10-23 13:15Z) "
-        "| OpenRouter snapshot (1, as of 2026-10-17)"
-    ) in pool_line
+        "Quality source: our published catalog (1 model, as of 2026-10-23 13:15Z) |"
+        in out
+    )
+    assert "                OpenRouter snapshot (1 model, as of 2026-10-17)" in out
 
 
 def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
@@ -6507,12 +6749,11 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
         aa_raises=True,
     )
     assert mc.run(make_args(), models, False) == 0
-    pool_line = next(
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith("pool:")
+    out = capsys.readouterr().out
+    assert (
+        "Quality source: our published catalog (2 models, as of 2026-10-23 13:15Z)"
+        in out
     )
-    assert "| quality: our catalog (2, as of 2026-10-23 13:15Z)" in pool_line
 
     # The date-only stamp is the fresher one: it wins and renders as a
     # plain date (the block ends at "2026-10-17)", never "00:00Z").
@@ -6523,12 +6764,8 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
         aa_raises=True,
     )
     assert mc.run(make_args(), models, False) == 0
-    pool_line = next(
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith("pool:")
-    )
-    assert "| quality: our catalog (2, as of 2026-10-17)" in pool_line
+    out = capsys.readouterr().out
+    assert "Quality source: our published catalog (2 models, as of 2026-10-17)" in out
 
 
 def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys):
@@ -6611,5 +6848,642 @@ def test_run_no_network_quality_blind_ranking_unchanged(monkeypatch, capsys):
     args = make_args()
     assert mc.run(args, models, False) == 0
     out = capsys.readouterr().out
-    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
-    assert "quality data unavailable, ranked on price/context/age" in pool_line
+    assert "pool:" not in out
+    assert "Quality source: unavailable; ranked on price/context/age" in out
+
+
+def test_run_summary_moves_below_table(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(), models, False) == 0
+    out = capsys.readouterr().out
+    assert "pool:" not in out
+    assert "Weights: " in out
+    assert "Quality source: unavailable; ranked on price/context/age" in out
+    assert out.index("RANK") < out.index("Weights:")
+
+
+def test_run_stderr_reports_ranked_and_dropped(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/short", name="Acme: Short", context_length=1000),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    err = capsys.readouterr().err
+    assert "1 of 2 listed models ranked" in err
+    assert "(dropped: 1 context)" in err
+
+
+def test_run_bare_prints_table_only(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(bare=True), models, False) == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("RANK")
+    for fragment in ("Weights:", "Quality source:", "QUALITY", "SCORE     weighted"):
+        assert fragment not in captured.out
+    assert captured.err == ""
+
+
+def test_run_bare_keeps_failure_warnings(monkeypatch, capsys):
+    models = [make_model(id="acme/short", name="Acme: Short", context_length=1000)]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(min_context=1_000_000, bare=True)
+    assert mc.run(args, models, False) == 2
+    assert "no models satisfy the filters" in capsys.readouterr().err
+
+
+def test_run_auto_color_is_plain_under_capture(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(color="auto"), models, False) == 0
+    captured = capsys.readouterr()
+    assert "\x1b[" not in captured.out
+    assert "\x1b[" not in captured.err
+
+
+def test_run_color_on_emits_sgr_even_when_piped(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(color="on"), models, False) == 0
+    assert "\x1b[1m" in capsys.readouterr().out
+
+
+def test_run_json_ignores_output_flags(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(json=True, color="on", bare=True, detail="simple")
+    assert mc.run(args, models, False) == 0
+    out = capsys.readouterr().out
+    assert "\x1b[" not in out
+    json.loads(out)  # still valid JSON, unchanged shape
+
+
+def test_parse_args_output_flag_defaults():
+    args = mc.parse_args([])
+    assert args.color == "auto"
+    assert args.detail == "expert"
+    assert args.off_peak is False
+    assert args.bare is False
+
+
+@pytest.mark.parametrize(
+    "argv,flag,value",
+    [
+        (["--detail", "fancy"], "--detail", "fancy"),
+        (["--color", "sometimes"], "--color", "sometimes"),
+    ],
+)
+def test_parse_args_rejects_unknown_detail_and_color(argv, flag, value, capsys):
+    with pytest.raises(SystemExit) as exc:
+        mc.parse_args(argv)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert f"argument {flag}: invalid choice: '{value}'" in err
+
+
+def test_help_groups_output_options(capsys):
+    with pytest.raises(SystemExit):
+        mc.parse_args(["--help"])
+    out = capsys.readouterr().out
+    headings = {
+        name: f"\n{name}:\n"
+        for name in ("output", "ranking", "filters", "data sources & cache")
+    }
+    for heading in headings.values():
+        assert heading in out
+    # Search after each heading: the usage line lists every option up front.
+    at = {name: out.index(heading) for name, heading in headings.items()}
+    assert at["output"] < out.index("--bare", at["output"]) < at["ranking"]
+    assert at["ranking"] < out.index("--priority", at["ranking"]) < at["filters"]
+    assert (
+        at["filters"]
+        < out.index("--min-context", at["filters"])
+        < at["data sources & cache"]
+    )
+    assert at["data sources & cache"] < out.index(
+        "--cache-ttl", at["data sources & cache"]
+    )
+
+
+def test_quality_footer_note_structured_sources_and_clauses():
+    records = {
+        "acme/a": {"source": "aa", "as_of": "2026-10-23T13:15:00Z"},
+        "acme/b": {"source": "catalog", "as_of": "2026-10-22T09:00:00Z"},
+        "acme/c": {"source": "openrouter", "as_of": "20261017"},
+    }
+    note = mc.quality_footer_note(records, 4.3, unmatched=1)
+    assert note["warn"] is True
+    assert note["sources"] == [
+        "AA index v4.3 - live AA (1 model, checked 13:15Z)",
+        "our published catalog (1 model, as of 2026-10-22 09:00Z)",
+        "OpenRouter snapshot (1 model, as of 2026-10-17)",
+    ]
+    assert note["clauses"] == ["1 model unmatched (no quality data; quality score 0)"]
+
+
+def test_quality_footer_note_none_when_no_records():
+    assert mc.quality_footer_note({}, None, unmatched=2) is None
+
+
+def test_quality_source_lines_wrap_at_source_boundaries():
+    note = {
+        "sources": [
+            "live AA (2 models, checked 13:15Z)",
+            "our published catalog (1 model, as of 2026-10-23 13:15Z)",
+        ],
+        "clauses": ["1 model unmatched (no quality data; quality score 0)"],
+        "warn": True,
+    }
+    assert mc.quality_source_lines(note) == [
+        "Quality source: live AA (2 models, checked 13:15Z) |",
+        "                our published catalog (1 model, as of 2026-10-23 13:15Z);",
+        "                1 model unmatched (no quality data; quality score 0)",
+    ]
+
+
+def test_quality_source_lines_last_source_unpunctuated_without_clauses():
+    note = {"sources": ["live AA (1 model)"], "clauses": [], "warn": False}
+    assert mc.quality_source_lines(note) == ["Quality source: live AA (1 model)"]
+
+
+def test_quality_source_lines_fallback():
+    assert mc.quality_source_lines(None) == [
+        "Quality source: unavailable; ranked on price/context/age"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Task 6: --off-peak deals table
+# ---------------------------------------------------------------------------
+
+
+def test_overall_scores_matches_build_catalog():
+    models = [make_model(id="acme/hy4", pricing=hy4_pricing())]
+    args = make_args(min_context=1_000_000)
+    candidates, dropped = mc.build_candidates(
+        models, args, {}, {m["id"] for m in models}, []
+    )
+    mc.compute_scores(candidates, args, {})
+    doc = mc.build_catalog(args, models, candidates, dropped, [], {}, {}, None, {}, {})
+    (entry,) = doc["models"]
+    weights = mc.catalog_weights(candidates, {})
+    assert (
+        mc.overall_scores(candidates[0], weights)["balanced"]
+        == entry["scores"]["overall"]["balanced"]
+    )
+    assert mc.overall_scores(candidates[0], weights) == entry["scores"]["overall"]
+
+
+def test_off_peak_deals_sorts_caps_and_drops_zero_rounding():
+    schedules = [
+        {"id": "acme/a", "max_discount": 0.10},
+        {"id": "acme/b", "max_discount": 0.50},
+        {"id": "acme/c", "max_discount": 0.004},
+        {"id": "acme/d", "max_discount": 0.50},
+    ]
+    ids = [row["id"] for row in mc.off_peak_deals(schedules)]
+    assert ids == ["acme/b", "acme/d", "acme/a"]
+
+
+def test_off_peak_deals_caps_at_ten():
+    schedules = [{"id": f"acme/m{i}", "max_discount": 0.1 + i / 100} for i in range(15)]
+    assert len(mc.off_peak_deals(schedules)) == 10
+
+
+def test_print_deals_table_and_empty_state(capsys):
+    rows = [
+        {
+            "id": "acme/deal",
+            "sched_note": "-45%",
+            "sched_detail": "daily 01:00-05:00 UTC",
+            "quality": 38.9,
+            "offpeak": {"input_per_1m": 0.017, "output_per_1m": 0.066},
+            "context": 256000,
+            "score": 0.661,
+        }
+    ]
+    mc.print_deals(rows)
+    out = capsys.readouterr().out
+    assert "Off-peak deals" in out
+    assert "daily 01:00-05:00 UTC" in out
+    assert "-45%" in out
+    assert "OFF-PEAK  largest scheduled discount" in out
+    mc.print_deals([])
+    assert (
+        "No scheduled off-peak discounts in the current data."
+        in capsys.readouterr().out
+    )
+
+
+def test_print_deals_dashes_out_of_pool_score_and_quality(capsys):
+    rows = [
+        {
+            "id": "acme/deal",
+            "sched_note": "-45%",
+            "sched_detail": "daily 01:00-05:00 UTC",
+            "quality": None,
+            "offpeak": {"input_per_1m": 0.017, "output_per_1m": 0.066},
+            "context": 256000,
+            "score": None,
+        }
+    ]
+    mc.print_deals(rows)
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("MODEL"))
+    row = next(line for line in lines if "acme/deal" in line)
+    for column in ("QUAL", "SCORE"):
+        end = header.index(column) + len(column)
+        assert row[:end].endswith(" -")  # right-aligned cell under its header
+    assert row.endswith("-")  # SCORE is the last column
+
+
+def _deal_row(**overrides):
+    row = {
+        "id": "acme/deal",
+        "sched_note": "-45%",
+        "sched_detail": "daily 01:00-05:00 UTC",
+        "quality": 38.9,
+        "offpeak": {"input_per_1m": 0.017, "output_per_1m": 0.066},
+        "context": 256000,
+        "score": 0.661,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_print_deals_color_header_and_placeholders(capsys):
+    mc.print_deals(
+        [_deal_row(), _deal_row(id="acme/unknown", quality=None, score=None)],
+        style=mc.Style(True),
+    )
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if "SCORE" in line and "MODEL" in line)
+    assert re.search(r"\x1b\[1m\s*OFF-PEAK\s*\x1b\[0m", header)
+    assert re.search(r"\x1b\[1m\s*QUAL\s*\x1b\[0m", header)
+    assert not re.search(r"\x1b\[1m\s*SCORE", header)
+    known = next(line for line in lines if "acme/deal" in line)
+    assert re.search(r"\x1b\[1m\s*-45%\x1b\[0m", known)
+    assert "\x1b[2m" not in known
+    unknown = next(line for line in lines if "acme/unknown" in line)
+    assert re.search(r"\x1b\[2m\s*-\x1b\[0m", unknown)  # QUAL placeholder
+    assert not re.search(r"\x1b\[1m[^\x1b]*SCORE", unknown)
+    assert unknown.endswith("-")  # SCORE placeholder stays plain
+    assert not unknown.endswith("\x1b[0m")
+
+
+def test_run_off_peak_appends_deals(monkeypatch, capsys):
+    models = [
+        # Below the context floor: the id can only come from the deals table.
+        make_model(id="acme/deal", pricing=hy4_pricing(), context_length=262144),
+        make_model(id="acme/plain"),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(off_peak=True, min_context=1_000_000), models, False) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert "Off-peak deals" in out
+    assert any(
+        line.startswith("MODEL") and "OFF-PEAK" in line and "SCHEDULE" in line
+        for line in lines
+    )
+    deal = next(line for line in lines if line.startswith("acme/deal"))
+    assert "-10%" in deal
+    assert "daily 16:00-00:00 UTC" in deal
+    assert out.count("acme/deal") == 1  # deals row, not a main-table row
+
+
+def test_run_off_peak_empty_state(monkeypatch, capsys):
+    models = [make_model(id="acme/plain")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(off_peak=True), models, False) == 0
+    assert (
+        "No scheduled off-peak discounts in the current data."
+        in capsys.readouterr().out
+    )
+
+
+def test_print_deals_empty_state_separator(capsys):
+    mc.print_deals([])
+    non_bare = capsys.readouterr().out
+    assert non_bare == "\nNo scheduled off-peak discounts in the current data.\n"
+    mc.print_deals([], bare=True)
+    bare = capsys.readouterr().out
+    assert bare == "No scheduled off-peak discounts in the current data.\n"
+
+
+def test_run_bare_off_peak_suppresses_title_and_legend(monkeypatch, capsys):
+    models = [
+        # Below the context floor: absent from print_table's output, so the
+        # deals header and body prove the second table is still rendered.
+        make_model(id="acme/deal", pricing=hy4_pricing(), context_length=262144),
+        make_model(id="acme/plain"),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert (
+        mc.run(
+            make_args(off_peak=True, bare=True, min_context=1_000_000), models, False
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert "Off-peak deals" not in out
+    assert "largest scheduled discount" not in out
+    header = next(
+        line for line in lines if line.startswith("MODEL") and "OFF-PEAK" in line
+    )
+    assert "SCHEDULE" in header
+    deal = next(line for line in lines if line.startswith("acme/deal"))
+    assert "-10%" in deal
+    assert out.count("acme/deal") == 1  # not also in the main table
+
+
+def test_run_off_peak_non_candidate_deal_keeps_resolved_quality(monkeypatch, capsys):
+    # The web page shows the resolved quality for out-of-pool schedule rows
+    # and build_schedules resolves it, so QUAL keeps that number; only SCORE
+    # stays "-" (no balanced score exists outside the ranked pool).
+    models = [
+        make_model(id="acme/ranked", name="Acme: Ranked", pricing=deepseek_pricing()),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+        ),
+    ]
+    catalog_doc = _catalog_doc(
+        [
+            {"id": "acme/ranked", "quality": 41.0, "quality_match": "aa"},
+            {
+                "id": "acme/sched-only",
+                "quality": 30.0,
+                "quality_match": "openrouter",
+                "quality_as_of": "20261017",
+            },
+        ],
+        schema_version=4,
+    )
+    catalog = {
+        "by_id": mc.catalog_quality_by_id(catalog_doc),
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schema_version": 4,
+    }
+    _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
+    args = make_args(off_peak=True, bare=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("MODEL"))
+    qual_end = header.index("QUAL") + len("QUAL")
+    ranked = next(line for line in lines if line.startswith("acme/ranked"))
+    sched_only = next(line for line in lines if line.startswith("acme/sched-only"))
+    assert ranked[:qual_end].endswith("41.0")
+    assert not ranked.endswith("-")
+    assert sched_only[:qual_end].endswith("30.0")
+    assert sched_only.endswith("-")  # SCORE has no ranked value
+
+
+@pytest.mark.parametrize(
+    "bad_id,clean",
+    [
+        ("acme/evil\x1b[2J", "acme/evil[2J"),
+        ("acme/line\nbreak", "acme/linebreak"),
+    ],
+)
+def test_control_chars_stripped_from_table_and_deals(bad_id, clean, capsys):
+    top = _scored_candidates()[:1]
+    top[0]["id"] = bad_id
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, bare=True)
+    table = capsys.readouterr().out
+    assert "\x1b" not in table
+    table_lines = table.splitlines()
+    assert len(table_lines) == 3  # header, rule, one row (no forged newline)
+    assert clean in table_lines[2]
+    model_rule = table_lines[1].split("  ")[1]
+    assert len(model_rule) == len(clean)  # width uses the sanitized id
+
+    mc.print_deals([_deal_row(id=bad_id)], bare=True)
+    deals = capsys.readouterr().out
+    assert "\x1b" not in deals
+    deal_lines = deals.splitlines()
+    assert len(deal_lines) == 3
+    assert clean in deal_lines[2]
+    deal_model_rule = deal_lines[1].split("  ")[0]
+    assert len(deal_model_rule) == len(clean)
+
+
+@pytest.mark.parametrize(
+    "bad_id,clean",
+    [
+        ("acme/evil\x1b[2J", "acme/evil[2J"),
+        ("acme/line\nbreak", "acme/linebreak"),
+    ],
+)
+def test_best_output_strips_control_chars(bad_id, clean, monkeypatch, capsys):
+    models = [make_model(id=bad_id, name="Acme: Evil")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(best=True), models, False) == 0
+    assert capsys.readouterr().out == f"openrouter/{clean}\n"
+
+
+def test_run_balanced_score_matches_between_main_and_deals(monkeypatch, capsys):
+    # quality 10 at 1.5M context, listed 20 days ago: the unrounded score is
+    # 0.57548..., while weighting the 4-dp-rounded components gives 0.5755
+    # (prints 0.576). Both tables must print the same SCORE.
+    monkeypatch.setattr(mc.time, "time", lambda: 1_700_000_000.0)
+    models = [
+        make_model(
+            id="acme/sched",
+            pricing=hy4_pricing(),
+            context_length=1_500_000,
+            created=1_700_000_000 - 20 * 86400,
+        )
+    ]
+    catalog = {
+        "by_id": {
+            "acme/sched": {
+                "index": 10.0,
+                "source": "aa",
+                "as_of": "2026-10-23T13:15:00Z",
+            }
+        },
+        "generated_at": "2026-10-23T13:15:00Z",
+        "schema_version": 4,
+    }
+    _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
+    assert mc.run(make_args(off_peak=True, min_context=1_000_000), models, False) == 0
+    rows = [
+        line for line in capsys.readouterr().out.splitlines() if "acme/sched" in line
+    ]
+    assert len(rows) == 2  # main table + deals table
+    scores = [line.split()[-1] for line in rows]
+    assert scores[0] == scores[1] == "0.575"
+
+
+def test_footer_aa_version_prefix_only_on_aa_block():
+    note = mc.quality_footer_note(
+        {"acme/x": {"source": "openrouter", "as_of": "20261017"}}, 4.3, 0
+    )
+    lines = mc.quality_source_lines(note)
+    assert lines[0] == (
+        "Quality source: OpenRouter snapshot (1 model, as of 2026-10-17)"
+    )
+    assert "AA index" not in lines[0]
+
+
+def test_weights_percentages_sum_to_100_quality_blind(capsys):
+    models = [make_model(id="acme/a"), make_model(id="acme/b")]
+    args = make_args(min_context=1_000_000)
+    candidates, _ = mc.build_candidates(models, args, {}, {"acme/a", "acme/b"}, [])
+    weights = mc.compute_scores(candidates, args, {})  # quality-blind pool
+    mc.print_table(candidates, weights, None)
+    line = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("Weights:")
+    )
+    percentages = [
+        int(token.rstrip(",%"))
+        for token in line.split()
+        if token.rstrip(",").endswith("%")
+    ]
+    assert sum(percentages) == 100
+
+
+def test_print_deals_headers_left_aligned(capsys):
+    mc.print_deals([_deal_row()])
+    lines = capsys.readouterr().out.splitlines()
+    header = next(line for line in lines if line.startswith("MODEL"))
+    rule = next(line for line in lines if set(line.replace(" ", "")) == {"-"})
+    widths = [len(segment) for segment in rule.split("  ")]
+    start = 0
+    for col, width in zip(mc.DEALS_COLUMNS, widths):
+        assert header[start : start + width].rstrip() == col
+        start += width + 2
+
+
+def test_print_deals_bolds_title(capsys):
+    mc.print_deals([_deal_row()], style=mc.Style(True))
+    title = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "Off-peak deals" in line
+    )
+    assert title.startswith("\x1b[1mOff-peak deals")
+    assert title.endswith("\x1b[0m")
+
+
+@pytest.mark.parametrize("mode", ["json", "best"])
+def test_off_peak_ignored_under_machine_outputs(mode, monkeypatch, capsys):
+    models = [
+        make_model(id="acme/deal", pricing=hy4_pricing()),
+        make_model(id="acme/plain"),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(**{mode: True}), models, False) == 0
+    without_off_peak = capsys.readouterr().out
+    assert mc.run(make_args(off_peak=True, **{mode: True}), models, False) == 0
+    assert capsys.readouterr().out == without_off_peak
+
+
+def test_run_off_peak_catalog_output_keeps_non_candidate_quality(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/candidate", name="Acme: Candidate"),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+        ),
+    ]
+    catalog_doc = _catalog_doc(
+        [{"id": "acme/sched-only", "quality": 30.0, "quality_match": "openrouter"}],
+        schema_version=4,
+    )
+    catalog = {
+        "by_id": mc.catalog_quality_by_id(catalog_doc),
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schema_version": 4,
+    }
+    _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
+    args = make_args(catalog=True, off_peak=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    (sched,) = json.loads(capsys.readouterr().out)["schedules"]
+    assert sched["quality"] == 30.0
+
+
+@pytest.mark.parametrize("detail", ["expert", "simple"])
+def test_print_table_legend_shows_actual_input_share(detail, capsys):
+    mc.print_table(
+        _scored_candidates(),
+        mc.PRIORITY_WEIGHTS["balanced"],
+        None,
+        detail=detail,
+        input_share=0.5,
+    )
+    out = capsys.readouterr().out
+    assert "50% input / 50% output (--input-share)" in out
+    assert "75% input" not in out
+
+
+def test_print_table_legend_defaults_to_75_25(capsys):
+    mc.print_table(_scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None)
+    assert "75% input / 25% output (--input-share)" in capsys.readouterr().out
+
+
+def test_run_legend_uses_args_input_share(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(input_share=0.9), models, False) == 0
+    assert "90% input / 10% output (--input-share)" in capsys.readouterr().out
+
+
+def test_print_table_simple_model_legend_matches_printed_ids(capsys):
+    top = _scored_candidates()
+    mc.print_table(top, mc.PRIORITY_WEIGHTS["balanced"], None, detail="simple")
+    out = capsys.readouterr().out
+    assert "openrouter/<provider>/<model>" not in out
+    assert "MODEL       provider/model id as listed; --best prefixes openrouter/" in out
+    assert top[0]["id"] in out  # the table prints the bare id
+
+
+def test_run_bare_suppresses_cached_note(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(bare=True), models, True) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_run_cached_note_printed_when_not_bare(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(), models, True) == 0
+    assert "note: catalog cached (use --no-cache to refresh)" in capsys.readouterr().err
+
+
+def test_run_bare_keeps_zdr_refusal_warning(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    monkeypatch.setattr(
+        mc, "fetch_openrouter_frontend", lambda a: ({}, set(), {}, set())
+    )
+    assert mc.run(make_args(bare=True), models, False) == 1
+    captured = capsys.readouterr()
+    assert "ZDR data unavailable; refusing to rank" in captured.err
+    assert captured.out == ""
+
+
+def test_run_color_on_dims_dropped_line_on_stderr(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/short", name="Acme: Short", context_length=1000),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(color="on", min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    err = capsys.readouterr().err
+    assert "\x1b[2m(dropped: 1 context)\x1b[0m" in err
+    assert "1 of 2 listed models ranked" in err
+    assert "\x1b[" not in err.replace("\x1b[2m(dropped: 1 context)\x1b[0m", "")

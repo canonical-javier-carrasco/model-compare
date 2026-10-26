@@ -239,6 +239,27 @@ ids it lacked were `:batch` or `:free` variants. If the list cannot be fetched
 or yields no entries, the tool refuses to rank rather than silently
 considering non-ZDR models; pass `--no-zdr` to explicitly consider everything.
 
+## CLI output
+
+The plain table path splits across the two streams. stdout carries the table,
+the `Weights:` line, the wrapped `Quality source:` block and the legend
+(`--bare` keeps only the table(s); `--off-peak` adds the deals table, with
+its title and legend dropped under `--bare`). stderr
+carries the cache note, the `N of M listed models ranked` line and the dim
+`(dropped: …)` line, which is omitted when nothing was dropped. Piping stdout
+does not change which lines go where.
+
+Color is SGR attributes only (bold, dim, green, yellow), never pinned hex, so
+the terminal theme picks the actual hues and light themes stay readable.
+`--color auto` colors a stream only when that stream is a TTY and `NO_COLOR`
+is unset or empty; `on` forces it and `off` never does. Column widths are
+computed from the raw text before any escape codes are added, so color never
+shifts alignment.
+
+`--json`, `--catalog` and `--best` are unaffected by `--color`, `--detail`,
+`--off-peak` and `--bare`: they keep their documented output byte-for-byte,
+and `--best` still prints only the opencode id.
+
 ## Catalog output contract
 
 `--catalog` prints the full evaluation as one machine-readable JSON document:
