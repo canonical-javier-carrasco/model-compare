@@ -6706,3 +6706,49 @@ def test_help_groups_output_options(capsys):
     assert out.index("data sources & cache:") < out.index(
         "--cache-ttl", out.index("data sources & cache:")
     )
+
+
+def test_quality_footer_note_structured_sources_and_clauses():
+    records = {
+        "acme/a": {"source": "aa", "as_of": "2026-10-23T13:15:00Z"},
+        "acme/b": {"source": "catalog", "as_of": "2026-10-22T09:00:00Z"},
+        "acme/c": {"source": "openrouter", "as_of": "20261017"},
+    }
+    note = mc.quality_footer_note(records, 4.3, unmatched=1)
+    assert note["warn"] is True
+    assert note["sources"] == [
+        "AA index v4.3 - live AA (1 model, checked 13:15Z)",
+        "our published catalog (1 model, as of 2026-10-22 09:00Z)",
+        "OpenRouter snapshot (1 model, as of 2026-10-17)",
+    ]
+    assert note["clauses"] == [
+        "1 model unmatched (no quality data; quality score 0)"
+    ]
+
+
+def test_quality_footer_note_none_when_no_records():
+    assert mc.quality_footer_note({}, None, unmatched=2) is None
+
+
+def test_quality_source_lines_wrap_at_source_boundaries():
+    note = {
+        "sources": ["live AA (2 models, checked 13:15Z)", "our published catalog (1 model, as of 2026-10-23 13:15Z)"],
+        "clauses": ["1 model unmatched (no quality data; quality score 0)"],
+        "warn": True,
+    }
+    assert mc.quality_source_lines(note) == [
+        "Quality source: live AA (2 models, checked 13:15Z) |",
+        "                our published catalog (1 model, as of 2026-10-23 13:15Z);",
+        "                1 model unmatched (no quality data; quality score 0)",
+    ]
+
+
+def test_quality_source_lines_last_source_unpunctuated_without_clauses():
+    note = {"sources": ["live AA (1 model)"], "clauses": [], "warn": False}
+    assert mc.quality_source_lines(note) == ["Quality source: live AA (1 model)"]
+
+
+def test_quality_source_lines_fallback():
+    assert mc.quality_source_lines(None) == [
+        "Quality source: unavailable; ranked on price/context/age"
+    ]

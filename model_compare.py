@@ -2901,20 +2901,23 @@ def _later_as_of(value, current) -> bool:
     return new > old
 
 
+QUALITY_SOURCE_LABEL = "Quality source: "
+
+
 def quality_footer_note(quality_by_id, aa_index_version, unmatched):
     """Compose the footer's quality note from the resolved records.
 
-    Lists per-source counts, each source's own as_of and the AA index
-    version when known, e.g. "AA index v4.3 - live AA (58, checked 13:15Z)
-    | our catalog (12, as of 2026-10-23 13:15Z) | OpenRouter snapshot (2,
-    as of 2026-10-17)". A trailing "unmatched score 0" names candidates
-    with no quality record, and a drift footnote appears when any resolved
-    record disagrees with the OpenRouter check value. Returns None when no
-    record resolved -- run() falls back to the quality-blind note.
+    Returns {"sources": [...], "clauses": [...], "warn": bool}. Each source
+    names its model count, its own as_of and the AA index version when
+    known, e.g. "AA index v4.3 - live AA (58 models, checked 13:15Z)".
+    Clauses carry the unmatched-candidates note and the drift footnote when
+    any resolved record disagrees with the OpenRouter check value. Returns
+    None when no record resolved -- run() falls back to the quality-blind
+    note.
     """
     labels = {
         "aa": "live AA",
-        "catalog": "our catalog",
+        "catalog": "our published catalog",
         "openrouter": "OpenRouter snapshot",
     }
     stamp_words = {"aa": "checked", "catalog": "as of", "openrouter": "as of"}
@@ -2935,23 +2938,48 @@ def quality_footer_note(quality_by_id, aa_index_version, unmatched):
         count = counts.get(source, 0)
         if not count:
             continue
+        plural = "" if count == 1 else "s"
         stamp = _footer_as_of(source, latest.get(source))
         if stamp:
-            blocks.append(f"{labels[source]} ({count}, {stamp_words[source]} {stamp})")
+            blocks.append(
+                f"{labels[source]} ({count} model{plural}, {stamp_words[source]} {stamp})"
+            )
         else:
-            blocks.append(f"{labels[source]} ({count})")
+            blocks.append(f"{labels[source]} ({count} model{plural})")
     if not blocks:
         return None
-    note = "quality: "
     if aa_index_version is not None:
-        note += f"AA index v{aa_index_version} - "
-    note += " | ".join(blocks)
+        blocks[0] = f"AA index v{aa_index_version} - {blocks[0]}"
+    clauses = []
     if unmatched:
-        note += "; unmatched score 0"
+        plural = "" if unmatched == 1 else "s"
+        clauses.append(
+            f"{unmatched} model{plural} unmatched (no quality data; quality score 0)"
+        )
     drift = sum(1 for record in quality_by_id.values() if record.get("drift"))
     if drift:
-        note += f"; drift vs OpenRouter snapshot ({drift})"
-    return note
+        clauses.append(f"drift vs OpenRouter snapshot ({drift})")
+    return {"sources": blocks, "clauses": clauses, "warn": bool(unmatched)}
+
+
+def quality_source_lines(note) -> list[str]:
+    """Render the footer as one source per line, 16-space continuation."""
+    if not note or not note.get("sources"):
+        return [QUALITY_SOURCE_LABEL + "unavailable; ranked on price/context/age"]
+    indent = " " * len(QUALITY_SOURCE_LABEL)
+    sources = note["sources"]
+    clauses = note.get("clauses") or []
+    lines = []
+    for index, source in enumerate(sources):
+        prefix = QUALITY_SOURCE_LABEL if index == 0 else indent
+        if index < len(sources) - 1:
+            lines.append(prefix + source + " |")
+        elif clauses:
+            lines.append(prefix + source + ";")
+        else:
+            lines.append(prefix + source)
+    lines.extend(indent + clause for clause in clauses)
+    return lines
 
 
 def print_table(top, total_candidates, weights, quality_note):
