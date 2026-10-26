@@ -3316,10 +3316,11 @@ def test_table_mode_prints_composed_quality_note(monkeypatch, capsys):
     argv = ["--top", "1", "--no-cache", "--min-context", "0", "--no-require-tools"]
     assert mc.main(argv) == 0
     captured = capsys.readouterr()
-    # Task 4's footer: per-source counts + as_of + index version when
-    # known. The OR benchmark carries no as_of here, so the block shows the
-    # bare count; model-b is unmatched and gets the trailing footnote.
-    assert "quality: OpenRouter snapshot (1); unmatched score 0" in captured.out
+    # Per-source counts + as_of + index version when known. The OR
+    # benchmark carries no as_of here, so the block shows the bare count;
+    # model-b is unmatched and gets the trailing clause.
+    assert "Quality source: OpenRouter snapshot (1 model);" in captured.out
+    assert "1 model unmatched (no quality data; quality score 0)" in captured.out
     assert "note:" not in captured.err  # --no-cache: nothing served from cache
 
 
@@ -6535,12 +6536,11 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     args = make_args(aa_api_key="dummy-key")
     assert mc.run(args, models, False) == 0
     out = capsys.readouterr().out
-    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
-    assert (
-        "| quality: AA index v4.3 - live AA (2, checked 13:15Z) "
-        "| OpenRouter snapshot (1, as of 2026-10-17); unmatched score 0; "
-        "drift vs OpenRouter snapshot (1)"
-    ) in pool_line
+    assert "pool:" not in out
+    assert "Quality source: AA index v4.3 - live AA (2 models, checked 13:15Z) |" in out
+    assert "                OpenRouter snapshot (1 model, as of 2026-10-17);" in out
+    assert "                1 model unmatched (no quality data; quality score 0)" in out
+    assert "                drift vs OpenRouter snapshot (1)" in out
 
     # Unkeyed: the catalog block shows the hydrated row's as_of (the v4
     # per-row stamp; the tier labels the record "catalog" regardless of
@@ -6570,11 +6570,8 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     args = make_args()
     assert mc.run(args, models, False) == 0
     out = capsys.readouterr().out
-    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
-    assert (
-        "| quality: our catalog (1, as of 2026-10-23 13:15Z) "
-        "| OpenRouter snapshot (1, as of 2026-10-17)"
-    ) in pool_line
+    assert "Quality source: our published catalog (1 model, as of 2026-10-23 13:15Z) |" in out
+    assert "                OpenRouter snapshot (1 model, as of 2026-10-17)" in out
 
 
 def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
@@ -6623,12 +6620,8 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
         aa_raises=True,
     )
     assert mc.run(make_args(), models, False) == 0
-    pool_line = next(
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith("pool:")
-    )
-    assert "| quality: our catalog (2, as of 2026-10-23 13:15Z)" in pool_line
+    out = capsys.readouterr().out
+    assert "Quality source: our published catalog (2 models, as of 2026-10-23 13:15Z)" in out
 
     # The date-only stamp is the fresher one: it wins and renders as a
     # plain date (the block ends at "2026-10-17)", never "00:00Z").
@@ -6639,12 +6632,8 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
         aa_raises=True,
     )
     assert mc.run(make_args(), models, False) == 0
-    pool_line = next(
-        line
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith("pool:")
-    )
-    assert "| quality: our catalog (2, as of 2026-10-17)" in pool_line
+    out = capsys.readouterr().out
+    assert "Quality source: our published catalog (2 models, as of 2026-10-17)" in out
 
 
 def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys):
@@ -6727,8 +6716,77 @@ def test_run_no_network_quality_blind_ranking_unchanged(monkeypatch, capsys):
     args = make_args()
     assert mc.run(args, models, False) == 0
     out = capsys.readouterr().out
-    pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
-    assert "quality data unavailable, ranked on price/context/age" in pool_line
+    assert "pool:" not in out
+    assert "Quality source: unavailable; ranked on price/context/age" in out
+
+
+def test_run_summary_moves_below_table(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(), models, False) == 0
+    out = capsys.readouterr().out
+    assert "pool:" not in out
+    assert "Weights: " in out
+    assert "Quality source: unavailable; ranked on price/context/age" in out
+    assert out.index("RANK") < out.index("Weights:")
+
+
+def test_run_stderr_reports_ranked_and_dropped(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/short", name="Acme: Short", context_length=1000),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    err = capsys.readouterr().err
+    assert "1 of 2 listed models ranked" in err
+    assert "(dropped: 1 context)" in err
+
+
+def test_run_bare_prints_table_only(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(bare=True), models, False) == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("RANK")
+    for fragment in ("Weights:", "Quality source:", "QUALITY", "SCORE     weighted"):
+        assert fragment not in captured.out
+    assert captured.err == ""
+
+
+def test_run_bare_keeps_failure_warnings(monkeypatch, capsys):
+    models = [make_model(id="acme/short", name="Acme: Short", context_length=1000)]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(min_context=1_000_000, bare=True)
+    assert mc.run(args, models, False) == 2
+    assert "no models satisfy the filters" in capsys.readouterr().err
+
+
+def test_run_auto_color_is_plain_under_capture(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(color="auto"), models, False) == 0
+    captured = capsys.readouterr()
+    assert "\x1b[" not in captured.out
+    assert "\x1b[" not in captured.err
+
+
+def test_run_color_on_emits_sgr_even_when_piped(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(color="on"), models, False) == 0
+    assert "\x1b[1m" in capsys.readouterr().out
+
+
+def test_run_json_ignores_output_flags(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    args = make_args(json=True, color="on", bare=True, detail="simple")
+    assert mc.run(args, models, False) == 0
+    out = capsys.readouterr().out
+    assert "\x1b[" not in out
+    json.loads(out)  # still valid JSON, unchanged shape
 
 
 def test_parse_args_output_flag_defaults():

@@ -3773,41 +3773,50 @@ def run(args, models, or_cached) -> int:
     elif args.json:
         print_json(top)
     else:
-        drop_note = ""
-        if dropped:
-            bits = ", ".join(
-                f"{v} {k}" for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])
-            )
-            drop_note = f" (dropped: {bits})"
-        # The footer lists per-source counts, each source's own as_of and
-        # the AA index version when known; unmatched candidates and drift
-        # get trailing footnotes. No record resolved -> the quality-blind
-        # fallback note.
-        unmatched = len(candidates) - len(quality_by_id)
-        quality_note = quality_footer_note(
-            quality_by_id, aa_index_version, unmatched
-        ) or ("quality data unavailable, ranked on price/context/age")
-        source_note = []
-        if or_cached:
-            source_note.append("catalog cached")
-        if "discounts" in frontend_cache_hits:
-            source_note.append("discounts cached")
-        if "zdr" in frontend_cache_hits:
-            source_note.append("ZDR cached")
-        if "aa" in frontend_cache_hits:
-            source_note.append("AA benchmarks cached")
-        if aa_cached and aa_source:
-            source_note.append("quality cached")
-        if source_note:
+        style = Style(color_enabled(args.color, sys.stdout))
+        err_style = Style(color_enabled(args.color, sys.stderr))
+        if not args.bare:
+            source_note = []
+            if or_cached:
+                source_note.append("catalog cached")
+            if "discounts" in frontend_cache_hits:
+                source_note.append("discounts cached")
+            if "zdr" in frontend_cache_hits:
+                source_note.append("ZDR cached")
+            if "aa" in frontend_cache_hits:
+                source_note.append("AA benchmarks cached")
+            if aa_cached and aa_source:
+                source_note.append("quality cached")
+            if source_note:
+                print(
+                    f"note: {', '.join(source_note)} (use --no-cache to refresh)",
+                    file=sys.stderr,
+                )
             print(
-                f"note: {', '.join(source_note)} (use --no-cache to refresh)",
+                f"{len(candidates)} of {len(models)} listed models ranked",
                 file=sys.stderr,
             )
-        print(
-            f"pool: {len(models)} listed -> {len(candidates)} candidates{drop_note}",
-            file=sys.stderr,
+            if dropped:
+                bits = ", ".join(
+                    f"{v} {k}"
+                    for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])
+                )
+                print(err_style.dim(f"(dropped: {bits})"), file=sys.stderr)
+            print(file=sys.stderr)
+        # The footer lists per-source counts, each source's own as_of and
+        # the AA index version when known; unmatched candidates and drift
+        # get trailing clauses. No record resolved -> print_table's
+        # quality-blind fallback line.
+        unmatched = len(candidates) - len(quality_by_id)
+        quality_note = quality_footer_note(quality_by_id, aa_index_version, unmatched)
+        print_table(
+            top,
+            weights,
+            quality_note,
+            detail=args.detail,
+            style=style,
+            bare=args.bare,
         )
-        print_table(top, len(candidates), weights, quality_note)
     return 0
 
 
