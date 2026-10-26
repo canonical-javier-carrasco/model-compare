@@ -65,9 +65,10 @@ CTX       context window; AGE = days since listed on OpenRouter
 SCORE     weighted blend of the four criteria above
 ```
 
-On a terminal, the header and rank numbers are bold, the #1 row is green, and
-the dropped line and `-` placeholders are dim. A `Quality source:` block that
-has unmatched models turns yellow. Piped output and `--bare` are plain.
+On a terminal, the table header (except SCORE) and rank numbers are bold, the
+#1 row is green (its rank stays bold), and the dropped line and the `-`
+quality placeholders are dim. A `Quality source:` block that has unmatched
+models turns yellow. Piped output is plain under `auto`.
 
 `--detail simple` shows RANK, MODEL, QUALITY, IN $/M, OUT $/M, DISCOUNT and
 AGE; `--bare` drops the summary, the weights line, the quality block and the
@@ -85,7 +86,7 @@ legend, leaving only the table(s).
 | `--detail {simple,expert}` | `expert` | table density; `simple` hides PREC, TIER, CTX and SCORE and uses the web page's labels (QUALITY, IN $/M, OUT $/M, DISCOUNT) |
 | `--off-peak` | off | also list scheduled off-peak deals, ranked by discount size (capped at 10) |
 | `--bare` | off | print just the table(s), no summary or legend |
-| `--color {auto,on,off}` | `auto` | colorize the table; `auto` colors only on a terminal, `on` forces it (e.g. `less -R`), and `NO_COLOR` disables it |
+| `--color {auto,on,off}` | `auto` | colorize the table; `auto` colors only on a terminal and `NO_COLOR` disables it, `on` forces color (e.g. `less -R`, ignoring `NO_COLOR`), `off` never colors |
 | `--min-context N` | 1000000 | hard context-window floor (tokens) |
 | `--input-share F` | 0.75 | input share of the blended price (0–1) |
 | `--recency-half-life D` | 120 | age decay half-life (days) |
