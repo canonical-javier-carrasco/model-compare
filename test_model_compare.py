@@ -6875,3 +6875,118 @@ def test_quality_source_lines_fallback():
     assert mc.quality_source_lines(None) == [
         "Quality source: unavailable; ranked on price/context/age"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Task 6: --off-peak deals table
+# ---------------------------------------------------------------------------
+
+
+def test_overall_scores_matches_build_catalog():
+    models = [make_model(id="acme/hy4", pricing=hy4_pricing())]
+    args = make_args(min_context=1_000_000)
+    candidates, dropped = mc.build_candidates(
+        models, args, {}, {m["id"] for m in models}, []
+    )
+    mc.compute_scores(candidates, args, {})
+    doc = mc.build_catalog(
+        args, models, candidates, dropped, [], {}, {}, None, {}, {}
+    )
+    (entry,) = doc["models"]
+    weights = mc.catalog_weights(candidates, {})
+    assert (
+        mc.overall_scores(candidates[0], weights)["balanced"]
+        == entry["scores"]["overall"]["balanced"]
+    )
+    assert mc.overall_scores(candidates[0], weights) == entry["scores"]["overall"]
+
+
+def test_off_peak_deals_sorts_caps_and_drops_zero_rounding():
+    schedules = [
+        {"id": "acme/a", "max_discount": 0.10},
+        {"id": "acme/b", "max_discount": 0.50},
+        {"id": "acme/c", "max_discount": 0.004},
+        {"id": "acme/d", "max_discount": 0.50},
+    ]
+    ids = [row["id"] for row in mc.off_peak_deals(schedules)]
+    assert ids == ["acme/b", "acme/d", "acme/a"]
+
+
+def test_off_peak_deals_caps_at_ten():
+    schedules = [
+        {"id": f"acme/m{i}", "max_discount": 0.1 + i / 100} for i in range(15)
+    ]
+    assert len(mc.off_peak_deals(schedules)) == 10
+
+
+def test_print_deals_table_and_empty_state(capsys):
+    rows = [
+        {
+            "id": "acme/deal",
+            "sched_note": "-45%",
+            "sched_detail": "daily 01:00-05:00 UTC",
+            "quality": 38.9,
+            "offpeak": {"input_per_1m": 0.017, "output_per_1m": 0.066},
+            "context": 256000,
+            "score": 0.661,
+        }
+    ]
+    mc.print_deals(rows)
+    out = capsys.readouterr().out
+    assert "Off-peak deals" in out
+    assert "daily 01:00-05:00 UTC" in out
+    assert "-45%" in out
+    assert "OFF-PEAK  largest scheduled discount" in out
+    mc.print_deals([])
+    assert "No scheduled off-peak discounts in the current data." in capsys.readouterr().out
+
+
+def test_print_deals_dashes_out_of_pool_score_and_quality(capsys):
+    rows = [
+        {
+            "id": "acme/deal",
+            "sched_note": "-45%",
+            "sched_detail": "daily 01:00-05:00 UTC",
+            "quality": None,
+            "offpeak": {"input_per_1m": 0.017, "output_per_1m": 0.066},
+            "context": 256000,
+            "score": None,
+        }
+    ]
+    mc.print_deals(rows)
+    row = next(
+        line for line in capsys.readouterr().out.splitlines() if "acme/deal" in line
+    )
+    assert row.count("-") >= 3  # sched "-45%" plus QUAL and SCORE placeholders
+
+
+def test_run_off_peak_appends_deals(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/deal", pricing=hy4_pricing()),
+        make_model(id="acme/plain"),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(off_peak=True), models, False) == 0
+    out = capsys.readouterr().out
+    assert "Off-peak deals" in out
+    assert "acme/deal" in out
+
+
+def test_run_off_peak_empty_state(monkeypatch, capsys):
+    models = [make_model(id="acme/plain")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(off_peak=True), models, False) == 0
+    assert "No scheduled off-peak discounts in the current data." in capsys.readouterr().out
+
+
+def test_run_bare_off_peak_suppresses_title_and_legend(monkeypatch, capsys):
+    models = [
+        make_model(id="acme/deal", pricing=hy4_pricing()),
+        make_model(id="acme/plain"),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(off_peak=True, bare=True), models, False) == 0
+    out = capsys.readouterr().out
+    assert "Off-peak deals" not in out
+    assert "largest scheduled discount" not in out
+    assert "acme/deal" in out

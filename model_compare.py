@@ -2543,6 +2543,38 @@ def catalog_weights(candidates, quality_by_id):
     return weights
 
 
+def overall_scores(cand, weights=None) -> dict:
+    """Per-priority overall scores from rounded components (catalog parity).
+
+    weights is the per-priority map from catalog_weights; callers that must
+    match the catalog on quality-blind runs pass it, otherwise the base
+    PRIORITY_WEIGHTS apply.
+    """
+    weights = weights or PRIORITY_WEIGHTS
+    scores = {
+        "price": round(cand["price_score"], 4),
+        "quality": round(cand["quality_score"], 4),
+        "context": round(cand["context_score"], 4),
+        "age": round(cand["age_score"], 4),
+    }
+    return {
+        priority: round(
+            weights[priority].get("quality", 0.0) * scores["quality"]
+            + weights[priority].get("price", 0.0) * scores["price"]
+            + weights[priority].get("context", 0.0) * scores["context"]
+            + weights[priority].get("age", 0.0) * scores["age"],
+            4,
+        )
+        for priority in PRIORITY_WEIGHTS
+    }
+
+
+def off_peak_deals(schedules, limit=10):
+    rows = [row for row in schedules if f"{row['max_discount']:.0%}" != "0%"]
+    rows.sort(key=lambda row: (-row["max_discount"], row["id"]))
+    return rows[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Filtering and scoring
 # ---------------------------------------------------------------------------
@@ -2984,42 +3016,69 @@ def quality_source_lines(note) -> list[str]:
 
 TABLE_COLUMNS = {
     "expert": (
-        "RANK", "MODEL", "QUAL", "$IN/M", "$OUT/M", "DISC",
-        "PREC", "TIER", "CTX", "AGE", "SCORE",
+        "RANK",
+        "MODEL",
+        "QUAL",
+        "$IN/M",
+        "$OUT/M",
+        "DISC",
+        "PREC",
+        "TIER",
+        "CTX",
+        "AGE",
+        "SCORE",
     ),
     "simple": ("RANK", "MODEL", "QUALITY", "IN $/M", "OUT $/M", "DISCOUNT", "AGE"),
 }
 
 LEGENDS = {
     "expert": (
-        ("QUALITY", ['Artificial Analysis intelligence index; "-" = unknown (scores 0)']),
-        ("$IN/$OUT", [
-            "USD per 1M tokens at the cheapest eligible endpoint, blended",
-            "75% input / 25% output (--input-share); differs from the",
-            "openrouter.ai default-endpoint price by design. A higher rate",
-            "may apply once the prompt outgrows a model's short-context tier.",
-        ]),
+        (
+            "QUALITY",
+            ['Artificial Analysis intelligence index; "-" = unknown (scores 0)'],
+        ),
+        (
+            "$IN/$OUT",
+            [
+                "USD per 1M tokens at the cheapest eligible endpoint, blended",
+                "75% input / 25% output (--input-share); differs from the",
+                "openrouter.ai default-endpoint price by design. A higher rate",
+                "may apply once the prompt outgrows a model's short-context tier.",
+            ],
+        ),
         ("DISC", ["active discount"]),
-        ("PREC", [
-            'quoted precision ("!" = default routing favors cheaper',
-            "sub-default endpoints)",
-        ]),
-        ("TIER", [
-            "how prices vary: >Nk = pricier above that prompt size; -N% =",
-            "scheduled off-peak discount (price shown: the standard rate);",
-            "SCHED = schedule with a discount under 1% (--off-peak lists them)",
-        ]),
+        (
+            "PREC",
+            [
+                'quoted precision ("!" = default routing favors cheaper',
+                "sub-default endpoints)",
+            ],
+        ),
+        (
+            "TIER",
+            [
+                "how prices vary: >Nk = pricier above that prompt size; -N% =",
+                "scheduled off-peak discount (price shown: the standard rate);",
+                "SCHED = schedule with a discount under 1% (--off-peak lists them)",
+            ],
+        ),
         ("CTX", ["context window; AGE = days since listed on OpenRouter"]),
         ("SCORE", ["weighted blend of the four criteria above"]),
     ),
     "simple": (
         ("RANK", ["position in this ranking"]),
         ("MODEL", ["provider-qualified id (openrouter/<provider>/<model>)"]),
-        ("QUALITY", ['Artificial Analysis intelligence index; "-" = unknown (scores 0)']),
-        ("IN/OUT $/M", [
-            "USD per 1M tokens at the cheapest eligible endpoint, blended",
-            "75% input / 25% output (--input-share)",
-        ]),
+        (
+            "QUALITY",
+            ['Artificial Analysis intelligence index; "-" = unknown (scores 0)'],
+        ),
+        (
+            "IN/OUT $/M",
+            [
+                "USD per 1M tokens at the cheapest eligible endpoint, blended",
+                "75% input / 25% output (--input-share)",
+            ],
+        ),
         ("DISCOUNT", ["active discount, if any"]),
         ("AGE", ["days since listed on OpenRouter"]),
     ),
@@ -3050,15 +3109,11 @@ def table_cells(cand, rank):
     }
 
 
-def print_table(
-    top, weights, quality_note, detail="expert", style=None, bare=False
-):
+def print_table(top, weights, quality_note, detail="expert", style=None, bare=False):
     style = style or Style(False)
     columns = TABLE_COLUMNS[detail]
     rows = [table_cells(cand, rank) for rank, cand in enumerate(top, 1)]
-    widths = {
-        col: max([len(col)] + [len(row[col]) for row in rows]) for col in columns
-    }
+    widths = {col: max([len(col)] + [len(row[col]) for row in rows]) for col in columns}
 
     def pad(col, value):
         if col == "MODEL":
@@ -3100,6 +3155,76 @@ def print_table(
         print(style.bold(term.ljust(width)) + "  " + lines[0])
         for extra in lines[1:]:
             print(" " * (width + 2) + extra)
+
+
+DEALS_COLUMNS = (
+    "MODEL",
+    "OFF-PEAK",
+    "SCHEDULE",
+    "QUAL",
+    "$IN/M",
+    "$OUT/M",
+    "CTX",
+    "SCORE",
+)
+
+DEALS_LEGEND = (
+    ("OFF-PEAK", "largest scheduled discount vs the standard rate"),
+    ("SCHEDULE", "when the discounted rate applies (UTC)"),
+)
+
+
+def print_deals(rows, style=None, bare=False):
+    style = style or Style(False)
+    if not rows:
+        print("No scheduled off-peak discounts in the current data.")
+        return
+    cells = [
+        {
+            "MODEL": row["id"],
+            "OFF-PEAK": row["sched_note"],
+            "SCHEDULE": row["sched_detail"] or "--",
+            "QUAL": fmt_quality(row["quality"]),
+            "$IN/M": fmt_price(row["offpeak"]["input_per_1m"]),
+            "$OUT/M": fmt_price(row["offpeak"]["output_per_1m"]),
+            "CTX": fmt_context(row["context"]),
+            "SCORE": "-" if row["score"] is None else f"{row['score']:.3f}",
+        }
+        for row in rows
+    ]
+    widths = {
+        col: max([len(col)] + [len(cell[col]) for cell in cells])
+        for col in DEALS_COLUMNS
+    }
+
+    def pad(col, value):
+        if col in ("MODEL", "SCHEDULE"):
+            return value.ljust(widths[col])
+        return value.rjust(widths[col])
+
+    if not bare:
+        print()
+        print(
+            style.bold(
+                "Off-peak deals (cheapest off-peak window's prices; "
+                "the standard rate applies at all other times)"
+            )
+        )
+        print()
+    print("  ".join(style.bold(pad(col, col)) for col in DEALS_COLUMNS))
+    print(style.dim("  ".join("-" * widths[col] for col in DEALS_COLUMNS)))
+    for cell in cells:
+        out = []
+        for col in DEALS_COLUMNS:
+            text = pad(col, cell[col])
+            out.append(style.bold(text) if col == "OFF-PEAK" else text)
+        print("  ".join(out))
+    if bare:
+        return
+    print()
+    width = max(len(term) for term, _ in DEALS_LEGEND)
+    for term, text in DEALS_LEGEND:
+        print(style.bold(term.ljust(width)) + "  " + text)
 
 
 def print_json(top):
@@ -3268,16 +3393,7 @@ def build_catalog(
             "context": round(cand["context_score"], 4),
             "age": round(cand["age_score"], 4),
         }
-        overall = {}
-        for priority in PRIORITY_WEIGHTS:
-            w = weights[priority]
-            overall[priority] = round(
-                w.get("quality", 0.0) * scores["quality"]
-                + w.get("price", 0.0) * scores["price"]
-                + w.get("context", 0.0) * scores["context"]
-                + w.get("age", 0.0) * scores["age"],
-                4,
-            )
+        overall = overall_scores(cand, weights)
         bench = aa_by_id.get(base_model_id(cand["id"])) or {}
         # The quality record map is already a parameter; the winning
         # record's as_of and drift verdict become entry fields verbatim.
@@ -3817,6 +3933,16 @@ def run(args, models, or_cached) -> int:
             style=style,
             bare=args.bare,
         )
+        if args.off_peak:
+            catalog_w = catalog_weights(candidates, quality_by_id)
+            balanced = {
+                cand["id"]: overall_scores(cand, catalog_w)["balanced"]
+                for cand in candidates
+            }
+            schedules = build_schedules(
+                models, args, quality_by_id, aa_by_id, balanced, catalog_quality
+            )
+            print_deals(off_peak_deals(schedules), style=style, bare=args.bare)
     return 0
 
 
