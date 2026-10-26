@@ -2335,6 +2335,53 @@ def test_table_has_tier_column(capsys):
     assert ">100k" not in plain_row
 
 
+class _FakeStream:
+    def __init__(self, tty):
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+def test_style_disabled_passes_text_through():
+    style = mc.Style(False)
+    for method in ("bold", "dim", "green", "yellow"):
+        assert getattr(style, method)("text") == "text"
+
+
+def test_style_enabled_wraps_in_sgr():
+    style = mc.Style(True)
+    assert style.bold("RANK") == "\x1b[1mRANK\x1b[0m"
+    assert style.dim("-") == "\x1b[2m-\x1b[0m"
+    assert style.green("row") == "\x1b[32mrow\x1b[0m"
+    assert style.yellow("warn") == "\x1b[33mwarn\x1b[0m"
+
+
+def test_color_auto_follows_tty(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert mc.color_enabled("auto", _FakeStream(True)) is True
+    assert mc.color_enabled("auto", _FakeStream(False)) is False
+
+
+def test_color_auto_honors_nonempty_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert mc.color_enabled("auto", _FakeStream(True)) is False
+
+
+def test_color_auto_ignores_empty_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "")
+    assert mc.color_enabled("auto", _FakeStream(True)) is True
+
+
+def test_color_on_overrides_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert mc.color_enabled("on", _FakeStream(False)) is True
+
+
+def test_color_off_forces_plain():
+    assert mc.color_enabled("off", _FakeStream(True)) is False
+
+
 def test_footer_legend_lines(capsys):
     mc.print_table(_scored_candidates(), 2, mc.PRIORITY_WEIGHTS["balanced"], "note")
     out = capsys.readouterr().out

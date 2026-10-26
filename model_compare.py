@@ -3378,6 +3378,49 @@ def print_catalog(document):
     print(json.dumps(document, indent=2))
 
 
+# --- plain-text styling -----------------------------------------------------
+# SGR attributes only: the terminal theme supplies the hues, so the output
+# stays readable on light and dark themes alike.
+SGR_RESET = "\x1b[0m"
+SGR_BOLD = "\x1b[1m"
+SGR_DIM = "\x1b[2m"
+SGR_GREEN = "\x1b[32m"
+SGR_YELLOW = "\x1b[33m"
+
+
+class Style:
+    """Minimal SGR wrapper; every method is a no-op when disabled."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+
+    def _wrap(self, text: str, code: str) -> str:
+        return f"{code}{text}{SGR_RESET}" if self.enabled else text
+
+    def bold(self, text: str) -> str:
+        return self._wrap(text, SGR_BOLD)
+
+    def dim(self, text: str) -> str:
+        return self._wrap(text, SGR_DIM)
+
+    def green(self, text: str) -> str:
+        return self._wrap(text, SGR_GREEN)
+
+    def yellow(self, text: str) -> str:
+        return self._wrap(text, SGR_YELLOW)
+
+
+def color_enabled(mode: str, stream) -> bool:
+    """Resolve --color for one stream. Explicit "on" beats NO_COLOR."""
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
