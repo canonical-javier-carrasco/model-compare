@@ -37,6 +37,9 @@ Examples:
   model_compare.py --best                   print only "#1 opencode id" (openrouter/<model>)
   model_compare.py --priority price --top 3 three cheapest-sensible picks
   model_compare.py --discount               only currently-discounted models
+  model_compare.py --off-peak               also list scheduled off-peak deals
+  model_compare.py --detail simple          fewer columns, friendlier labels
+  model_compare.py --bare                   just the table(s): no summary or legend
   model_compare.py --catalog                full catalog (ranked + filtered) as one JSON document
   MODEL=$(model_compare.py --best)          shell integration (opencode --model $MODEL)
 """

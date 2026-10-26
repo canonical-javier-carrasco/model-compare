@@ -28,6 +28,51 @@ display string (e.g. `25%` or `--`).
 No dependencies beyond Python 3.10+ (stdlib only). Exit codes: `0` success,
 `1` fetch failure, `2` no candidates survive the filters.
 
+## Sample output
+
+The table goes to stdout; the summary goes to stderr. The numbers below are
+illustrative, not current data. The stderr lines come first:
+
+```console
+$ ./model_compare.py --top 4
+74 of 468 listed models ranked
+(dropped: 275 context, 61 not ZDR, 47 batch, 6 pricing, 5 tool calling)
+
+RANK  MODEL               QUAL  $IN/M  $OUT/M  DISC  PREC  TIER   CTX    AGE  SCORE
+----  ------------------  ----  -----  ------  ----  ----  -----  -----  ---  -----
+   1  z-ai/glm-5.3-flash  58.0  0.120   0.400    --   fp8     --  1.00M  42d  0.812
+   2  acme/coder-mini     51.0  0.250    1.00   25%  bf16  >200k  1.05M  3mo  0.744
+   3  moonshot/kimi-lite  49.0  0.300    1.20    --   fp8     --  1.00M  5mo  0.701
+   4  deepseek/v3-turbo      -  0.180   0.550    --   fp8   -38%  1.00M  20d  0.655
+
+Weights: quality 40%, price 40%, context 10%, age 10%
+Quality source: AA index v4.3 - live AA (2 models, checked 13:15Z) |
+                our published catalog (1 model, as of 2026-10-23 13:15Z);
+                1 model unmatched (no quality data; quality score 0)
+
+QUALITY   Artificial Analysis intelligence index; "-" = unknown (scores 0)
+$IN/$OUT  USD per 1M tokens at the cheapest eligible endpoint, blended
+          75% input / 25% output (--input-share); differs from the
+          openrouter.ai default-endpoint price by design. A higher rate
+          may apply once the prompt outgrows a model's short-context tier.
+DISC      active discount
+PREC      quoted precision ("!" = default routing favors cheaper
+          sub-default endpoints)
+TIER      how prices vary: >Nk = pricier above that prompt size; -N% =
+          scheduled off-peak discount (price shown: the standard rate);
+          SCHED = schedule with a discount under 1% (--off-peak lists them)
+CTX       context window; AGE = days since listed on OpenRouter
+SCORE     weighted blend of the four criteria above
+```
+
+On a terminal, the header and rank numbers are bold, the #1 row is green, and
+the dropped line and `-` placeholders are dim. A `Quality source:` block that
+has unmatched models turns yellow. Piped output and `--bare` are plain.
+
+`--detail simple` shows RANK, MODEL, QUALITY, IN $/M, OUT $/M, DISCOUNT and
+AGE; `--bare` drops the summary, the weights line, the quality block and the
+legend, leaving only the table(s).
+
 ## Options
 
 | flag | default | meaning |
@@ -37,6 +82,10 @@ No dependencies beyond Python 3.10+ (stdlib only). Exit codes: `0` success,
 | `--best` | off | print only the #1 model id (for scripting) |
 | `--json` | off | machine-readable output |
 | `--catalog` | off | print the full model catalog (ranked candidates + filtered, with reasons, plus the per-priority model ranking) as one JSON document |
+| `--detail {simple,expert}` | `expert` | table density; `simple` hides PREC, TIER, CTX and SCORE and uses the web page's labels (QUALITY, IN $/M, OUT $/M, DISCOUNT) |
+| `--off-peak` | off | also list scheduled off-peak deals, ranked by discount size (capped at 10) |
+| `--bare` | off | print just the table(s), no summary or legend |
+| `--color {auto,on,off}` | `auto` | colorize the table; `auto` colors only on a terminal, `on` forces it (e.g. `less -R`), and `NO_COLOR` disables it |
 | `--min-context N` | 1000000 | hard context-window floor (tokens) |
 | `--input-share F` | 0.75 | input share of the blended price (0–1) |
 | `--recency-half-life D` | 120 | age decay half-life (days) |
