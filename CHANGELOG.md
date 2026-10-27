@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alternative. Deals rows carry the same effort tag and "not like-for-like"
   drift wording.
 
+- CLI: color support (`--color auto/on/off`, `NO_COLOR`), one-term-per-line
+  legend, `--detail simple|expert`, `--off-peak` deals table, `--bare`, and
+  grouped `--help`.
+
 ### Changed
 
 - Catalog `schema_version` 4 → 5: `quality` now means the

@@ -37,6 +37,9 @@ Examples:
   model_compare.py --best                   print only "#1 opencode id" (openrouter/<model>)
   model_compare.py --priority price --top 3 three cheapest-sensible picks
   model_compare.py --discount               only currently-discounted models
+  model_compare.py --off-peak               also list scheduled off-peak deals
+  model_compare.py --detail simple          fewer columns, friendlier labels
+  model_compare.py --bare                   just the table(s): no summary or legend
   model_compare.py --catalog                full catalog (ranked + filtered) as one JSON document
   MODEL=$(model_compare.py --best)          shell integration (opencode --model $MODEL)
 """
@@ -3519,6 +3522,38 @@ def catalog_weights(candidates, quality_by_id):
     return weights
 
 
+def overall_scores(cand, weights=None) -> dict:
+    """Per-priority overall scores from rounded components (catalog parity).
+
+    weights is the per-priority map from catalog_weights; callers that must
+    match the catalog on quality-blind runs pass it, otherwise the base
+    PRIORITY_WEIGHTS apply.
+    """
+    weights = weights or PRIORITY_WEIGHTS
+    scores = {
+        "price": round(cand["price_score"], 4),
+        "quality": round(cand["quality_score"], 4),
+        "context": round(cand["context_score"], 4),
+        "age": round(cand["age_score"], 4),
+    }
+    return {
+        priority: round(
+            weights[priority].get("quality", 0.0) * scores["quality"]
+            + weights[priority].get("price", 0.0) * scores["price"]
+            + weights[priority].get("context", 0.0) * scores["context"]
+            + weights[priority].get("age", 0.0) * scores["age"],
+            4,
+        )
+        for priority in PRIORITY_WEIGHTS
+    }
+
+
+def off_peak_deals(schedules, limit=10):
+    rows = [row for row in schedules if f"{row['max_discount']:.0%}" != "0%"]
+    rows.sort(key=lambda row: (-row["max_discount"], row["id"]))
+    return rows[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Filtering and scoring
 # ---------------------------------------------------------------------------
@@ -3942,21 +3977,24 @@ def _later_as_of(value, current) -> bool:
     return new > old
 
 
+QUALITY_SOURCE_LABEL = "Quality source: "
+
+
 def quality_footer_note(quality_by_id, aa_index_version, unmatched):
     """Compose the footer's quality note from the resolved records.
 
-    Lists per-source counts, each source's own as_of and the AA index
-    version when known, e.g. "AA index v4.3 - live AA (58, checked 13:15Z)
-    | our catalog (12, as of 2026-10-23 13:15Z) | OpenRouter snapshot (2,
-    as of 2026-10-17)". A trailing "unmatched score 0" names candidates
-    with no quality record, and a drift footnote appears when any resolved
-    record disagrees with the OpenRouter check value; that count covers only
-    comparable (non-reasoning) rows and the footnote says so. Returns None
-    when no record resolved -- run() falls back to the quality-blind note.
+    Returns {"sources": [...], "clauses": [...], "warn": bool}. Each source
+    names its model count, its own as_of and the AA index version when
+    known, e.g. "AA index v4.3 - live AA (58 models, checked 13:15Z)".
+    Clauses carry the unmatched-candidates note and the drift footnote when
+    any resolved record disagrees with the OpenRouter check value; the drift
+    count covers only comparable (non-reasoning) rows and says so. Returns
+    None when no record resolved -- run() falls back to the quality-blind
+    note.
     """
     labels = {
         "aa": "live AA",
-        "catalog": "our catalog",
+        "catalog": "our published catalog",
         "openrouter": "OpenRouter snapshot",
     }
     stamp_words = {"aa": "checked", "catalog": "as of", "openrouter": "as of"}
@@ -3977,30 +4015,58 @@ def quality_footer_note(quality_by_id, aa_index_version, unmatched):
         count = counts.get(source, 0)
         if not count:
             continue
+        plural = "" if count == 1 else "s"
         stamp = _footer_as_of(source, latest.get(source))
         if stamp:
-            blocks.append(f"{labels[source]} ({count}, {stamp_words[source]} {stamp})")
+            blocks.append(
+                f"{labels[source]} ({count} model{plural}, {stamp_words[source]} {stamp})"
+            )
         else:
-            blocks.append(f"{labels[source]} ({count})")
+            blocks.append(f"{labels[source]} ({count} model{plural})")
     if not blocks:
         return None
-    note = "quality: "
-    if aa_index_version is not None:
-        note += f"AA index v{aa_index_version} - "
-    note += " | ".join(blocks)
+    if aa_index_version is not None and counts.get("aa"):
+        # Only the AA block gets the index-version prefix; a run whose first
+        # (or only) source is the OpenRouter snapshot must not be mislabelled
+        # as an AA index version.
+        blocks[0] = f"AA index v{aa_index_version} - {blocks[0]}"
+    clauses = []
     if unmatched:
-        note += "; unmatched score 0"
+        plural = "" if unmatched == 1 else "s"
+        clauses.append(
+            f"{unmatched} model{plural} unmatched (no quality data; quality score 0)"
+        )
     drift = sum(1 for record in quality_by_id.values() if record.get("drift"))
     if drift:
         rows = "row" if drift == 1 else "rows"
-        note += (
-            f"; drift vs OpenRouter snapshot: {drift} comparable (non-reasoning) {rows}"
+        clauses.append(
+            f"drift vs OpenRouter snapshot: {drift} comparable (non-reasoning) {rows}"
         )
-    return note
+    return {"sources": blocks, "clauses": clauses, "warn": bool(unmatched)}
 
 
-def print_table(top, total_candidates, weights, quality_note):
-    headers = [
+def quality_source_lines(note) -> list[str]:
+    """Render the footer as one source per line, 16-space continuation."""
+    if not note or not note.get("sources"):
+        return [QUALITY_SOURCE_LABEL + "unavailable; ranked on price/context/age"]
+    indent = " " * len(QUALITY_SOURCE_LABEL)
+    sources = note["sources"]
+    clauses = note.get("clauses") or []
+    lines = []
+    for index, source in enumerate(sources):
+        prefix = QUALITY_SOURCE_LABEL if index == 0 else indent
+        if index < len(sources) - 1:
+            lines.append(prefix + source + " |")
+        elif clauses:
+            lines.append(prefix + source + ";")
+        else:
+            lines.append(prefix + source)
+    lines.extend(indent + clause for clause in clauses)
+    return lines
+
+
+TABLE_COLUMNS = {
+    "expert": (
         "RANK",
         "MODEL",
         "DEPTH",
@@ -4013,83 +4079,287 @@ def print_table(top, total_candidates, weights, quality_note):
         "CTX",
         "AGE",
         "SCORE",
-    ]
-    rows = []
-    for rank, cand in enumerate(top, 1):
-        rows.append(
+    ),
+    "simple": ("RANK", "MODEL", "QUALITY", "IN $/M", "OUT $/M", "DISCOUNT", "AGE"),
+}
+
+LEGENDS = {
+    "expert": (
+        (
+            "QUALITY",
+            ['Artificial Analysis intelligence index; "-" = unknown (scores 0)'],
+        ),
+        (
+            "DEPTH",
             [
-                str(rank),
-                cand["id"],
-                fmt_depth(cand),
-                "-" if cand["quality"] is None else f"{cand['quality']:.1f}",
-                fmt_price(cand["price_in"]),
-                fmt_price(cand["price_out"]),
-                fmt_discount(cand["discount"]),
-                fmt_prec(cand),
-                cand["tier_note"] or cand["sched_note"] or "--",
-                fmt_context(cand["context"]),
-                fmt_age(cand["age_days"]),
-                f"{cand['score']:.3f}",
-            ]
-        )
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+                "reasoning effort the QUAL score was measured at; * = OpenRouter's",
+                "default; - = no known effort; --no-depths hides the depth detail",
+            ],
+        ),
+        (
+            "$IN/$OUT",
+            [
+                "USD per 1M tokens at the cheapest eligible endpoint, blended",
+                "{in_pct} input / {out_pct} output (--input-share); differs from the",
+                "openrouter.ai default-endpoint price by design. A higher rate",
+                "may apply once the prompt outgrows a model's short-context tier.",
+            ],
+        ),
+        ("DISC", ["active discount"]),
+        (
+            "PREC",
+            [
+                'quoted precision ("!" = default routing favors cheaper',
+                "sub-default endpoints)",
+            ],
+        ),
+        (
+            "TIER",
+            [
+                "how prices vary: >Nk = pricier above that prompt size; -N% =",
+                "scheduled off-peak discount (price shown: the standard rate);",
+                "SCHED = schedule with a discount under 1% (--off-peak lists them)",
+            ],
+        ),
+        ("CTX", ["context window; AGE = days since listed on OpenRouter"]),
+        ("SCORE", ["weighted blend of the four criteria above"]),
+    ),
+    "simple": (
+        ("RANK", ["position in this ranking"]),
+        ("MODEL", ["provider/model id as listed; --best prefixes openrouter/"]),
+        (
+            "QUALITY",
+            [
+                'Artificial Analysis intelligence index; "-" = unknown (scores 0)',
+                "the suffix after · is the reasoning effort the score was measured at",
+            ],
+        ),
+        (
+            "IN/OUT $/M",
+            [
+                "USD per 1M tokens at the cheapest eligible endpoint, blended",
+                "{in_pct} input / {out_pct} output (--input-share)",
+            ],
+        ),
+        ("DISCOUNT", ["active discount, if any"]),
+        ("AGE", ["days since listed on OpenRouter"]),
+    ),
+}
 
-    def emit(row):
-        if row[1] == "MODEL":
-            line = "  ".join(h.ljust(w) for h, w in zip(row, widths))
-            print(line)
-            print("  ".join("-" * w for w in widths))
-        else:
-            cells = [row[0].rjust(widths[0]), row[1].ljust(widths[1])]
-            cells += [c.rjust(w) for c, w in zip(row[2:], widths[2:])]
-            print("  ".join(cells))
 
-    emit(headers)
-    for row in rows:
-        emit(row)
-    weight_bits = ", ".join(
-        f"{k} {v:.0%}" for k, v in sorted(weights.items(), reverse=True)
-    )
-    print()
-    print(
-        f"pool: {total_candidates} candidates | weights: {weight_bits} | {quality_note}"
-    )
+def fmt_quality(value) -> str:
+    return "-" if value is None else f"{value:.1f}"
 
 
-def print_table_legend():
-    """The main table's legend paragraphs.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
-    Printed after any depth detail, so the DEPTH line says "above".
+
+def display_text(value) -> str:
+    """Return untrusted text safe to print: strip C0/C1 control characters.
+
+    Model ids come from the OpenRouter API. An id carrying ESC (SGR/CSI
+    injection) or a newline (forged output lines) must never reach the
+    terminal raw. Normal ids pass through unchanged.
     """
-    print(
-        "quality: Artificial Analysis intelligence index (- = unknown); prices in USD per 1M tokens; "
-        "DISC = active discount; AGE = time since listed on OpenRouter"
+    return _CONTROL_CHARS_RE.sub("", str(value))
+
+
+def table_cells(cand, rank):
+    effort = (cand.get("quality_record") or {}).get("effort")
+    quality_cell = fmt_quality(cand["quality"])
+    if effort and cand["quality"] is not None:
+        # Simple view has no DEPTH column; the effort rides on QUALITY.
+        quality_cell += f" · {effort}"
+    return {
+        "RANK": str(rank),
+        "MODEL": display_text(cand["id"]),
+        "DEPTH": fmt_depth(cand),
+        "QUAL": fmt_quality(cand["quality"]),
+        "QUALITY": quality_cell,
+        "$IN/M": fmt_price(cand["price_in"]),
+        "IN $/M": fmt_price(cand["price_in"]),
+        "$OUT/M": fmt_price(cand["price_out"]),
+        "OUT $/M": fmt_price(cand["price_out"]),
+        "DISC": fmt_discount(cand["discount"]),
+        "DISCOUNT": fmt_discount(cand["discount"]),
+        "PREC": fmt_prec(cand),
+        "TIER": cand["tier_note"] or cand["sched_note"] or "--",
+        "CTX": fmt_context(cand["context"]),
+        "AGE": fmt_age(cand["age_days"]),
+        "SCORE": f"{cand['score']:.3f}",
+    }
+
+
+def format_weights(weights) -> str:
+    """Render weights as integer percentages that sum to exactly 100.
+
+    Naive per-item ``:.0%`` rounding can print 101% (or 99%) because each
+    share rounds independently. Largest-remainder rounding floors every
+    share, then hands the leftover points to the largest fractional parts
+    (deterministic name tie-break) so the line is always self-consistent.
+    """
+    items = sorted(weights.items(), reverse=True)
+    total = sum(value for _, value in items)
+    if total <= 0:
+        return ", ".join(f"{name} 0%" for name, _ in items)
+    exact = [(name, value / total * 100) for name, value in items]
+    floors = [
+        (name, math.floor(share), share - math.floor(share)) for name, share in exact
+    ]
+    remainder = 100 - sum(floor for _, floor, _ in floors)
+    order = sorted(range(len(floors)), key=lambda i: (-floors[i][2], floors[i][0]))
+    bumped = set(order[:remainder])
+    return ", ".join(
+        f"{name} {floor + (1 if index in bumped else 0)}%"
+        for index, (name, floor, _) in enumerate(floors)
     )
-    print(
-        "DEPTH is the reasoning effort the QUAL score was measured at; "
-        "* = OpenRouter's default. QUAL - means AA has not measured the model "
-        "at that effort. --no-depths hides the depth detail above."
-    )
-    print(
-        "Prices shown are what a long session pays: several models bill at a "
-        "higher rate once the prompt outgrows their cheap short-context tier."
-    )
-    print(
-        "TIER marks how prices vary: a token threshold is the prompt size "
-        "above which the higher rate applies; a percentage is a scheduled "
-        "off-peak discount (price shown: the standard rate); SCHED marks a "
-        "schedule whose discount is under 1%. --json lists each model's "
-        "schedule."
-    )
-    print(
-        "PREC = precision the ranked price is quoted at (maker's default when "
-        "disclosed, best available otherwise; ! = default routing favors "
-        "cheaper sub-default endpoints); prices are the cheapest live endpoint "
-        "at that precision."
-    )
+
+
+def print_table(
+    top,
+    weights,
+    quality_note,
+    detail="expert",
+    style=None,
+    bare=False,
+    input_share=0.75,
+    depth_detail=None,
+):
+    style = style or Style(False)
+    columns = TABLE_COLUMNS[detail]
+    rows = [table_cells(cand, rank) for rank, cand in enumerate(top, 1)]
+    widths = {col: max([len(col)] + [len(row[col]) for row in rows]) for col in columns}
+
+    def pad(col, value):
+        if col == "MODEL":
+            return value.ljust(widths[col])
+        return value.rjust(widths[col])
+
+    header = []
+    for col in columns:
+        text = col.ljust(widths[col])
+        header.append(text if col == "SCORE" else style.bold(text))
+    print("  ".join(header))
+    print(style.dim("  ".join("-" * widths[col] for col in columns)))
+    for rank, row in enumerate(rows, 1):
+        cells = []
+        for col in columns:
+            text = pad(col, row[col])
+            if col == "RANK":
+                text = style.bold(text)
+                if rank == 1:
+                    text = style.green(text)
+            elif rank == 1:
+                text = style.green(text)
+            elif col in ("QUAL", "QUALITY") and row[col] == "-":
+                text = style.dim(text)
+            cells.append(text)
+        print("  ".join(cells))
+    if bare:
+        return
+    print()
+    print("Weights: " + format_weights(weights))
+    warn = not quality_note or quality_note.get("warn")
+    for line in quality_source_lines(quality_note):
+        print(style.yellow(line) if warn else line)
+    if depth_detail is not None:
+        print()
+        depth_detail(top)
+    print()
+    legend = LEGENDS[detail]
+    width = max(len(term) for term, _ in legend)
+    in_pct = f"{input_share:.0%}"
+    out_pct = f"{1 - input_share:.0%}"
+    for term, lines in legend:
+        lines = [
+            line.replace("{in_pct}", in_pct).replace("{out_pct}", out_pct)
+            for line in lines
+        ]
+        print(style.bold(term.ljust(width)) + "  " + lines[0])
+        for extra in lines[1:]:
+            print(" " * (width + 2) + extra)
+
+
+DEALS_COLUMNS = (
+    "MODEL",
+    "OFF-PEAK",
+    "SCHEDULE",
+    "QUAL",
+    "$IN/M",
+    "$OUT/M",
+    "CTX",
+    "SCORE",
+)
+
+DEALS_LEGEND = (
+    ("OFF-PEAK", "largest scheduled discount vs the standard rate"),
+    ("SCHEDULE", "when the discounted rate applies (UTC)"),
+)
+
+
+def print_deals(rows, style=None, bare=False):
+    style = style or Style(False)
+    if not rows:
+        if not bare:
+            print()
+        print("No scheduled off-peak discounts in the current data.")
+        return
+    cells = [
+        {
+            "MODEL": display_text(row["id"]),
+            "OFF-PEAK": row["sched_note"],
+            "SCHEDULE": row["sched_detail"] or "--",
+            "QUAL": fmt_quality(row["quality"]),
+            "$IN/M": fmt_price(row["offpeak"]["input_per_1m"]),
+            "$OUT/M": fmt_price(row["offpeak"]["output_per_1m"]),
+            "CTX": fmt_context(row["context"]),
+            "SCORE": "-" if row["score"] is None else f"{row['score']:.3f}",
+        }
+        for row in rows
+    ]
+    widths = {
+        col: max([len(col)] + [len(cell[col]) for cell in cells])
+        for col in DEALS_COLUMNS
+    }
+
+    def pad(col, value):
+        if col in ("MODEL", "SCHEDULE"):
+            return value.ljust(widths[col])
+        return value.rjust(widths[col])
+
+    if not bare:
+        print()
+        print(
+            style.bold(
+                "Off-peak deals (cheapest off-peak window's prices; "
+                "the standard rate applies at all other times)"
+            )
+        )
+        print()
+    header = []
+    for col in DEALS_COLUMNS:
+        # Every deals header is left-aligned (matching the main table and
+        # the frozen mockup); only the data cells keep numeric right-align.
+        text = col.ljust(widths[col])
+        header.append(text if col == "SCORE" else style.bold(text))
+    print("  ".join(header))
+    print(style.dim("  ".join("-" * widths[col] for col in DEALS_COLUMNS)))
+    for cell in cells:
+        out = []
+        for col in DEALS_COLUMNS:
+            text = pad(col, cell[col])
+            if col == "OFF-PEAK":
+                text = style.bold(text)
+            elif col == "QUAL" and cell[col] == "-":
+                text = style.dim(text)
+            out.append(text)
+        print("  ".join(out))
+    if bare:
+        return
+    print()
+    width = max(len(term) for term, _ in DEALS_LEGEND)
+    for term, text in DEALS_LEGEND:
+        print(style.bold(term.ljust(width)) + "  " + text)
 
 
 def print_depth_detail(top):
@@ -4248,7 +4518,7 @@ def print_best(top, args):
         and supports_effort(reasoning, effort)
     ):
         model_id += f"#{effort}"
-    print(model_id)
+    print(display_text(model_id))
 
 
 def print_json(top):
@@ -4445,16 +4715,7 @@ def build_catalog(
             "context": round(cand["context_score"], 4),
             "age": round(cand["age_score"], 4),
         }
-        overall = {}
-        for priority in PRIORITY_WEIGHTS:
-            w = weights[priority]
-            overall[priority] = round(
-                w.get("quality", 0.0) * scores["quality"]
-                + w.get("price", 0.0) * scores["price"]
-                + w.get("context", 0.0) * scores["context"]
-                + w.get("age", 0.0) * scores["age"],
-                4,
-            )
+        overall = overall_scores(cand, weights)
         bench = aa_by_id.get(base_model_id(cand["id"])) or {}
         # The quality record map is already a parameter; the winning
         # record's as_of and drift verdict become entry fields verbatim.
@@ -4673,6 +4934,49 @@ def print_catalog(document):
     print(json.dumps(document, indent=2))
 
 
+# --- plain-text styling -----------------------------------------------------
+# SGR attributes only: the terminal theme supplies the hues, so the output
+# stays readable on light and dark themes alike.
+SGR_RESET = "\x1b[0m"
+SGR_BOLD = "\x1b[1m"
+SGR_DIM = "\x1b[2m"
+SGR_GREEN = "\x1b[32m"
+SGR_YELLOW = "\x1b[33m"
+
+
+class Style:
+    """Minimal SGR wrapper; every method is a no-op when disabled."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+
+    def _wrap(self, text: str, code: str) -> str:
+        return f"{code}{text}{SGR_RESET}" if self.enabled else text
+
+    def bold(self, text: str) -> str:
+        return self._wrap(text, SGR_BOLD)
+
+    def dim(self, text: str) -> str:
+        return self._wrap(text, SGR_DIM)
+
+    def green(self, text: str) -> str:
+        return self._wrap(text, SGR_GREEN)
+
+    def yellow(self, text: str) -> str:
+        return self._wrap(text, SGR_YELLOW)
+
+
+def color_enabled(mode: str, stream) -> bool:
+    """Resolve --color for one stream. Explicit "on" beats NO_COLOR."""
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -4690,59 +4994,95 @@ def parse_args(argv=None):
         action="version",
         version=f"%(prog)s {VERSION}",
     )
-    parser.add_argument(
+    output = parser.add_argument_group("output")
+    ranking = parser.add_argument_group("ranking")
+    filters = parser.add_argument_group("filters")
+    sources = parser.add_argument_group("data sources & cache")
+    filters.add_argument(
         "--min-context",
         type=int,
         default=1_000_000,
         help="hard minimum context window in tokens (default: 1000000)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--priority",
         choices=sorted(PRIORITY_WEIGHTS),
         default="balanced",
         help="ranking emphasis (default: balanced)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--top", type=int, default=5, help="how many models to list (default: 5)"
     )
-    parser.add_argument(
+    output.add_argument(
         "--best",
         action="store_true",
         help="print only the #1 model as an opencode id (openrouter/<model>), for scripting",
     )
-    parser.add_argument(
+    output.add_argument(
         "--json", action="store_true", help="print the ranked candidates as JSON"
     )
-    parser.add_argument(
+    output.add_argument(
         "--catalog",
         action="store_true",
         help="print the full model catalog (ranked candidates and filtered-out models with reasons) as one JSON document; ignores --top and --priority, cannot be combined with --best or --json",
     )
-    parser.add_argument(
+    output.add_argument(
+        "--detail",
+        choices=("simple", "expert"),
+        default="expert",
+        help="table density (default: expert; simple hides PREC, TIER, CTX and "
+        "SCORE, mimicking the web page's simple view)",
+    )
+    output.add_argument(
+        "--off-peak",
+        action="store_true",
+        help="also list scheduled off-peak deals, ranked by discount size",
+    )
+    output.add_argument(
+        "--bare",
+        action="store_true",
+        help="print just the table(s), no summary or legend",
+    )
+    output.add_argument(
+        "--no-depths",
+        action="store_true",
+        help=(
+            "hide the per-model depth detail below the table (the DEPTH and "
+            "QUAL columns stay)"
+        ),
+    )
+    output.add_argument(
+        "--color",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="colorize the table output (default: auto; honors NO_COLOR, and on "
+        "forces color when piping through less -R)",
+    )
+    ranking.add_argument(
         "--input-share",
         type=float,
         default=0.75,
         help="input-token share used for the blended price, 0-1 (default: 0.75)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--recency-half-life",
         type=float,
         default=120.0,
         help="age decay half-life in days (default: 120)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--max-age-days",
         type=float,
         default=0.0,
         help="drop models listed more than this many days ago (0 = off)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--quality-ref",
         type=float,
         default=70.0,
         help="AA intelligence index that counts as full quality score (default: 70)",
     )
-    parser.add_argument(
+    ranking.add_argument(
         "--reasoning-effort",
         choices=REASONING_EFFORT_CHOICES,
         default="default",
@@ -4752,55 +5092,47 @@ def parse_args(argv=None):
             "effective default, no filter)"
         ),
     )
-    parser.add_argument(
-        "--no-depths",
-        action="store_true",
-        help=(
-            "hide the per-model depth detail below the table (the DEPTH and "
-            "QUAL columns stay)"
-        ),
-    )
-    parser.add_argument(
+    sources.add_argument(
         "--aa-api-key",
         default=None,
         help="Artificial Analysis API key (or set AA_API_KEY; free at artificialanalysis.ai)",
     )
-    parser.add_argument(
+    sources.add_argument(
         "--openrouter-api-key",
         default=None,
         help="OpenRouter API key (or set OPENROUTER_API_KEY; free at openrouter.ai/keys)",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--no-require-tools",
         action="store_true",
         help="do not require tool-calling support (coding agents want it)",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--exclude-free",
         action="store_true",
         help="drop zero-cost listings such as rate-limited :free variants",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--include-batch",
         action="store_true",
         help="keep ':batch' variants (asynchronous completion; cheaper but unsuitable for interactive agents)",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--discount",
         action="store_true",
         help="only list models with an active discount",
     )
-    parser.add_argument(
+    filters.add_argument(
         "--no-zdr",
         action="store_true",
         help="consider all models, not just zero-data-retention (ZDR) ones",
     )
-    parser.add_argument(
+    sources.add_argument(
         "--no-cache",
         action="store_true",
         help="bypass the local response cache and refetch",
     )
-    parser.add_argument(
+    sources.add_argument(
         "--cache-ttl",
         type=int,
         default=6 * 3600,
@@ -4983,46 +5315,69 @@ def run(args, models, or_cached) -> int:
     elif args.json:
         print_json(top)
     else:
-        drop_note = ""
-        if dropped:
-            bits = ", ".join(
-                f"{v} {k}" for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])
-            )
-            drop_note = f" (dropped: {bits})"
-        # The footer lists per-source counts, each source's own as_of and
-        # the AA index version when known; unmatched candidates and drift
-        # get trailing footnotes. No record resolved -> the quality-blind
-        # fallback note.
-        unmatched = len(candidates) - len(quality_by_id)
-        quality_note = quality_footer_note(
-            quality_by_id, aa_index_version, unmatched
-        ) or ("quality data unavailable, ranked on price/context/age")
-        source_note = []
-        if or_cached:
-            source_note.append("catalog cached")
-        if "discounts" in frontend_cache_hits:
-            source_note.append("discounts cached")
-        if "zdr" in frontend_cache_hits:
-            source_note.append("ZDR cached")
-        if "aa" in frontend_cache_hits:
-            source_note.append("AA benchmarks cached")
-        if aa_cached and aa_source:
-            source_note.append("quality cached")
-        if source_note:
+        style = Style(color_enabled(args.color, sys.stdout))
+        err_style = Style(color_enabled(args.color, sys.stderr))
+        if not args.bare:
+            source_note = []
+            if or_cached:
+                source_note.append("catalog cached")
+            if "discounts" in frontend_cache_hits:
+                source_note.append("discounts cached")
+            if "zdr" in frontend_cache_hits:
+                source_note.append("ZDR cached")
+            if "aa" in frontend_cache_hits:
+                source_note.append("AA benchmarks cached")
+            if aa_cached and aa_source:
+                source_note.append("quality cached")
+            if source_note:
+                print(
+                    f"note: {', '.join(source_note)} (use --no-cache to refresh)",
+                    file=sys.stderr,
+                )
             print(
-                f"note: {', '.join(source_note)} (use --no-cache to refresh)",
+                f"{len(candidates)} of {len(models)} listed models ranked",
                 file=sys.stderr,
             )
-        print(
-            f"pool: {len(models)} listed -> {len(candidates)} candidates{drop_note}",
-            file=sys.stderr,
+            if dropped:
+                bits = ", ".join(
+                    f"{v} {k}"
+                    for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])
+                )
+                print(err_style.dim(f"(dropped: {bits})"), file=sys.stderr)
+            print(file=sys.stderr)
+        # The footer lists per-source counts, each source's own as_of and
+        # the AA index version when known; unmatched candidates and drift
+        # get trailing clauses. No record resolved -> print_table's
+        # quality-blind fallback line.
+        unmatched = len(candidates) - len(quality_by_id)
+        quality_note = quality_footer_note(quality_by_id, aa_index_version, unmatched)
+        print_table(
+            top,
+            weights,
+            quality_note,
+            detail=args.detail,
+            style=style,
+            bare=args.bare,
+            input_share=args.input_share,
+            depth_detail=(None if args.bare or args.no_depths else print_depth_detail),
         )
-        print_table(top, len(candidates), weights, quality_note)
-        if not args.no_depths:
-            print()
-            print_depth_detail(top)
-            print()
-        print_table_legend()
+        if args.off_peak:
+            catalog_w = catalog_weights(candidates, quality_by_id)
+            # Use the exact unrounded weighted score (not overall_scores,
+            # whose rounded components can disagree by 0.001) so a candidate
+            # in both tables always prints the same SCORE under balanced.
+            balanced_w = catalog_w["balanced"]
+            balanced = {
+                cand["id"]: weighted_score(cand, balanced_w) for cand in candidates
+            }
+            schedules = build_schedules(
+                models, args, quality_by_id, aa_by_id, balanced, catalog_quality
+            )
+            # build_schedules resolves quality for any listed model; the web
+            # page's deals table shows that resolved value even for models
+            # outside the ranked pool, so keep it here too. Only SCORE is
+            # blanked for non-candidates (balanced is None for them).
+            print_deals(off_peak_deals(schedules), style=style, bare=args.bare)
     return 0
 
 
