@@ -5,6 +5,67 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-27
+
+### Added
+
+- Thinking depths: the headline `quality` and every ranking now use the AA
+  intelligence index at the model's **effective OpenRouter default reasoning
+  effort** instead of AA's primary `max` row, and every ranked model carries
+  a depth block: the measured efforts, their AA index, AA `$/task`, the cost
+  ratio against the default, and the OpenCode variant suffix (`#max`) that
+  selects it. The CLI gains a `DEPTH` column (`high*` marks the OpenRouter
+  default) and a per-model depth detail below the table; `QUAL -` means AA
+  has not measured the model at the selected effort, and the score is never
+  borrowed from another depth. AA `$/task` is AA's reference-price benchmark
+  cost: display-only, never in the weighted score.
+- `--reasoning-effort <effort>` (`default`, `none`, `minimal`, `low`,
+  `medium`, `high`, `xhigh`, `max`) selects the effort used for scoring and
+  ranking; a specific effort also drops models that cannot run it (the
+  `reasoning effort` drop reason). `--no-depths` hides the depth detail
+  block; the `DEPTH`/`QUAL` columns stay.
+- `--json` rows gain `quality_effort`, `default_effort` and a nested
+  `reasoning` block (effective default, expanded `supported_efforts`, the
+  raw flags and the depth records); catalog entries gain `quality_effort` and
+  the same `reasoning` block, and `sources.aa` gains `depth_rows`,
+  `matched_depth` and `matched_default`. Schedule entries gain
+  `quality_effort`/`quality_as_of`/`quality_source`.
+- Site: a `DEPTH` column in Expert view (hidden in Simple), the effort under
+  `QUAL` (`46.8 · high` in Simple), the best selectable measured alternative
+  as a muted number, and a Depth section in each expanded row with copy
+  buttons for `openrouter/<id>#<effort>`. An AA row for an effort OpenRouter
+  does not support says `not selectable` and is never advertised as the best
+  alternative. Deals rows carry the same effort tag and "not like-for-like"
+  drift wording.
+
+### Changed
+
+- Catalog `schema_version` 4 → 5: `quality` now means the
+  selected/default-effort score, and each entry carries `quality_effort` and
+  a `reasoning` block. The hydration gate accepts v5 only; an older catalog
+  warns and hydrates no quality rather than mixing semantics.
+- `data.json` 2 → 3: `quality_effort` and `default_effort` join the required
+  row keys; `quality_index` is retained and means the selected/default-effort
+  score. `history.json` 3 → 4: max-based snapshots are not comparable, so
+  history starts fresh; the 7-day arrows and weekly highlights degrade to
+  their no-baseline state until fresh snapshots cover a week.
+  `highlights.json` stays schema 1.
+- The publish gates fail a keyed run when `sources.aa.depth_rows` or
+  `matched_default` is zero, and warn when default-effort coverage is below
+  25% of candidates. `web/publish.py`'s `data.json` stamp check pins version
+  3.
+- Drift is only flagged for non-reasoning models: OpenRouter's snapshot
+  reports no effort, so a reasoning model keeps it as a reference but
+  `quality_drift` is null. The AA entries cache key moved to
+  `aa-intelligence-v4` (one record per measured effort, deduped by AA id).
+- Downstream handoff: the catalog is now v5, which the published OpenCode
+  plugin (npm 0.1.3) does not accept; the plugin release that accepts v5 and
+  pins the effort on aliases is `canonical/model-compare-opencode-plugin#16`.
+  The `data.json` v3 pin bump in `canonical/agent-provisioner` is
+  `canonical/agent-provisioner#638`; the backend keeps its previous snapshot
+  until it lands. This release is upstream-only: both consumer changes are
+  separate follow-ups.
+
 ## [0.5.0] - 2026-10-25
 
 ### Added

@@ -152,13 +152,13 @@ def check_stamps(output_dir: Path) -> dict:
     # .get: fail closed with the clean RuntimeError below even if the
     # required tuple above ever stops listing schema_version.
     version = data.get("schema_version")
-    # Strict identity: True and 2.0 compare equal to 2 but are not v2.
-    if type(version) is not int or version != 2:
+    # Strict identity: True and 3.0 compare equal to 3 but are not v3.
+    if type(version) is not int or version != 3:
         # publish imports nothing from build_site_data (subprocess-only by
         # design); the expected data.json version is pinned here, like the
         # opencode id prefix in check_best.
         raise RuntimeError(
-            f"publish: data.json schema_version must be 2, got {version!r}"
+            f"publish: data.json schema_version must be 3, got {version!r}"
         )
     history = _load_artifact(output_dir / "history.json", ("updated_at", "snapshots"))
     stamp = catalog["generated_at"]
@@ -203,6 +203,9 @@ def check_best(output_dir: Path, catalog: dict) -> None:
 
 
 AA_LIVE_MODE = "aa"
+# Coverage regression threshold (spec 9.4): below this share of candidates
+# carrying a default-effort score the publish warns but still deploys.
+MIN_MATCHED_DEFAULT_COVERAGE = 0.25
 
 
 def check_aa_source(catalog_path: Path) -> None:
@@ -212,10 +215,14 @@ def check_aa_source(catalog_path: Path) -> None:
     returned usable entries, "catalog" for published-catalog hydration
     (keyed runs never hydrate), "none" when neither tier produced data. A
     keyed publish must have live AA data standing behind its quality:
-    mode "aa" AND at least one AA-matched model (matched_aa > 0) -- a
-    rejected key, an empty result, a catalog-or-OR-only chain, an unknown
-    mode or a malformed count all fail closed. Without a key the catalog
-    chain (or OR-only data) is expected, so the gate never raises.
+    mode "aa" AND at least one AA-matched model (matched_aa > 0), at least
+    one per-effort row (depth_rows > 0), and at least one candidate with a
+    default-effort main score (matched_default > 0) -- a rejected key, an
+    empty result, a catalog-or-OR-only chain, an unknown mode or a
+    malformed count all fail closed. Coverage below
+    MIN_MATCHED_DEFAULT_COVERAGE warns without failing: a coverage
+    regression is visible but not a deploy blocker. Without a key the
+    catalog chain (or OR-only data) is expected, so the gate never raises.
     """
     if not os.environ.get("AA_API_KEY"):
         return
@@ -226,19 +233,47 @@ def check_aa_source(catalog_path: Path) -> None:
         aa_sources = {}
     mode = aa_sources.get("mode")
     matched_aa = aa_sources.get("matched_aa")
-    if (
-        mode != AA_LIVE_MODE
-        or not isinstance(matched_aa, int)
-        or isinstance(matched_aa, bool)
-        or matched_aa <= 0
-    ):
+    depth_rows = aa_sources.get("depth_rows")
+    matched_default = aa_sources.get("matched_default")
+    if mode != AA_LIVE_MODE:
         raise RuntimeError(
             "publish: AA_API_KEY is set but catalog sources.aa is "
             f"{{mode: {mode!r}, matched_aa: {matched_aa!r}}}: the AA API "
             "did not yield data. Check the key and artificialanalysis.ai, "
             "or unset AA_API_KEY, before deploying."
         )
-    print(f"publish: AA source mode {mode}, matched_aa {matched_aa}")
+    for label, value in (
+        ("matched_aa", matched_aa),
+        ("depth_rows", depth_rows),
+        ("matched_default", matched_default),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise RuntimeError(
+                f"publish: AA_API_KEY is set but catalog sources.aa.{label} "
+                f"is {value!r}: the AA API did not yield usable data. Check "
+                "the key and artificialanalysis.ai, or unset AA_API_KEY, "
+                "before deploying."
+            )
+    pool = catalog.get("pool")
+    candidates = pool.get("candidates") if isinstance(pool, dict) else None
+    if (
+        isinstance(candidates, int)
+        and not isinstance(candidates, bool)
+        and candidates > 0
+        and matched_default / candidates < MIN_MATCHED_DEFAULT_COVERAGE
+    ):
+        print(
+            "publish: warning: AA matched_default coverage is "
+            f"{matched_default}/{candidates} "
+            f"({matched_default / candidates:.0%} < "
+            f"{MIN_MATCHED_DEFAULT_COVERAGE:.0%}): the AA default-effort "
+            "score covers few candidates",
+            file=sys.stderr,
+        )
+    print(
+        f"publish: AA source mode {mode}, matched_aa {matched_aa}, "
+        f"depth_rows {depth_rows}, matched_default {matched_default}"
+    )
 
 
 def check_endpoint_drops(catalog_path: Path) -> None:

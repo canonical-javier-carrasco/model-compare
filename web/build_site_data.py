@@ -51,6 +51,14 @@ ROW_KEYS = (
     "quality_drift",
     "quality_or_index",
     "quality_or_as_of",
+    # data.json v3 row keys (thinking depth): the effort the main quality
+    # was measured at and the model's effective default effort. print_json
+    # always emits both -- unknown efforts degrade to null -- so the
+    # missing-key check demands them on every row. The nested reasoning
+    # block is NOT a row key: build_data drops it (the site's depth table
+    # joins it from catalog.json).
+    "quality_effort",
+    "default_effort",
 )
 # provider-qualified opencode id (openrouter/<provider/model>), the plain
 # catalog id (<provider/model>), each with an optional :variant suffix.
@@ -66,7 +74,7 @@ MODEL_ID_RE = re.compile(
 # arbitrary text that would ship a dead footer link.
 REVISION_RE = re.compile(r"[0-9a-f]{7,40}")
 
-CATALOG_SCHEMA_VERSION = 4
+CATALOG_SCHEMA_VERSION = 5
 
 # Duplicated from model_compare.py: build_site_data is subprocess-isolated
 # from the CLI, and the catalog constants are duplicated here by convention
@@ -110,6 +118,11 @@ CATALOG_ENTRY_KEYS = (
     # the candidate matched no quality source.
     "quality_as_of",
     "quality_drift",
+    # Schema v5 (thinking depth): the effort the main quality was measured
+    # at, and the model's reasoning metadata plus every measured depth
+    # record (the site's depth table and the plugin read the block).
+    "quality_effort",
+    "reasoning",
     "scores",
     # Schema v3 additive blocks (Task 8/9): the producer emits all four on
     # every entry, null when the candidate skipped the endpoint stage.
@@ -135,6 +148,15 @@ CATALOG_ANNOTATION_KEYS = (
     "risk_flag",
     "baseline_context_below_catalog",
 )
+# Keys of the per-model reasoning block (schema v5): the metadata fields the
+# site and plugin read plus the measured depth records. Only the three keys
+# the depth contract depends on are required; the producer's other metadata
+# fields are tolerated.
+CATALOG_REASONING_KEYS = ("default_effort", "supported_efforts", "depths")
+# One measured depth record: effort label, AA intelligence index at that
+# effort, AA cost per benchmark task (null when unreported), source label and
+# its as_of. `index`, never `quality_index`.
+CATALOG_DEPTH_KEYS = ("effort", "index", "cost_per_task_usd", "source", "as_of")
 # The OpenRouter session-cost dataset's four turn ranges (brainstorm
 # section 2.6): the only keys a medians cell dict may carry.
 SESSION_COST_TURN_RANGES = ("1-turn", "2-9-turns", "10-49-turns", "50-plus-turns")
@@ -159,6 +181,9 @@ CATALOG_SCHEDULE_ENTRY_KEYS = (
     # came without any.
     "quality_source",
     "quality_as_of",
+    # Schema v5: the effort the scheduled row's quality was measured at
+    # (data.json v3 additive), null when unknown.
+    "quality_effort",
     "score",
     "max_discount",
     "sched_note",
@@ -404,6 +429,74 @@ def _validate_catalog_annotations(annotations, label) -> None:
     for key in ("risk_flag", "baseline_context_below_catalog"):
         if not isinstance(annotations[key], bool):
             raise ValueError(f"{label} {key} must be a boolean")
+
+
+def _validate_catalog_reasoning(reasoning, label) -> None:
+    """Schema v5 reasoning block: metadata plus the measured depth records.
+
+    The producer emits the block on every entry (never null), and downstream
+    consumers index straight into it: the site's depth table, the plugin's
+    depth injection and unkeyed runs' depth re-selection. A malformed block
+    fails closed here rather than degrading a published score.
+
+    Depth records reuse the quality record's shape, so the score field is
+    ``index``; ``quality_index`` is the pre-release draft key and is rejected
+    as an unknown key. Effort labels are unique per model (a duplicate is
+    ambiguous, never last-wins), the index is finite, and the AA cost is
+    finite or null when unreported.
+    """
+    if not isinstance(reasoning, dict):
+        raise ValueError(f"{label} is not an object")
+    missing = [key for key in CATALOG_REASONING_KEYS if key not in reasoning]
+    if missing:
+        raise ValueError(f"{label} is missing keys: {', '.join(missing)}")
+    default_effort = reasoning["default_effort"]
+    if default_effort is not None and (
+        not isinstance(default_effort, str) or not default_effort
+    ):
+        raise ValueError(f"{label} default_effort must be a non-empty string or null")
+    for flag in ("mandatory", "default_enabled", "supports_max_tokens"):
+        value = reasoning[flag]
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"{label} {flag} must be a boolean or null")
+    supported = reasoning["supported_efforts"]
+    if not isinstance(supported, list) or any(
+        not isinstance(effort, str) or not effort for effort in supported
+    ):
+        raise ValueError(
+            f"{label} supported_efforts must be a list of non-empty strings"
+        )
+    depths = reasoning["depths"]
+    if not isinstance(depths, list):
+        raise ValueError(f"{label} depths must be a list")
+    seen = set()
+    for j, depth in enumerate(depths):
+        sub = f"{label}.depths[{j}]"
+        if not isinstance(depth, dict):
+            raise ValueError(f"{sub} is not an object")
+        unknown = [key for key in depth if key not in CATALOG_DEPTH_KEYS]
+        if unknown:
+            raise ValueError(f"{sub} has unknown keys: " + ", ".join(unknown))
+        missing = [key for key in CATALOG_DEPTH_KEYS if key not in depth]
+        if missing:
+            raise ValueError(f"{sub} is missing keys: " + ", ".join(missing))
+        effort = depth["effort"]
+        if not isinstance(effort, str) or not effort:
+            raise ValueError(f"{sub} effort must be a non-empty string")
+        if effort in seen:
+            raise ValueError(f"{sub} duplicates effort: {effort!r}")
+        seen.add(effort)
+        if not _is_number(depth["index"]):
+            raise ValueError(f"{sub} index must be a finite number")
+        cost = depth["cost_per_task_usd"]
+        if cost is not None and not _is_number(cost):
+            raise ValueError(f"{sub} cost_per_task_usd must be a finite number or null")
+        source = depth["source"]
+        if not isinstance(source, str) or not source:
+            raise ValueError(f"{sub} source must be a non-empty string")
+        as_of = depth["as_of"]
+        if as_of is not None and not isinstance(as_of, str):
+            raise ValueError(f"{sub} as_of must be a string or null")
 
 
 def _validate_catalog_steering(steering, label) -> None:
@@ -728,6 +821,17 @@ def validate_catalog(document) -> None:
             entry["quality_drift"], bool
         ):
             raise ValueError(f"models[{i}] quality_drift must be a boolean or null")
+        # Schema v5 (thinking depth): the main quality's effort label is a
+        # non-empty string or null (unknown), and the reasoning block is
+        # validated in full -- malformed depth data fails the build.
+        quality_effort = entry["quality_effort"]
+        if quality_effort is not None and (
+            not isinstance(quality_effort, str) or not quality_effort
+        ):
+            raise ValueError(
+                f"models[{i}] quality_effort must be a non-empty string or null"
+            )
+        _validate_catalog_reasoning(entry["reasoning"], f"models[{i}] reasoning")
         if parameters["zdr_required"] and entry["zdr"] is not True:
             raise ValueError(f"models[{i}] is not zdr=true under zdr_required")
         # Schema v3 additive blocks: the producer emits all four (null when
@@ -834,6 +938,15 @@ def validate_catalog(document) -> None:
             entry["quality_as_of"], str
         ):
             raise ValueError(f"schedules[{i}] quality_as_of must be a string or null")
+        # Schema v5: the effort label the scheduled row's quality was
+        # measured at, a non-empty string or null (unknown).
+        quality_effort = entry["quality_effort"]
+        if quality_effort is not None and (
+            not isinstance(quality_effort, str) or not quality_effort
+        ):
+            raise ValueError(
+                f"schedules[{i}] quality_effort must be a non-empty string or null"
+            )
         if entry["score"] is not None and not _is_score(entry["score"]):
             raise ValueError(f"schedules[{i}] score must be a score in [0, 1] or null")
         if entry["sched_detail"] is not None and not isinstance(
@@ -852,7 +965,7 @@ def validate_catalog(document) -> None:
         _validate_catalog_session_cost(document["session_cost"])
 
 
-HISTORY_SCHEMA_VERSION = 3
+HISTORY_SCHEMA_VERSION = 4
 HISTORY_RETENTION = 10
 HISTORY_TOP_N = 20
 
@@ -1107,8 +1220,10 @@ def order_rows(rows, ranking) -> list:
 # data.json's own contract version: additive changes are free; renaming,
 # removing, or changing the meaning of a field bumps it (mirrors the catalog
 # and history documents). v2: the five provider-aware row keys became part
-# of ROW_KEYS' required set (print_json emits them on every row).
-DATA_SCHEMA_VERSION = 2
+# of ROW_KEYS' required set (print_json emits them on every row). v3
+# (thinking depth): quality_effort and default_effort join the required row
+# keys; the nested reasoning block stays catalog-only and is dropped here.
+DATA_SCHEMA_VERSION = 3
 
 
 def project_schedules(catalog) -> list:
@@ -1117,6 +1232,8 @@ def project_schedules(catalog) -> list:
     Excludes schedules whose (already 4-decimal-rounded) max_discount formats
     as 0% -- the SCHED rule; sorted by discount descending then id; capped at
     10. Prices are the cheapest off-peak window's: the table sells the deal.
+    The row's quality provenance (source, as_of, effort) rides through
+    verbatim for the Deals QUAL tooltip.
     """
     decorated = []
     for entry in catalog.get("schedules") or []:
@@ -1136,6 +1253,7 @@ def project_schedules(catalog) -> list:
                     # without it silently).
                     "quality_source": entry["quality_source"],
                     "quality_as_of": entry["quality_as_of"],
+                    "quality_effort": entry["quality_effort"],
                     "score": entry["score"],
                     "input_per_1m": entry["offpeak"]["input_per_1m"],
                     "output_per_1m": entry["offpeak"]["output_per_1m"],
@@ -1197,7 +1315,16 @@ def build_data(
             missing = [key for key in ROW_KEYS if key not in row]
             if missing:
                 raise ValueError(f"{name}[{i}] is missing keys: {', '.join(missing)}")
-    rows_by_priority = {name: list(priorities[name]) for name in PRIORITIES}
+    # data.json rows stay lean: the producer's nested reasoning block is
+    # catalog-only (the site's depth table joins it from catalog.json), so it
+    # is dropped before the rows are projected into the document.
+    rows_by_priority = {
+        name: [
+            {key: value for key, value in row.items() if key != "reasoning"}
+            for row in priorities[name]
+        ]
+        for name in PRIORITIES
+    }
     if catalog is not None:
         for name in PRIORITIES:
             try:

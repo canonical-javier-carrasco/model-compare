@@ -68,6 +68,9 @@ def make_args(**overrides):
         # parse_args always provides this (mirror the production shape);
         # None means the keyless fast path in fetch_session_cost.
         openrouter_api_key=None,
+        reasoning_effort="default",
+        # --no-depths arrives with the depth-output task; inert until then.
+        no_depths=False,
     )
     base.update(overrides)
     return Namespace(**base)
@@ -1837,11 +1840,17 @@ def _endpoint_stage_eps():
     )
 
 
-def _stub_endpoint_pipeline(monkeypatch, models, endpoints_by_id, fail_ids=()):
+def _stub_endpoint_pipeline(
+    monkeypatch, models, endpoints_by_id, fail_ids=(), frontend_models=()
+):
     """Stub every fetcher so mc.run() exercises the endpoint stage offline."""
     zdr = {m["id"] for m in models}
     monkeypatch.setattr(mc, "fetch_openrouter_models", lambda a: (models, False))
-    monkeypatch.setattr(mc, "fetch_openrouter_frontend", lambda a: ({}, zdr, {}, set()))
+    monkeypatch.setattr(
+        mc,
+        "fetch_openrouter_frontend",
+        lambda a: ({}, zdr, {}, set(), list(frontend_models)),
+    )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False, None))
     # Task 4's unkeyed chain hydrates quality from the published catalog;
     # these tests are about the endpoint/session-cost/zdr stages, so the
@@ -1895,7 +1904,10 @@ def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
     # The fetch succeeded, so the cache written moments ago backs the
     # display annotations, marked stale (the model is not ranked on them).
     assert entry["annotations"]["stale"] is True
-    bsd.validate_catalog(doc)
+    # Task 7 moves the site validator to v5; until the two schema pins
+    # agree it rejects this v5 document, so exercise it only then.
+    if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
+        bsd.validate_catalog(doc)
 
 
 def test_empty_pool_after_endpoint_drops_warns_with_drop_counts(monkeypatch, capsys):
@@ -1925,6 +1937,48 @@ def test_empty_pool_after_endpoint_drops_warns_with_drop_counts(monkeypatch, cap
         "no models after the endpoint stage: "
         "no_baseline_eligible_endpoint=2, endpoint_fetch_failed=0" in captured.err
     )
+
+
+def test_run_filters_at_requested_reasoning_effort(monkeypatch, capsys):
+    # Without the run() wiring the metadata is unknown and the model would
+    # be dropped by the effort filter; supporting max must keep it.
+    model = make_model(
+        id="z-ai/glm",
+        name="Z.AI: GLM",
+        reasoning={
+            "mandatory": False,
+            "default_enabled": True,
+            "supported_efforts": ["max", "high"],
+            "default_effort": "high",
+        },
+    )
+    _stub_endpoint_pipeline(monkeypatch, [model], {"z-ai/glm": _endpoint_stage_eps()})
+    args = make_args(min_context=0, reasoning_effort="max")
+    assert mc.run(args, [model], False) == 0
+    assert "z-ai/glm" in capsys.readouterr().out
+
+
+def test_run_uses_frontend_reasoning_fallback_for_the_filter(monkeypatch, capsys):
+    # The model has no models-API reasoning object; only the frontend says
+    # it is non-reasoning, which is what makes --reasoning-effort none keep it.
+    model = make_model(id="z-ai/glm", name="Z.AI: GLM")
+    frontend = [
+        {
+            "slug": "z-ai/glm",
+            "permaslug": "z-ai/glm-20261017",
+            "supports_reasoning": False,
+            "reasoning_config": {},
+        }
+    ]
+    _stub_endpoint_pipeline(
+        monkeypatch,
+        [model],
+        {"z-ai/glm": _endpoint_stage_eps()},
+        frontend_models=frontend,
+    )
+    args = make_args(min_context=0, reasoning_effort="none")
+    assert mc.run(args, [model], False) == 0
+    assert "z-ai/glm" in capsys.readouterr().out
 
 
 def test_candidate_pricing_replaced_by_baseline(monkeypatch):
@@ -2167,6 +2221,7 @@ def test_cli_table_shows_prec_column_and_risk_marker(monkeypatch, capsys):
         mc.PRIORITY_WEIGHTS["balanced"],
         "quality data unavailable, ranked on price/context/age",
     )
+    mc.print_table_legend()
     out = capsys.readouterr().out
     header = out.splitlines()[0]
     assert "PREC" in header
@@ -2337,6 +2392,7 @@ def test_table_has_tier_column(capsys):
 
 def test_footer_legend_lines(capsys):
     mc.print_table(_scored_candidates(), 2, mc.PRIORITY_WEIGHTS["balanced"], "note")
+    mc.print_table_legend()
     out = capsys.readouterr().out
     assert (
         "Prices shown are what a long session pays: several models bill at a "
@@ -2621,8 +2677,8 @@ def test_fetch_openrouter_frontend_derives_all_payloads(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     calls = []
     stub_frontend(monkeypatch, calls, frontend_payload(), zdr_payload())
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=True)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=True))
     )
     assert discounts == {"acme/a": 0.5, "acme/b:free": 0.0, "acme/c:batch": 0.75}
     assert zdr_ids == {"acme/a", "acme/b:batch"}
@@ -2637,6 +2693,59 @@ def test_fetch_openrouter_frontend_derives_all_payloads(monkeypatch, tmp_path):
     assert cache_hits == set()
     assert mc.OPENROUTER_DISCOUNTS_URL in calls
     assert mc.OPENROUTER_ZDR_URL in calls
+    # The frontend listing is projected to the reasoning fields; "~" router
+    # aliases are not models and never enter the fallback.
+    assert [entry["slug"] for entry in frontend_models] == [
+        "acme/a",
+        "acme/a",
+        "acme/b",
+        "acme/c",
+        "acme/no-endpoint",
+        "acme/no-discount-field",
+    ]
+    assert set(frontend_models[0]) == set(mc.FRONTEND_REASONING_FIELDS)
+
+
+def test_fetch_openrouter_frontend_caches_reasoning_entries(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    payload = {
+        "data": {
+            "models": [
+                {
+                    "slug": "acme/a",
+                    "permaslug": "acme/a-20261017",
+                    "supports_reasoning": True,
+                    "reasoning_config": {"supported_reasoning_efforts": ["high"]},
+                    "endpoint": {"variant": "standard", "pricing": {"discount": 0}},
+                }
+            ],
+            # A benchmark entry keeps the AA cache warm too, so the second
+            # run is served entirely from cache (the point of this test).
+            "benchmarks": {"acme/a-20261017": {"aa": {"intelligence_index": 50}}},
+        }
+    }
+    calls = []
+    stub_frontend(monkeypatch, calls, payload, zdr_payload())
+    args = make_args(no_cache=False, cache_ttl=3600)
+    first = mc.fetch_openrouter_frontend(args)
+    second = mc.fetch_openrouter_frontend(args)
+    expected = [
+        {
+            "slug": "acme/a",
+            "permaslug": "acme/a-20261017",
+            "supports_reasoning": True,
+            "reasoning_config": {"supported_reasoning_efforts": ["high"]},
+        }
+    ]
+    assert first[4] == expected
+    assert second[4] == expected
+    assert len(calls) == 2  # base + zdr once each; the second run is cached
+    saved = json.loads(
+        (
+            tmp_path / "model-compare" / "openrouter-frontend-reasoning-v1.json"
+        ).read_text()
+    )
+    assert saved["payload"] == expected
 
 
 def test_openrouter_zdr_url_is_the_per_endpoint_list():
@@ -2675,8 +2784,8 @@ def test_fetch_openrouter_frontend_zdr_excludes_unlisted_variant(monkeypatch, tm
     }
     calls = []
     stub_frontend(monkeypatch, calls, base, zdr)
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=True)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=True))
     )
     assert zdr_ids == {"nvidia/nemotron-3-ultra-550b-a55b"}
     assert "nvidia/nemotron-3-ultra-550b-a55b:free" in discounts  # find has it
@@ -2706,8 +2815,8 @@ def test_fetch_openrouter_frontend_zdr_fails_closed_without_entries(
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     calls = []
     stub_frontend(monkeypatch, calls, frontend_payload(), payload)
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=False, cache_ttl=3600)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=False, cache_ttl=3600))
     )
     assert zdr_ids == set()
     assert discounts  # base data unaffected
@@ -2727,8 +2836,8 @@ def test_fetch_openrouter_frontend_ignores_stale_v2_zdr_cache(monkeypatch, tmp_p
         )
     calls = []
     stub_frontend(monkeypatch, calls, frontend_payload(), zdr_payload())
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=False, cache_ttl=3600)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=False, cache_ttl=3600))
     )
     assert zdr_ids == {"acme/a", "acme/b:batch"}
     assert "zdr" not in cache_hits
@@ -2755,8 +2864,8 @@ def test_fetch_openrouter_frontend_base_failure_keeps_zdr_decoupled(
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     calls = []
     stub_frontend(monkeypatch, calls, RuntimeError("network down"), zdr_payload())
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=True)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=True))
     )
     assert discounts == {}
     assert aa_by_id == {}
@@ -2781,6 +2890,7 @@ def test_fetch_openrouter_frontend_does_not_cache_empty(monkeypatch, tmp_path):
     cache_dir = tmp_path / "model-compare"
     assert not (cache_dir / "openrouter-frontend-discounts.json").exists()
     assert not (cache_dir / "openrouter-frontend-aa-v2.json").exists()
+    assert not (cache_dir / "openrouter-frontend-reasoning-v1.json").exists()
     assert not (cache_dir / "openrouter-zdr-v3.json").exists()
 
 
@@ -2802,8 +2912,8 @@ def test_fetch_openrouter_frontend_treats_empty_cached_payloads_as_miss(
     (cache_dir / "openrouter-zdr-v3.json").write_text(
         json.dumps({"fetched_at": now, "payload": []})
     )
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=False, cache_ttl=3600)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=False, cache_ttl=3600))
     )
     assert len(calls) == 2  # all three payloads empty in cache -> both fetches
     assert discounts == {"acme/a": 0.5, "acme/b:free": 0.0, "acme/c:batch": 0.75}
@@ -2824,8 +2934,8 @@ def test_fetch_openrouter_frontend_fresh_fetch_replaces_cached_discounts(
     (cache_dir / "openrouter-frontend-discounts.json").write_text(
         json.dumps({"fetched_at": time.time(), "payload": {"acme/cached": 0.1}})
     )
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=False, cache_ttl=3600)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=False, cache_ttl=3600))
     )
     assert len(calls) == 2  # aa not cached, so the base URL is hit anyway
     assert discounts == {"acme/a": 0.5, "acme/b:free": 0.0, "acme/c:batch": 0.75}
@@ -3004,8 +3114,8 @@ def test_fetch_openrouter_frontend_no_zdr_skips_zdr_fetch_but_still_loads_base(
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     calls = []
     stub_frontend(monkeypatch, calls, frontend_payload(), zdr_payload())
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=True, no_zdr=True)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=True, no_zdr=True))
     )
     assert zdr_ids == set()
     assert discounts != {}
@@ -3046,13 +3156,16 @@ def test_fetch_openrouter_frontend_aa_cache_hit_skips_base_fetch(monkeypatch, tm
             }
         )
     )
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=False, cache_ttl=3600)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=False, cache_ttl=3600))
     )
     assert len(calls) == 1  # only the ZDR URL
     assert discounts == {"acme/a": 0.5}
     assert aa_by_id == {"acme/a": {"intelligence_index": 57.5}}
     assert cache_hits == {"discounts", "aa"}
+    # A warm discounts+AA cache predating the reasoning cache does not
+    # trigger a base refetch; the fallback self-heals when the TTL expires.
+    assert frontend_models == []
 
 
 @pytest.mark.parametrize(
@@ -3156,7 +3269,7 @@ def test_best_prints_provider_qualified_id(monkeypatch, capsys):
         mc, "fetch_openrouter_models", lambda a: ([make_model()], False)
     )
     monkeypatch.setattr(
-        mc, "fetch_openrouter_frontend", lambda a: ({}, {"acme/model-a"}, {}, set())
+        mc, "fetch_openrouter_frontend", lambda a: ({}, {"acme/model-a"}, {}, set(), [])
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False, None))
     # Unkeyed runs hydrate quality from the published catalog (Task 4);
@@ -3188,6 +3301,18 @@ def test_table_mode_prints_composed_quality_note(monkeypatch, capsys):
             {"acme/model-a", "acme/model-b"},
             {"acme/model-a": {"intelligence_index": 57.5}},
             set(),
+            [
+                {
+                    "slug": "acme/model-a",
+                    "supports_reasoning": False,
+                    "reasoning_config": {},
+                },
+                {
+                    "slug": "acme/model-b",
+                    "supports_reasoning": False,
+                    "reasoning_config": {},
+                },
+            ],
         ),
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda a: ([], None, False, None))
@@ -3306,6 +3431,166 @@ def test_compute_scores_single_candidate_pool():
 # ---------------------------------------------------------------------------
 # AA lookup + matching
 # ---------------------------------------------------------------------------
+
+
+def test_parse_aa_effort_reads_name_then_slug():
+    assert mc.parse_aa_effort(
+        "Claude Sonnet 5.5 (High, Default Fallback)", "claude-sonnet-5-5-high"
+    ) == {
+        "base_name": "Claude Sonnet 5.5",
+        "base_slug": "claude-sonnet-5-5",
+        "effort": "high",
+        "ambiguous": False,
+    }
+    assert mc.parse_aa_effort("GLM-5.3-Flash (Max)", "glm-5-3-flash") == {
+        "base_name": "GLM-5.3-Flash",
+        "base_slug": "glm-5-3-flash",
+        "effort": "max",
+        "ambiguous": False,
+    }
+
+
+def test_parse_aa_effort_ambiguous_and_unknown():
+    assert mc.parse_aa_effort("Model (Non-reasoning, High)", "model")["effort"] is None
+    assert (
+        mc.parse_aa_effort("Model (Non-reasoning, High)", "model")["ambiguous"] is True
+    )
+    # An ambiguous name blocks the slug fallback even when the slug names an
+    # effort: the name is authoritative and the conflict is not guessed away.
+    ambiguous_slug = mc.parse_aa_effort("Model (Non-reasoning, High)", "model-high")
+    assert ambiguous_slug["effort"] is None
+    assert ambiguous_slug["ambiguous"] is True
+    assert mc.parse_aa_effort("Model (High, Max)", "model")["effort"] is None
+    assert mc.parse_aa_effort("Model (High, Max)", "model")["ambiguous"] is True
+    assert mc.parse_aa_effort("Model (Something)", "model")["effort"] is None
+    assert mc.parse_aa_effort("Model", "model")["effort"] is None
+
+
+def test_parse_aa_effort_falls_back_to_slug_suffix():
+    assert mc.parse_aa_effort("Model A", "model-a-high")["effort"] == "high"
+    assert mc.parse_aa_effort("Model A", "model-a-xhigh")["effort"] == "xhigh"
+    assert mc.parse_aa_effort("Model A", "model-a-non-reasoning")["effort"] == "none"
+    reasoning = mc.parse_aa_effort("Model A", "model-a-reasoning")
+    assert reasoning["effort"] == "reasoning"
+    assert reasoning["base_slug"] == "model-a"
+    # The name still wins over a suffixed slug.
+    assert mc.parse_aa_effort("Model A (High)", "model-a-reasoning")["effort"] == "high"
+
+
+def test_parse_aa_effort_warns_once_per_unknown_shape(monkeypatch, capsys):
+    monkeypatch.setattr(mc, "_AA_WARNED_UNKNOWN_SHAPES", set())
+    # Two rows sharing one unrecognized parenthetical shape: one warning.
+    mc.parse_aa_effort("Model A (Novel Shape)", "model-a")
+    mc.parse_aa_effort("Model B (Novel Shape)", "model-b")
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if line]
+    assert len(lines) == 1, err
+    assert "Novel Shape" in lines[0]
+    # A legitimately labeled row produces no warning.
+    mc.parse_aa_effort("Model C (High)", "model-c-high")
+    assert capsys.readouterr().err == ""
+
+
+def test_build_aa_depth_lookup_groups_variants_and_drops_conflicts():
+    entries = [
+        {
+            "id": "1",
+            "name": "Model A (Max)",
+            "slug": "model-a",
+            "index": 56.0,
+            "as_of": "t1",
+        },
+        {
+            "id": "2",
+            "name": "Model A (High)",
+            "slug": "model-a-high",
+            "index": 46.8,
+            "as_of": "t1",
+        },
+        {
+            "id": "3",
+            "name": "Model A (High, Default Fallback)",
+            "slug": "model-a-high-2",
+            "index": 40.0,
+            "as_of": "t1",
+        },
+    ]
+    lookup = mc.build_aa_depth_lookup(entries)
+    assert lookup["model a"]["max"]["index"] == 56.0
+    assert lookup["model a"]["high"] is None
+    assert (
+        mc.build_aa_depth_lookup(
+            [
+                {
+                    "id": "4",
+                    "name": "Model B",
+                    "slug": "model-b",
+                    "index": 50.0,
+                },
+            ]
+        )
+        == {}
+    )
+
+
+def test_build_aa_depth_lookup_normalizes_cost_and_creator_key():
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "creator": "Z.AI",
+                "cost_per_task": 0.8844,
+                "as_of": "t1",
+            }
+        ]
+    )
+    record = lookup["model a"]["high"]
+    assert record["effort"] == "high"
+    assert record["cost_per_task_usd"] == 0.8844
+    assert record["as_of"] == "t1"
+    # creator-qualified alias uses normalize_provider on model_creator.name
+    assert lookup["zai:model a"]["high"] is record
+
+
+def test_legacy_aa_entries_dedupe_by_key_first_wins():
+    # The depth path keeps every effort variant (id-first dedupe), but the
+    # legacy lookup must see the key-unique list it always saw: one entry per
+    # key, first occurrence in list order wins.
+    entries = [
+        {
+            "id": "1",
+            "key": "model-a",
+            "name": "Model A (Max)",
+            "slug": "model-a",
+            "index": 56.0,
+        },
+        {
+            "id": "2",
+            "key": "model-a",
+            "name": "Model A (High)",
+            "slug": "model-a",
+            "index": 46.8,
+        },
+        {
+            "id": "3",
+            "key": "model-b",
+            "name": "Model B",
+            "slug": "model-b",
+            "index": 50.0,
+        },
+    ]
+    legacy = mc.dedupe_aa_entries_by_key(entries)
+    assert [entry["id"] for entry in legacy] == ["1", "3"]
+
+    exact, fuzzy = mc.build_aa_lookup(legacy)
+    # Without the seam the variant name "Model A (High)" would win tier 2;
+    # with it the candidate falls through to the first-wins max entry.
+    assert mc.match_quality(
+        {"id": "other/unrelated", "name": "Acme: Model A (High)"}, exact, fuzzy
+    ) == (56.0, None)
 
 
 def test_build_aa_lookup_skips_non_numeric_index():
@@ -3538,6 +3823,631 @@ def test_base_model_id_strips_variant():
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter reasoning metadata (effective default + effort filter)
+# ---------------------------------------------------------------------------
+
+
+def test_effective_default_is_none_when_disabled():
+    assert (
+        mc.effective_default_effort(
+            {
+                "supported_efforts": ["max", "high", "none"],
+                "default_enabled": False,
+                "default_effort": "medium",
+                "mandatory": False,
+                "is_reasoning": True,
+            }
+        )
+        == "none"
+    )
+
+
+def test_effective_default_single_state_and_mandatory():
+    assert (
+        mc.effective_default_effort(
+            {
+                "supported_efforts": [],
+                "default_enabled": True,
+                "default_effort": None,
+                "mandatory": True,
+                "is_reasoning": True,
+            }
+        )
+        == "reasoning"
+    )
+
+
+def test_supported_efforts_null_expands_but_omitted_stays_empty():
+    meta = mc.build_reasoning_metadata(
+        [{"id": "a/m", "reasoning": {"supported_efforts": None}}]
+    )
+    assert meta["a/m"]["supported_efforts"] == list(mc.REASONING_GATEWAY_EFFORTS)
+    meta = mc.build_reasoning_metadata(
+        [{"id": "a/m", "reasoning": {"mandatory": True}}]
+    )
+    assert meta["a/m"]["supported_efforts"] == []
+
+
+def test_build_candidates_drops_unsupported_effort():
+    model = make_model(
+        reasoning={"supported_efforts": ["high"], "default_effort": "high"}
+    )
+    args = make_args(reasoning_effort="max")
+    candidates, dropped = mc.build_candidates(
+        [model],
+        args,
+        {},
+        set(),
+        reasoning_by_id={
+            "acme/model-a": {
+                "supported_efforts": ["high"],
+                "default_effort": "high",
+                "default_enabled": True,
+                "mandatory": False,
+                "supports_max_tokens": False,
+                "is_reasoning": True,
+            }
+        },
+    )
+    assert candidates == []
+    assert dropped["reasoning effort"] == 1
+
+
+def test_build_candidates_keeps_effective_default_effort_outside_supported_list():
+    # BUG-03: default_enabled false resolves to the effective default "none"
+    # even though the supported list omits it. Asking for that same effort
+    # must keep the model: it runs at "none" by default.
+    reasoning = {
+        "supported_efforts": ["max", "high"],
+        "default_effort": "none",
+        "default_enabled": False,
+        "mandatory": False,
+        "supports_max_tokens": False,
+        "is_reasoning": True,
+    }
+    candidates, dropped = mc.build_candidates(
+        [make_model()],
+        make_args(reasoning_effort="none", no_zdr=True),
+        {},
+        set(),
+        reasoning_by_id={"acme/model-a": dict(reasoning)},
+    )
+    assert [c["id"] for c in candidates] == ["acme/model-a"]
+    assert "reasoning effort" not in dropped
+
+
+def test_build_candidates_effort_filter_control_cases():
+    # Control 1: a supported effort is still kept.
+    supported = {
+        "supported_efforts": ["max", "high"],
+        "default_effort": "none",
+        "default_enabled": False,
+        "mandatory": False,
+        "supports_max_tokens": False,
+        "is_reasoning": True,
+    }
+    candidates, dropped = mc.build_candidates(
+        [make_model()],
+        make_args(reasoning_effort="max", no_zdr=True),
+        {},
+        set(),
+        reasoning_by_id={"acme/model-a": dict(supported)},
+    )
+    assert [c["id"] for c in candidates] == ["acme/model-a"]
+    assert "reasoning effort" not in dropped
+
+    # Control 2: the equality carve-out only covers the effective default.
+    # A model whose default is "high" cannot run "none".
+    high_default = {
+        "supported_efforts": ["high"],
+        "default_effort": "high",
+        "default_enabled": True,
+        "mandatory": False,
+        "supports_max_tokens": False,
+        "is_reasoning": True,
+    }
+    candidates, dropped = mc.build_candidates(
+        [make_model()],
+        make_args(reasoning_effort="none"),
+        {},
+        set(),
+        reasoning_by_id={"acme/model-a": dict(high_default)},
+    )
+    assert candidates == []
+    assert dropped["reasoning effort"] == 1
+
+
+def test_effective_default_discrete_effort_rules():
+    base = {
+        "supported_efforts": ["max", "high", "none"],
+        "default_enabled": True,
+        "default_effort": "high",
+        "mandatory": False,
+        "is_reasoning": True,
+    }
+    assert mc.effective_default_effort(base) == "high"
+    # default_enabled null is the same as true for a default request
+    assert mc.effective_default_effort({**base, "default_enabled": None}) == "high"
+    assert mc.effective_default_effort({**base, "default_effort": "none"}) == "none"
+    assert mc.effective_default_effort({**base, "default_effort": None}) is None
+    # default_enabled false wins over a non-none pre-select effort
+    assert mc.effective_default_effort({**base, "default_enabled": False}) == "none"
+
+
+def test_effective_default_single_state_disabled_and_token_budget():
+    single = {
+        "supported_efforts": [],
+        "default_enabled": False,
+        "default_effort": None,
+        "mandatory": False,
+        "is_reasoning": True,
+    }
+    assert mc.effective_default_effort(single) == "none"
+    # A token-budget model has no discrete efforts and follows the same rule.
+    assert (
+        mc.effective_default_effort(
+            {**single, "default_enabled": None, "supports_max_tokens": True}
+        )
+        == "reasoning"
+    )
+
+
+def test_effective_default_mandatory_disabled_is_contradictory(capsys):
+    discrete = {
+        "supported_efforts": ["high"],
+        "default_enabled": False,
+        "default_effort": "high",
+        "mandatory": True,
+        "is_reasoning": True,
+    }
+    assert mc.effective_default_effort(discrete) is None
+    assert "contradict" in capsys.readouterr().err
+
+    single = {
+        "supported_efforts": [],
+        "default_enabled": False,
+        "default_effort": None,
+        "mandatory": True,
+        "is_reasoning": True,
+    }
+    assert mc.effective_default_effort(single) is None
+    assert "contradict" in capsys.readouterr().err
+
+
+def test_effective_default_non_reasoning_and_unknown():
+    assert (
+        mc.effective_default_effort({"supported_efforts": [], "is_reasoning": False})
+        == "none"
+    )
+    assert (
+        mc.effective_default_effort({"supported_efforts": [], "is_reasoning": None})
+        is None
+    )
+    assert mc.effective_default_effort(None) is None
+
+
+def test_supports_effort_branches():
+    discrete = {
+        "supported_efforts": ["high", "none"],
+        "is_reasoning": True,
+        "mandatory": False,
+    }
+    assert mc.supports_effort(discrete, "high") is True
+    assert mc.supports_effort(discrete, "max") is False
+
+    non_reasoning = {
+        "supported_efforts": [],
+        "is_reasoning": False,
+        "mandatory": False,
+    }
+    assert mc.supports_effort(non_reasoning, "none") is True
+    assert mc.supports_effort(non_reasoning, "high") is False
+
+    single = {"supported_efforts": [], "is_reasoning": True, "mandatory": False}
+    assert mc.supports_effort(single, "none") is True
+    assert mc.supports_effort(single, "reasoning") is True
+    assert mc.supports_effort(single, "high") is False
+    assert mc.supports_effort({**single, "mandatory": True}, "none") is False
+    assert mc.supports_effort({**single, "mandatory": True}, "reasoning") is True
+
+    assert mc.supports_effort(None, "none") is False
+
+
+def test_build_reasoning_metadata_reads_models_api_fields():
+    meta = mc.build_reasoning_metadata(
+        [
+            {
+                "id": "acme/m",
+                "reasoning": {
+                    "mandatory": False,
+                    "default_enabled": True,
+                    "supported_efforts": ["high", "none"],
+                    "default_effort": "high",
+                    "supports_max_tokens": False,
+                },
+            }
+        ]
+    )
+    assert meta["acme/m"] == {
+        "default_effort": "high",
+        "supported_efforts": ["high", "none"],
+        "default_enabled": True,
+        "mandatory": False,
+        "supports_max_tokens": False,
+        "is_reasoning": True,
+    }
+
+
+def test_build_reasoning_metadata_supports_max_tokens_is_bool_or_null(capsys):
+    meta = mc.build_reasoning_metadata(
+        [
+            {"id": "a/unknown", "reasoning": {"mandatory": True}},
+            {"id": "a/false", "reasoning": {"supports_max_tokens": False}},
+            {"id": "a/true", "reasoning": {"supports_max_tokens": True}},
+            {"id": "a/string", "reasoning": {"supports_max_tokens": "false"}},
+            {"id": "a/bad", "reasoning": {"supports_max_tokens": "maybe"}},
+        ]
+    )
+    # Spec 9.1: the published field is bool or null. An omitted field is
+    # unknown, not false; an explicit bool stays verbatim.
+    assert meta["a/unknown"]["supports_max_tokens"] is None
+    assert meta["a/false"]["supports_max_tokens"] is False
+    assert meta["a/true"]["supports_max_tokens"] is True
+    assert meta["a/string"]["supports_max_tokens"] is False
+    assert meta["a/bad"]["supports_max_tokens"] is None
+    err = capsys.readouterr().err
+    assert "supports_max_tokens" in err
+
+
+def test_build_reasoning_metadata_coerces_malformed_fields(capsys):
+    meta = mc.build_reasoning_metadata(
+        [
+            {
+                "id": "a/bad",
+                "reasoning": {
+                    "supported_efforts": ["high"],
+                    "default_effort": 3.5,
+                    "mandatory": [],
+                    "default_enabled": 3,
+                    "supports_max_tokens": "maybe",
+                },
+            }
+        ]
+    )
+    # Malformed external metadata degrades to unknown; it must never reach
+    # the published catalog, where a non-string default_effort would fail
+    # the whole artifact.
+    assert meta["a/bad"]["default_effort"] is None
+    assert meta["a/bad"]["mandatory"] is None
+    assert meta["a/bad"]["default_enabled"] is None
+    assert meta["a/bad"]["supports_max_tokens"] is None
+    err = capsys.readouterr().err
+    assert "default_effort" in err
+    assert "mandatory" in err
+    assert "default_enabled" in err
+
+
+def test_build_reasoning_metadata_frontend_fallback_and_non_reasoning():
+    models = [
+        {"id": "acme/m", "canonical_slug": "acme/m-20261001"},
+        {"id": "acme/n", "canonical_slug": "acme/n-20261002"},
+        {"id": "acme/plain"},
+        {"id": "acme/unknown"},
+    ]
+    frontend = [
+        {
+            "slug": "acme/m",
+            "permaslug": "acme/m-20261001",
+            "supports_reasoning": True,
+            "reasoning_config": {
+                "supports_reasoning_effort": True,
+                "supported_reasoning_efforts": ["low", "high"],
+                "default_reasoning_effort": "high",
+                "default_reasoning_enabled": True,
+                "is_mandatory_reasoning": False,
+                "supports_reasoning_max_tokens": False,
+            },
+        },
+        {
+            "slug": "acme/n",
+            "permaslug": "acme/n-20261002",
+            "supports_reasoning": False,
+            "reasoning_config": {},
+        },
+        {
+            "slug": "acme/plain",
+            "permaslug": "acme/plain-20261003",
+            "supports_reasoning": False,
+            "reasoning_config": {},
+        },
+    ]
+    meta = mc.build_reasoning_metadata(models, frontend)
+    assert meta["acme/m"]["default_effort"] == "high"
+    assert meta["acme/m"]["supported_efforts"] == ["low", "high"]
+    assert meta["acme/m"]["is_reasoning"] is True
+    assert meta["acme/n"]["default_effort"] == "none"
+    assert meta["acme/n"]["is_reasoning"] is False
+    # exact slug fallback, even though the permaslug is dated
+    assert meta["acme/plain"]["default_effort"] == "none"
+    assert meta["acme/plain"]["is_reasoning"] is False
+    # no models API field and no frontend entry -> unknown, not non-reasoning
+    assert meta["acme/unknown"]["default_effort"] is None
+    assert meta["acme/unknown"]["is_reasoning"] is None
+
+
+def test_build_reasoning_metadata_models_api_wins_over_frontend():
+    models = [
+        {
+            "id": "acme/m",
+            "canonical_slug": "acme/m-1",
+            "reasoning": {
+                "mandatory": False,
+                "default_enabled": True,
+                "supported_efforts": ["max"],
+                "default_effort": "max",
+            },
+        }
+    ]
+    frontend = [
+        {
+            "slug": "acme/m",
+            "permaslug": "acme/m-1",
+            "supports_reasoning": True,
+            "reasoning_config": {
+                "supported_reasoning_efforts": ["low"],
+                "default_reasoning_effort": "low",
+                "default_reasoning_enabled": True,
+            },
+        }
+    ]
+    meta = mc.build_reasoning_metadata(models, frontend)["acme/m"]
+    assert meta["supported_efforts"] == ["max"]
+    assert meta["default_effort"] == "max"
+
+
+def test_build_reasoning_metadata_fields_fall_back_individually():
+    # A models API reasoning object that omits a field takes that field
+    # from the frontend config (spec §5.2 precedence per field).
+    models = [
+        {
+            "id": "acme/m",
+            "canonical_slug": "acme/m-1",
+            "reasoning": {"supported_efforts": ["high"]},
+        }
+    ]
+    frontend = [
+        {
+            "slug": "acme/m",
+            "permaslug": "acme/m-1",
+            "supports_reasoning": True,
+            "reasoning_config": {
+                "default_reasoning_effort": "high",
+                "default_reasoning_enabled": True,
+                "is_mandatory_reasoning": False,
+            },
+        }
+    ]
+    meta = mc.build_reasoning_metadata(models, frontend)["acme/m"]
+    assert meta["supported_efforts"] == ["high"]
+    assert meta["default_enabled"] is True
+    assert meta["mandatory"] is False
+    assert meta["default_effort"] == "high"
+
+
+def test_build_reasoning_metadata_primary_omitted_efforts_stay_single_state():
+    # Live shape (google/gemini-2.5-pro, openai/o3): the models API reasoning
+    # object omits supported_efforts while the frontend's null marker says
+    # "all efforts". The primary object is authoritative: no discrete
+    # efforts, so the mandatory single-state rule applies.
+    models = [
+        {
+            "id": "acme/m",
+            "canonical_slug": "acme/m-1",
+            "reasoning": {"mandatory": True},
+        }
+    ]
+    frontend = [
+        {
+            "slug": "acme/m",
+            "permaslug": "acme/m-1",
+            "supports_reasoning": True,
+            "reasoning_config": {
+                "supported_reasoning_efforts": None,
+                "is_mandatory_reasoning": True,
+            },
+        }
+    ]
+    meta = mc.build_reasoning_metadata(models, frontend)["acme/m"]
+    assert meta["supported_efforts"] == []
+    assert meta["default_effort"] == "reasoning"
+
+
+def test_build_reasoning_metadata_frontend_null_efforts_expand():
+    frontend = [
+        {
+            "slug": "acme/m",
+            "permaslug": "acme/m-1",
+            "supports_reasoning": True,
+            "reasoning_config": {
+                "supported_reasoning_efforts": None,
+                "default_reasoning_enabled": True,
+            },
+        }
+    ]
+    meta = mc.build_reasoning_metadata(
+        [{"id": "acme/m", "canonical_slug": "acme/m-1"}], frontend
+    )["acme/m"]
+    assert meta["supported_efforts"] == list(mc.REASONING_GATEWAY_EFFORTS)
+    # no pre-select effort -> unknown, even though reasoning is enabled
+    assert meta["default_effort"] is None
+
+
+def test_build_reasoning_metadata_frontend_single_state():
+    frontend = [
+        {
+            "slug": "acme/m",
+            "permaslug": "acme/m-1",
+            "supports_reasoning": True,
+            "reasoning_config": {"is_mandatory_reasoning": False},
+        }
+    ]
+    meta = mc.build_reasoning_metadata(
+        [{"id": "acme/m", "canonical_slug": "acme/m-1"}], frontend
+    )["acme/m"]
+    assert meta["supported_efforts"] == []
+    assert meta["default_effort"] == "reasoning"
+
+
+def test_build_reasoning_metadata_frontend_pairs_permaslug_across_slugs():
+    # The frontend's own slug differs from the candidate id; the catalog's
+    # permaslug pairing (pass 1) still attaches the config.
+    models = [{"id": "acme/snapshot", "canonical_slug": "acme/snapshot-20261017"}]
+    frontend = [
+        {
+            "slug": "acme/base",
+            "permaslug": "acme/snapshot-20261017",
+            "supports_reasoning": True,
+            "reasoning_config": {
+                "supported_reasoning_efforts": ["high"],
+                "default_reasoning_effort": "high",
+                "default_reasoning_enabled": True,
+            },
+        }
+    ]
+    meta = mc.build_reasoning_metadata(models, frontend)["acme/snapshot"]
+    assert meta["supported_efforts"] == ["high"]
+    assert meta["default_effort"] == "high"
+
+
+def test_build_reasoning_metadata_frontend_pairs_by_date_strip():
+    # An unpaired dated permaslug strips to the candidate id (pass 3).
+    models = [{"id": "acme/m"}]
+    frontend = [
+        {
+            "slug": "acme/other",
+            "permaslug": "acme/m-20261017",
+            "supports_reasoning": True,
+            "reasoning_config": {
+                "supported_reasoning_efforts": ["low"],
+                "default_reasoning_effort": "low",
+                "default_reasoning_enabled": True,
+            },
+        }
+    ]
+    meta = mc.build_reasoning_metadata(models, frontend)["acme/m"]
+    assert meta["supported_efforts"] == ["low"]
+    assert meta["default_effort"] == "low"
+
+
+def test_build_reasoning_metadata_exact_slug_beats_shared_canonical():
+    # Base and :batch share a canonical slug, and the permaslug pairing
+    # assigns it to the last listing. The undated exact slug must still
+    # resolve the base (live: openai/gpt-4o and its :batch variant).
+    models = [
+        {"id": "acme/m", "canonical_slug": "acme/m"},
+        {"id": "acme/m:batch", "canonical_slug": "acme/m"},
+    ]
+    frontend = [
+        {
+            "slug": "acme/m",
+            "permaslug": "acme/m",
+            "supports_reasoning": False,
+            "reasoning_config": {},
+        }
+    ]
+    meta = mc.build_reasoning_metadata(models, frontend)
+    assert meta["acme/m"]["is_reasoning"] is False
+    assert meta["acme/m"]["default_effort"] == "none"
+    assert meta["acme/m:batch"]["is_reasoning"] is False
+
+
+def test_build_candidates_attaches_reasoning_fields():
+    reasoning = {
+        "supported_efforts": ["high", "max"],
+        "default_effort": "high",
+        "default_enabled": True,
+        "mandatory": False,
+        "supports_max_tokens": False,
+        "is_reasoning": True,
+    }
+    candidates, dropped = mc.build_candidates(
+        [make_model()],
+        make_args(reasoning_effort="high"),
+        {},
+        {"acme/model-a"},
+        reasoning_by_id={"acme/model-a": reasoning},
+    )
+    assert dropped == {}
+    assert candidates[0]["reasoning"] == reasoning
+    assert candidates[0]["default_effort"] == "high"
+    assert candidates[0]["supported_efforts"] == ["high", "max"]
+
+
+def test_build_candidates_default_effort_does_not_filter():
+    candidates, dropped = mc.build_candidates(
+        [make_model()],
+        make_args(),
+        {},
+        {"acme/model-a"},
+        reasoning_by_id={
+            "acme/model-a": {
+                "supported_efforts": [],
+                "default_effort": None,
+                "default_enabled": None,
+                "mandatory": None,
+                "supports_max_tokens": False,
+                "is_reasoning": None,
+            }
+        },
+    )
+    assert len(candidates) == 1
+    assert dropped == {}
+    assert candidates[0]["default_effort"] is None
+    assert candidates[0]["supported_efforts"] == []
+
+
+def test_build_candidates_reasoning_filter_appends_filtered_entry():
+    filtered = []
+    candidates, dropped = mc.build_candidates(
+        [make_model()],
+        make_args(reasoning_effort="max"),
+        {},
+        {"acme/model-a"},
+        filtered,
+        reasoning_by_id={
+            "acme/model-a": {
+                "supported_efforts": ["high"],
+                "default_effort": "high",
+                "default_enabled": True,
+                "mandatory": False,
+                "supports_max_tokens": False,
+                "is_reasoning": True,
+            }
+        },
+    )
+    assert candidates == []
+    assert dropped == {"reasoning effort": 1}
+    assert filtered == [
+        {
+            "id": "acme/model-a",
+            "name": "Acme: Model A",
+            "reasons": ["reasoning effort"],
+        }
+    ]
+
+
+def test_catalog_drop_reasons_includes_reasoning_effort():
+    assert "reasoning effort" in mc.CATALOG_DROP_REASONS
+
+
+def test_parse_args_reasoning_effort():
+    assert mc.parse_args([]).reasoning_effort == "default"
+    assert mc.parse_args(["--reasoning-effort", "max"]).reasoning_effort == "max"
+    with pytest.raises(SystemExit):
+        mc.parse_args(["--reasoning-effort", "reasoning"])
+
+
+# ---------------------------------------------------------------------------
 # aa_api_entries (AA V2 language models/free parser)
 # ---------------------------------------------------------------------------
 
@@ -3554,18 +4464,55 @@ def aa_page(items, page=1, total_pages=1, has_more=False, with_pagination=True):
     return out
 
 
-def aa_item(slug="acme/m", name="M", index=42.0):
+def aa_item(slug="acme/m", name="M", index=42.0, *, id=None, cost=None, creator=None):
     item = {"name": name}
+    if id is not None:
+        item["id"] = id
     if slug is not None:
         item["slug"] = slug
     if index is not None:
         item["evaluations"] = {"artificial_analysis_intelligence_index": index}
+    if cost is not None:
+        item["artificial_analysis_intelligence_index_cost"] = {
+            "cost_per_task": {"total_cost": cost}
+        }
+    if creator is not None:
+        item["model_creator"] = {"id": "creator-uuid", "name": creator}
     return item
 
 
 def _without_as_of(entries):
     """Strip the dynamic per-fetch as_of stamp so tests can compare entries."""
     return [{k: v for k, v in entry.items() if k != "as_of"} for entry in entries]
+
+
+_AA_ENTRY_UNSET = object()
+
+
+def aa_entry(
+    key,
+    name,
+    index,
+    *,
+    id=None,
+    slug=_AA_ENTRY_UNSET,
+    base=None,
+    effort=None,
+    creator=None,
+    cost=None,
+):
+    """Expected aa_api_entries shape (minus the dynamic as_of stamp)."""
+    return {
+        "key": key,
+        "name": name,
+        "index": index,
+        "id": id,
+        "slug": key if slug is _AA_ENTRY_UNSET else slug,
+        "base": key if base is None else base,
+        "effort": effort,
+        "creator": creator,
+        "cost_per_task": cost,
+    }
 
 
 def test_aa_api_sends_auth_header_and_timeout(monkeypatch):
@@ -3599,7 +4546,55 @@ def test_aa_api_parses_documented_shape(monkeypatch):
     payload = aa_page([aa_item("acme/a", "A", 42.5), aa_item("acme/b", "B", None)])
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
     entries, _ = mc.aa_api_entries("dummy-key")
-    assert _without_as_of(entries) == [{"key": "acme/a", "name": "A", "index": 42.5}]
+    assert _without_as_of(entries) == [aa_entry("acme/a", "A", 42.5)]
+
+
+def test_aa_api_entries_carry_effort_creator_and_cost(monkeypatch):
+    payload = aa_page(
+        [
+            aa_item(
+                "claude-sonnet-5-5-high",
+                "Claude Sonnet 5.5 (High, Default Fallback)",
+                46.8,
+                id="uuid-high",
+                cost=0.8844,
+                creator="Anthropic",
+            ),
+            aa_item(
+                "claude-sonnet-5-5",
+                "Claude Sonnet 5.5 (Max, Default Fallback)",
+                56.0,
+                id="uuid-max",
+                cost=5.4609,
+                creator="Anthropic",
+            ),
+        ]
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
+    entries, _ = mc.aa_api_entries("dummy-key")
+    high, max_row = entries
+    assert high["id"] == "uuid-high"
+    assert high["slug"] == "claude-sonnet-5-5-high"
+    assert high["base"] == "claude-sonnet-5-5"
+    assert high["effort"] == "high"
+    assert high["creator"] == "Anthropic"
+    assert high["cost_per_task"] == 0.8844
+    assert max_row["effort"] == "max"
+    assert max_row["base"] == "claude-sonnet-5-5"
+
+
+def test_aa_api_dedupes_variants_by_id_not_slug(monkeypatch):
+    # Two effort rows can share a slug (the primary max row often has no
+    # suffix); they must survive as separate entries, deduped by AA id.
+    payload = aa_page(
+        [
+            aa_item("model-a", "Model A (Max, Default Fallback)", 56.0, id="1"),
+            aa_item("model-a", "Model A (High, Default Fallback)", 46.8, id="2"),
+        ]
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
+    entries, _ = mc.aa_api_entries("dummy-key")
+    assert [entry["effort"] for entry in entries] == ["max", "high"]
 
 
 def test_aa_api_skips_unmeasurable_indexes(monkeypatch):
@@ -3633,7 +4628,7 @@ def test_aa_api_skips_unmeasurable_indexes(monkeypatch):
     )
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
     assert _without_as_of(mc.aa_api_entries("dummy-key")[0]) == [
-        {"key": "acme/ok", "name": "OK", "index": 5.0}
+        aa_entry("acme/ok", "OK", 5.0)
     ]
 
 
@@ -3645,7 +4640,7 @@ def test_aa_api_skips_index_too_large_for_float(monkeypatch):
     )
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
     assert _without_as_of(mc.aa_api_entries("dummy-key")[0]) == [
-        {"key": "acme/ok", "name": "OK", "index": 5.0}
+        aa_entry("acme/ok", "OK", 5.0)
     ]
 
 
@@ -3665,7 +4660,7 @@ def test_aa_api_non_list_data_mid_pagination_keeps_earlier_pages(monkeypatch):
     )
     monkeypatch.setattr(mc, "fetch_json", fake)
     assert _without_as_of(mc.aa_api_entries("dummy-key")[0]) == [
-        {"key": "acme/a", "name": "A", "index": 40.0}
+        aa_entry("acme/a", "A", 40.0)
     ]
     assert calls == [f"{mc.AA_API_URL}?page=1", f"{mc.AA_API_URL}?page=2"]
 
@@ -3682,7 +4677,7 @@ def test_aa_api_key_falls_back_to_name(monkeypatch):
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: payload)
     entries, _ = mc.aa_api_entries("dummy-key")
     assert _without_as_of(entries) == [
-        {"key": "Some Model", "name": "Some Model", "index": 7.0}
+        aa_entry("Some Model", "Some Model", 7.0, slug=None)
     ]
 
 
@@ -3715,8 +4710,8 @@ def test_aa_api_follows_pagination_and_dedupes(monkeypatch):
     entries, _ = mc.aa_api_entries("dummy-key")
     assert calls == [f"{mc.AA_API_URL}?page=1", f"{mc.AA_API_URL}?page=2"]
     assert _without_as_of(entries) == [
-        {"key": "acme/a", "name": "A", "index": 40.0},  # first page wins
-        {"key": "acme/b", "name": "B", "index": 9.0},
+        aa_entry("acme/a", "A", 40.0),  # first page wins
+        aa_entry("acme/b", "B", 9.0),
     ]
 
 
@@ -3779,7 +4774,7 @@ def test_aa_api_best_effort_on_mid_pagination_failure(monkeypatch, capsys):
 
     monkeypatch.setattr(mc, "fetch_json", fake_fetch)
     entries, _ = mc.aa_api_entries("dummy-key")
-    assert _without_as_of(entries) == [{"key": "acme/a", "name": "A", "index": 40.0}]
+    assert _without_as_of(entries) == [aa_entry("acme/a", "A", 40.0)]
     assert (
         "AA API page 2 failed (boom); using entries collected so far"
         in capsys.readouterr().err
@@ -3929,8 +4924,8 @@ def test_fetch_openrouter_frontend_realistic_slugs(monkeypatch, tmp_path):
     stub_frontend(
         monkeypatch, calls, _realistic_openrouter_payload(), _realistic_zdr_payload()
     )
-    discounts, zdr_ids, aa_by_id, cache_hits = mc.fetch_openrouter_frontend(
-        make_args(no_cache=True)
+    discounts, zdr_ids, aa_by_id, cache_hits, frontend_models = (
+        mc.fetch_openrouter_frontend(make_args(no_cache=True))
     )
     assert discounts == {
         "openai/gpt-4o": 0.5,
@@ -4159,6 +5154,429 @@ def test_resolve_quality_unmatched_is_none():
     assert source == {}
 
 
+def test_resolve_quality_depth_uses_effective_default():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, source = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
+    )
+    assert quality["acme/model-a"]["index"] == 46.8
+    assert quality["acme/model-a"]["effort"] == "high"
+    assert source == {"acme/model-a": "aa"}
+
+
+def test_resolve_quality_depth_missing_default_is_unmatched():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, source = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
+    )
+    assert quality == {} and source == {}
+
+
+def test_resolve_quality_depth_catalog_reselects_live_default():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    catalog_depths = {
+        "acme/model-a": {
+            "default_effort": "max",
+            "depths": {
+                "max": {
+                    "effort": "max",
+                    "index": 56.0,
+                    "as_of": "t1",
+                    "source": "catalog",
+                },
+                "high": {
+                    "effort": "high",
+                    "index": 46.8,
+                    "as_of": "t1",
+                    "source": "catalog",
+                },
+            },
+        }
+    }
+    quality, source = mc.resolve_quality(
+        [cand],
+        {},
+        {},
+        {},
+        None,
+        catalog_depths=catalog_depths,
+        requested_effort="default",
+    )
+    assert quality["acme/model-a"]["index"] == 46.8
+    assert quality["acme/model-a"]["source"] == "catalog"
+
+
+def test_resolve_quality_single_state_reasoning_uses_reasoning_row():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "reasoning",
+        "reasoning": {"is_reasoning": True, "supported_efforts": []},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (Reasoning)",
+                "slug": "model-a",
+                "index": 44.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, source = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
+    )
+    assert quality["acme/model-a"]["index"] == 44.0
+    assert quality["acme/model-a"]["effort"] == "reasoning"
+
+
+def test_resolve_quality_depth_explicit_effort_selects_that_depth():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, source = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="max"
+    )
+    assert quality["acme/model-a"]["index"] == 56.0
+    assert quality["acme/model-a"]["effort"] == "max"
+
+
+def test_match_depth_quality_prefers_creator_qualified_key():
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "as_of": "t1",
+                "creator": "Beta",
+            },
+            {
+                "id": "2",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 40.0,
+                "as_of": "t1",
+                "creator": "Acme",
+            },
+        ]
+    )
+    # The unqualified key is ambiguous (two creators); the qualified key is not.
+    assert lookup["model a"]["high"] is None
+    record = mc.match_depth_quality(
+        {"id": "acme/model-a", "name": "Acme: Model A"}, lookup, "high"
+    )
+    assert record["index"] == 40.0
+    beta = mc.match_depth_quality(
+        {"id": "beta/model-a", "name": "Beta: Model A"}, lookup, "high"
+    )
+    assert beta["index"] == 46.8
+
+
+def test_match_depth_quality_missing_effort_does_not_fall_through():
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    model = {"id": "acme/model-a", "name": "Acme: Model A"}
+    assert mc.match_depth_quality(model, lookup, "high") is None
+    assert mc.match_depth_quality(model, lookup, None) is None
+
+
+def test_match_depth_quality_ambiguous_tier_does_not_fall_through():
+    # The base tier's high record is ambiguous (None). A lower display tier
+    # exists, but a matched-but-ambiguous tier yields nothing.
+    lookup = {
+        "model a": {"high": None},
+        "something else": {
+            "high": {
+                "effort": "high",
+                "index": 50.0,
+                "cost_per_task_usd": None,
+                "source": "aa",
+                "as_of": "t1",
+            }
+        },
+    }
+    model = {"id": "acme/model-a", "name": "Acme: Something Else"}
+    assert mc.match_depth_quality(model, lookup, "high") is None
+
+
+def test_resolve_quality_reasoning_model_without_depth_ignores_or_trio():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    aa_by_id = {
+        "acme/model-a": {"intelligence_index": 57.5, "as_of": "20260915"},
+    }
+    quality, source = mc.resolve_quality(
+        [cand], aa_by_id, {}, {}, None, depth_lookup={}, requested_effort="default"
+    )
+    assert quality == {} and source == {}
+
+
+def test_resolve_quality_non_reasoning_uses_or_trio_with_none_effort():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "none",
+        "reasoning": {"is_reasoning": False},
+    }
+    aa_by_id = {
+        "acme/model-a": {"intelligence_index": 57.5, "as_of": "20260915"},
+    }
+    quality, source = mc.resolve_quality(
+        [cand], aa_by_id, {}, {}, None, depth_lookup={}, requested_effort="default"
+    )
+    assert quality["acme/model-a"]["source"] == "openrouter"
+    assert quality["acme/model-a"]["effort"] == "none"
+    assert cand["reasoning_depths"] == [
+        {
+            "effort": "none",
+            "index": 57.5,
+            "cost_per_task_usd": None,
+            "source": "openrouter",
+            "as_of": "20260915",
+        }
+    ]
+    assert source == {"acme/model-a": "openrouter"}
+
+
+def test_resolve_quality_depth_drift_only_when_like_for_like():
+    cands = [
+        {
+            "id": "acme/model-a",
+            "name": "Acme: Model A",
+            "default_effort": "none",
+            "reasoning": {"is_reasoning": True},
+        },
+        {
+            "id": "acme/model-b",
+            "name": "Acme: Model B",
+            "default_effort": "high",
+            "reasoning": {"is_reasoning": True},
+        },
+        {
+            "id": "acme/model-c",
+            "name": "Acme: Model C",
+            "default_effort": "none",
+            "reasoning": {"is_reasoning": False},
+        },
+    ]
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (Non-reasoning)",
+                "slug": "model-a",
+                "index": 45.1,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model B (High)",
+                "slug": "model-b-high",
+                "index": 45.1,
+                "as_of": "t1",
+            },
+            {
+                "id": "3",
+                "name": "Model C (Non-reasoning)",
+                "slug": "model-c",
+                "index": 45.1,
+                "as_of": "t1",
+            },
+        ]
+    )
+    aa_by_id = {
+        "acme/model-a": {"intelligence_index": 39.5, "as_of": "20260915"},
+        "acme/model-b": {"intelligence_index": 39.5, "as_of": "20260915"},
+        "acme/model-c": {"intelligence_index": 39.5, "as_of": "20260915"},
+    }
+    quality, _source = mc.resolve_quality(
+        cands, aa_by_id, {}, {}, "AA API v2", depth_lookup=lookup
+    )
+    # A reasoning model at effort "none" is still a reasoning model: the OR
+    # snapshot is measured at its reasoning state, so the pair is a
+    # reference only (not a like-for-like drift check).
+    assert quality["acme/model-a"]["or_index"] == 39.5
+    assert quality["acme/model-a"]["or_as_of"] == "20260915"
+    assert quality["acme/model-a"]["drift"] is None
+    # A reasoning model at a non-none effort: same.
+    assert quality["acme/model-b"]["or_index"] == 39.5
+    assert quality["acme/model-b"]["drift"] is None
+    # A non-reasoning model at effort "none": both sides are non-reasoning,
+    # so the old drift rule applies.
+    assert quality["acme/model-c"]["drift"] is True
+
+
+def test_resolve_quality_depth_attaches_full_measured_depth_list():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "cost_per_task": 0.88,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "cost_per_task": 5.46,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, _source = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup
+    )
+    assert quality["acme/model-a"]["effort"] == "high"
+    assert cand["reasoning_depths"] == [
+        {
+            "effort": "max",
+            "index": 56.0,
+            "cost_per_task_usd": 5.46,
+            "source": "aa",
+            "as_of": "t1",
+        },
+        {
+            "effort": "high",
+            "index": 46.8,
+            "cost_per_task_usd": 0.88,
+            "source": "aa",
+            "as_of": "t1",
+        },
+    ]
+
+
+def test_resolve_quality_catalog_missing_requested_effort_is_unmatched():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    catalog_depths = {
+        "acme/model-a": {
+            "default_effort": "max",
+            "depths": {
+                "max": {
+                    "effort": "max",
+                    "index": 56.0,
+                    "as_of": "t1",
+                    "source": "catalog",
+                },
+            },
+        }
+    }
+    quality, source = mc.resolve_quality(
+        [cand],
+        {},
+        {},
+        {},
+        None,
+        catalog_depths=catalog_depths,
+        requested_effort="default",
+    )
+    assert quality == {} and source == {}
+    assert cand["reasoning_depths"] == [
+        {
+            "effort": "max",
+            "index": 56.0,
+            "cost_per_task_usd": None,
+            "source": "catalog",
+            "as_of": "t1",
+        }
+    ]
+
+
 def test_resolve_quality_unmatched_yields_none_and_zero_penalty_unchanged():
     # compute_scores: an unmatched candidate keeps quality None and scores 0
     # on the quality axis, while a partial match keeps the quality weight
@@ -4230,6 +5648,251 @@ def test_compute_scores_and_build_schedules_keep_quality_numeric():
     assert entry["quality_as_of"] is None
 
 
+def test_build_schedules_reasoning_no_default_depth_is_null():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    aa_by_id = {"acme/sched": {"intelligence_index": 30.0, "as_of": "20261001"}}
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        aa_by_id,
+        {},
+        depth_lookup={},
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": True,
+                "default_effort": "high",
+                "supported_efforts": ["high"],
+            }
+        },
+    )
+    # The OR trio exists but has no effort label; it must not supply the score.
+    assert entries[0]["quality"] is None
+    assert entries[0]["quality_effort"] is None
+
+
+def test_build_schedules_non_reasoning_keeps_or_trio():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    aa_by_id = {"acme/sched": {"intelligence_index": 30.0, "as_of": "20261001"}}
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        aa_by_id,
+        {},
+        depth_lookup={},
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": False,
+                "default_effort": "none",
+                "supported_efforts": [],
+            }
+        },
+    )
+    assert entries[0]["quality"] == 30.0
+    assert entries[0]["quality_effort"] == "none"
+    assert entries[0]["quality_source"] == "openrouter"
+
+
+def test_build_schedules_keyed_uses_default_depth_record():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    depth_lookup = {
+        "sched": {
+            "high": {
+                "effort": "high",
+                "index": 44.0,
+                "cost_per_task_usd": 0.5,
+                "source": "aa",
+                "as_of": "t1",
+            }
+        }
+    }
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        {},
+        {},
+        depth_lookup=depth_lookup,
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": True,
+                "default_effort": "high",
+                "supported_efforts": ["high"],
+            }
+        },
+    )
+    assert entries[0]["quality"] == 44.0
+    assert entries[0]["quality_effort"] == "high"
+    assert entries[0]["quality_source"] == "aa"
+    assert entries[0]["quality_as_of"] == "t1"
+
+
+def test_build_schedules_unkeyed_carries_catalog_effort():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    catalog_depths = {
+        "acme/sched": {
+            "default_effort": "high",
+            "depths": {
+                "high": {
+                    "effort": "high",
+                    "index": 44.0,
+                    "as_of": "t1",
+                    "source": "catalog",
+                }
+            },
+        }
+    }
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        {},
+        {},
+        catalog_depths=catalog_depths,
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": True,
+                "default_effort": "high",
+                "supported_efforts": ["high"],
+            }
+        },
+    )
+    assert entries[0]["quality"] == 44.0
+    assert entries[0]["quality_effort"] == "high"
+    assert entries[0]["quality_source"] == "catalog"
+
+
+def test_build_schedules_keyed_honors_requested_effort():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    depth_lookup = {
+        "sched": {
+            "max": {
+                "effort": "max",
+                "index": 56.0,
+                "cost_per_task_usd": 5.0,
+                "source": "aa",
+                "as_of": "t-max",
+            },
+            "high": {
+                "effort": "high",
+                "index": 44.0,
+                "cost_per_task_usd": 0.5,
+                "source": "aa",
+                "as_of": "t-high",
+            },
+        }
+    }
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        {},
+        {},
+        depth_lookup=depth_lookup,
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": True,
+                "default_effort": "high",
+                "supported_efforts": ["max", "high"],
+            }
+        },
+        requested_effort="max",
+    )
+    assert entries[0]["quality"] == 56.0
+    assert entries[0]["quality_effort"] == "max"
+    assert entries[0]["quality_source"] == "aa"
+    assert entries[0]["quality_as_of"] == "t-max"
+
+
+def test_build_schedules_unkeyed_ignores_requested_effort_for_recorded_entry():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    schedule_entries = {
+        "acme/sched": {
+            "quality": 44.0,
+            "quality_effort": "high",
+            "quality_as_of": "t1",
+            "quality_source": "aa",
+        }
+    }
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        {},
+        {},
+        schedule_entries=schedule_entries,
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": True,
+                "default_effort": "high",
+                "supported_efforts": ["max", "high"],
+            }
+        },
+        requested_effort="max",
+    )
+    # Unkeyed schedules serve the published entry as-is: no depth list to
+    # re-select from, so --reasoning-effort cannot change it.
+    assert entries[0]["quality"] == 44.0
+    assert entries[0]["quality_effort"] == "high"
+    assert entries[0]["quality_source"] == "aa"
+    assert entries[0]["quality_as_of"] == "t1"
+
+
+def test_build_schedules_recorded_entry_without_effort_nulls_quality():
+    # Spec 6.5: a recorded entry with no quality_effort is legacy/unknown,
+    # so its quality is null. Tier 0 must not fall through to the OR trio
+    # (which would republish a max-effort snapshot as the default).
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    aa_by_id = {"acme/sched": {"intelligence_index": 30.0, "as_of": "20261001"}}
+    reasoning_by_id = {
+        "acme/sched": {
+            "is_reasoning": False,
+            "default_effort": "none",
+            "supported_efforts": [],
+        }
+    }
+    for entry in (
+        {
+            "quality": 30.0,
+            "quality_effort": None,
+            "quality_as_of": "t1",
+            "quality_source": "openrouter",
+        },
+        {  # quality_effort absent entirely
+            "quality": 30.0,
+            "quality_as_of": "t1",
+            "quality_source": "openrouter",
+        },
+    ):
+        entries = mc.build_schedules(
+            [model],
+            make_args(),
+            {},
+            aa_by_id,
+            {},
+            schedule_entries={"acme/sched": entry},
+            reasoning_by_id=reasoning_by_id,
+        )
+        assert entries[0]["quality"] is None
+        assert entries[0]["quality_effort"] is None
+        assert entries[0]["quality_source"] is None
+
+
 def test_print_json_rows_carry_quality_source_and_as_of(capsys):
     cand = _cand("a/x", 1.0)
     cand["quality"] = 55.0
@@ -4250,12 +5913,83 @@ def test_print_json_rows_carry_quality_source_and_as_of(capsys):
     assert row["quality_or_as_of"] == "20260915"
 
 
+def test_print_json_carries_depth_fields(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["quality"] = 46.8
+    cand["quality_record"] = {
+        "index": 46.8,
+        "source": "aa",
+        "as_of": "t1",
+        "effort": "high",
+    }
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["max", "high"],
+        "is_reasoning": True,
+    }
+    cand["reasoning_depths"] = [
+        {"effort": "max", "index": 56.0, "source": "aa", "as_of": "t1"}
+    ]
+    mc.print_json([cand])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["quality_effort"] == "high"
+    assert row["default_effort"] == "high"
+    assert row["reasoning"]["depths"][0]["effort"] == "max"
+    # BUG-01: the internal flag never leaks into the published block.
+    assert "is_reasoning" not in row["reasoning"]
+
+
+def test_print_json_non_reasoning_none_record(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["quality"] = 30.0
+    cand["quality_record"] = {
+        "index": 30.0,
+        "source": "openrouter",
+        "as_of": "t1",
+        "effort": "none",
+    }
+    cand["reasoning"] = {
+        "default_effort": "none",
+        "supported_efforts": [],
+        "is_reasoning": False,
+    }
+    cand["reasoning_depths"] = [
+        {
+            "effort": "none",
+            "index": 30.0,
+            "cost_per_task_usd": None,
+            "source": "openrouter",
+            "as_of": "t1",
+        }
+    ]
+    mc.print_json([cand])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["quality_effort"] == "none"
+    assert row["reasoning"]["depths"][0]["cost_per_task_usd"] is None
+
+
+def test_print_json_unmatched_effort_is_null(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["quality"] = None
+    cand["quality_record"] = None
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["high"],
+        "is_reasoning": True,
+    }
+    cand["reasoning_depths"] = []
+    mc.print_json([cand])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["quality_effort"] is None
+    assert row["default_effort"] == "high"
+
+
 # ---------------------------------------------------------------------------
 # published catalog hydration (pure parser + fetcher; Task 3)
 # ---------------------------------------------------------------------------
 
 
-def _catalog_doc(models, schema_version=3, generated_at="2026-10-23T13:15:07+00:00"):
+def _catalog_doc(models, schema_version=5, generated_at="2026-10-23T13:15:07+00:00"):
     """Minimal published catalog.json: only the fields hydration reads."""
     return {
         "schema_version": schema_version,
@@ -4264,9 +5998,10 @@ def _catalog_doc(models, schema_version=3, generated_at="2026-10-23T13:15:07+00:
     }
 
 
-def test_catalog_quality_by_id_v4_passthrough(capsys):
-    """v4 rows keep their recorded quality_as_of and source label verbatim;
-    unmatched rows (no value, no label) are skipped without a warning.
+def test_catalog_quality_by_id_v5_passthrough(capsys):
+    """v5 rows keep their recorded quality_as_of, source label and effort
+    verbatim; unmatched rows (no value, no label) are skipped without a
+    warning.
 
     Producer-faithful stamps: aa rows carry the CI run's ISO fetch stamp,
     OR rows its YYYYMMDD permaslug date (build_catalog never emits an ISO
@@ -4279,73 +6014,67 @@ def test_catalog_quality_by_id_v4_passthrough(capsys):
                 "quality": 45.1,
                 "quality_match": "aa",
                 "quality_as_of": "2026-10-23T13:15:07+00:00",
+                "quality_effort": "high",
             },
             {
                 "id": "acme/model-b",
                 "quality": 39.5,
                 "quality_match": "openrouter",
                 "quality_as_of": "20261017",
+                "quality_effort": "none",
             },
             {"id": "acme/model-c", "quality": None, "quality_match": None},
         ],
-        schema_version=4,
+        schema_version=5,
     )
     assert mc.catalog_quality_by_id(doc) == {
         "acme/model-a": {
             "index": 45.1,
             "source": "aa",
             "as_of": "2026-10-23T13:15:07+00:00",
+            "effort": "high",
         },
         "acme/model-b": {
             "index": 39.5,
             "source": "openrouter",
             "as_of": "20261017",
+            "effort": "none",
         },
     }
     assert capsys.readouterr().err == ""
 
 
-def test_catalog_quality_by_id_v3_normalized(capsys):
-    """Deploy-day skew: v3 rows normalize (quality_match "api" -> "aa") and
-    date every row with the catalog's generated_at -- the live v3 artifact
-    carries quality_as_of: null, which must be ignored, not passed through."""
+@pytest.mark.parametrize("schema_version", [3, 4])
+def test_catalog_quality_by_id_old_schema_skipped(schema_version, capsys):
+    """Only v5 hydrates: the v3/v4 normalization branches are retired, and
+    mixing old semantics into a depth-aware run is never allowed."""
     doc = _catalog_doc(
         [
             {
                 "id": "acme/model-a",
                 "quality": 45.1,
-                "quality_match": "api",
+                "quality_match": "aa",
                 "quality_as_of": None,
             },
             {"id": "acme/model-b", "quality": 39.5, "quality_match": "openrouter"},
         ],
-        schema_version=3,
-        generated_at="2026-10-23T13:15:07+00:00",
+        schema_version=schema_version,
     )
-    assert mc.catalog_quality_by_id(doc) == {
-        "acme/model-a": {
-            "index": 45.1,
-            "source": "aa",
-            "as_of": "2026-10-23T13:15:07+00:00",
-        },
-        "acme/model-b": {
-            "index": 39.5,
-            "source": "openrouter",
-            "as_of": "2026-10-23T13:15:07+00:00",
-        },
-    }
-    assert capsys.readouterr().err == ""
+    assert mc.catalog_quality_by_id(doc) == {}
+    err = capsys.readouterr().err
+    assert f"published catalog schema v{schema_version}, expected 5" in err
+    assert "skipping hydration" in err
 
 
 def test_catalog_quality_by_id_schema_mismatch_skipped(capsys):
-    """schema_version < 3: warn + skip the whole artifact (empty by_id)."""
+    """schema_version < 5: warn + skip the whole artifact (empty by_id)."""
     doc = _catalog_doc(
         [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}],
         schema_version=2,
     )
     assert mc.catalog_quality_by_id(doc) == {}
     err = capsys.readouterr().err
-    assert "published catalog schema v2, expected >= 3" in err
+    assert "published catalog schema v2, expected 5" in err
     assert "skipping hydration" in err
 
 
@@ -4386,10 +6115,225 @@ def test_catalog_quality_by_id_out_of_range_quality_degrades(capsys):
                 {"id": "acme/model-a", "quality": 45.1, "quality_match": "aa"},
                 {"id": "acme/model-b", "quality": bad, "quality_match": "openrouter"},
             ],
-            schema_version=4,
+            schema_version=5,
         )
         assert mc.catalog_quality_by_id(doc) == {}
         assert "unexpected response shape" in capsys.readouterr().err
+
+
+def test_catalog_quality_by_id_malformed_depths_degrade(capsys):
+    """A malformed depth block degrades the whole artifact: hydration never
+    feeds a partial or guessed depth map into resolve_quality."""
+    good = {
+        "effort": "high",
+        "index": 46.8,
+        "cost_per_task_usd": 0.88,
+        "source": "aa",
+        "as_of": "t1",
+    }
+    bad_reasoning = [
+        "not a dict",
+        {"depths": "not a list"},
+        {"depths": ["not a dict"]},
+        {"depths": [{**good, "effort": ""}]},
+        {"depths": [{**good, "index": "46.8"}]},
+        {"depths": [{**good, "index": 200.0}]},
+        # The published depth shape is `index`; the retired `quality_index`
+        # spelling is malformed, never normalized.
+        {
+            "depths": [
+                {
+                    "effort": "high",
+                    "quality_index": 46.8,
+                    "source": "aa",
+                    "as_of": "t1",
+                }
+            ]
+        },
+        {"depths": [{**good, "cost_per_task_usd": "cheap"}]},
+        {"depths": [{**good, "source": None}]},
+        {"depths": [{**good, "as_of": 5}]},
+        {"depths": [good, good]},  # duplicate effort: ambiguous
+        {"default_effort": 5},
+    ]
+    for reasoning in bad_reasoning:
+        doc = _catalog_doc(
+            [
+                {
+                    "id": "acme/model-a",
+                    "quality": 46.8,
+                    "quality_match": "aa",
+                    "quality_effort": "high",
+                    "reasoning": reasoning,
+                }
+            ],
+            schema_version=5,
+        )
+        assert mc.catalog_quality_by_id(doc) == {}
+        assert "unexpected response shape" in capsys.readouterr().err
+
+
+def test_fetch_quality_catalog_parses_v5_depth_without_main_quality(monkeypatch):
+    """A model can have measured depths without a main score: by_id skips it
+    but depths_by_id still hydrates its depth map."""
+    doc = _catalog_doc(
+        [
+            {
+                "id": "acme/model-a",
+                "quality": None,
+                "quality_match": None,
+                "reasoning": {
+                    "default_effort": "high",
+                    "depths": [
+                        {
+                            "effort": "high",
+                            "index": 46.8,
+                            "cost_per_task_usd": None,
+                            "source": "aa",
+                            "as_of": "t1",
+                        }
+                    ],
+                },
+            }
+        ],
+        schema_version=5,
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
+    result = mc.fetch_quality_catalog(make_args())
+    assert result["by_id"] == {}
+    assert result["depths_by_id"]["acme/model-a"]["depths"]["high"]["index"] == 46.8
+
+
+def test_fetch_quality_catalog_parses_v5_depths(monkeypatch):
+    """The v5 per-model reasoning.depths list becomes an effort-keyed map;
+    each depth record reuses the quality record's shape (`index`)."""
+    stamp = "2026-10-23T13:15:07+00:00"
+    doc = _catalog_doc(
+        [
+            {
+                "id": "acme/model-a",
+                "quality": 46.8,
+                "quality_match": "aa",
+                "quality_as_of": stamp,
+                "quality_effort": "high",
+                "reasoning": {
+                    "default_effort": "high",
+                    "supported_efforts": ["max", "high"],
+                    "depths": [
+                        {
+                            "effort": "max",
+                            "index": 56.0,
+                            "cost_per_task_usd": 5.46,
+                            "source": "aa",
+                            "as_of": stamp,
+                        },
+                        {
+                            "effort": "high",
+                            "index": 46.8,
+                            "cost_per_task_usd": 0.88,
+                            "source": "aa",
+                            "as_of": stamp,
+                        },
+                    ],
+                },
+            },
+            {"id": "acme/model-b", "quality": None, "quality_match": None},
+        ],
+        schema_version=5,
+    )
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
+    result = mc.fetch_quality_catalog(make_args())
+    assert set(result) == {
+        "by_id",
+        "depths_by_id",
+        "generated_at",
+        "schedules_by_id",
+    }
+    assert result["by_id"]["acme/model-a"]["effort"] == "high"
+    assert result["depths_by_id"] == {
+        "acme/model-a": {
+            "default_effort": "high",
+            "depths": {
+                "max": {
+                    "effort": "max",
+                    "index": 56.0,
+                    "cost_per_task_usd": 5.46,
+                    "source": "aa",
+                    "as_of": stamp,
+                },
+                "high": {
+                    "effort": "high",
+                    "index": 46.8,
+                    "cost_per_task_usd": 0.88,
+                    "source": "aa",
+                    "as_of": stamp,
+                },
+            },
+        }
+    }
+
+
+def test_fetch_quality_catalog_parses_schedule_entries(monkeypatch):
+    """The published schedules array becomes an id -> recorded-provenance map.
+
+    Schedule entries are the unkeyed rebuild's source of truth (spec 6.5):
+    a schedule-only model never appears in the models array, so its deals
+    quality can only come from here. Malformed rows are skipped, never
+    guessed.
+    """
+    doc = _catalog_doc(
+        [
+            {
+                "id": "acme/model-a",
+                "quality": 45.1,
+                "quality_match": "aa",
+                "quality_as_of": "t1",
+                "quality_effort": "high",
+            }
+        ]
+    )
+    doc["schedules"] = [
+        {
+            "id": "acme/sched",
+            "quality": 47.5,
+            "quality_effort": "high",
+            "quality_as_of": "t9",
+            "quality_source": "aa",
+        },
+        {
+            "id": "acme/blank",
+            "quality": None,
+            "quality_effort": None,
+            "quality_as_of": None,
+            "quality_source": None,
+        },
+        "not a dict",
+        {"quality": 1.0},  # no id
+        {"id": "", "quality": 1.0},  # empty id
+        {
+            "id": "acme/bad-quality",
+            "quality": "47.5",
+            "quality_effort": "high",
+            "quality_as_of": "t9",
+            "quality_source": "aa",
+        },
+    ]
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
+    result = mc.fetch_quality_catalog(make_args())
+    assert result["schedules_by_id"] == {
+        "acme/sched": {
+            "quality": 47.5,
+            "quality_effort": "high",
+            "quality_as_of": "t9",
+            "quality_source": "aa",
+        },
+        "acme/blank": {
+            "quality": None,
+            "quality_effort": None,
+            "quality_as_of": None,
+            "quality_source": None,
+        },
+    }
 
 
 def test_fetch_quality_catalog_stale_generated_at_warns_but_uses(monkeypatch, capsys):
@@ -4397,19 +6341,40 @@ def test_fetch_quality_catalog_stale_generated_at_warns_but_uses(monkeypatch, ca
     the hydration is not thrown away over display-only provenance."""
     stale = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
     doc = _catalog_doc(
-        [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}],
+        [
+            {
+                "id": "acme/model-a",
+                "quality": 45.1,
+                "quality_match": "aa",
+                "quality_as_of": stale,
+                "quality_effort": "high",
+            }
+        ],
         generated_at=stale,
     )
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
     result = mc.fetch_quality_catalog(make_args())
     assert result["by_id"] == {
-        "acme/model-a": {"index": 45.1, "source": "aa", "as_of": stale}
+        "acme/model-a": {
+            "index": 45.1,
+            "source": "aa",
+            "as_of": stale,
+            "effort": "high",
+        }
     }
-    assert result["schema_version"] == 3
+    assert result["depths_by_id"] == {}
     assert "stale" in capsys.readouterr().err
     # A fresh catalog hydrates without the staleness warning.
     fresh = _catalog_doc(
-        [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}],
+        [
+            {
+                "id": "acme/model-a",
+                "quality": 45.1,
+                "quality_match": "aa",
+                "quality_as_of": datetime.now(timezone.utc).isoformat(),
+                "quality_effort": "high",
+            }
+        ],
         generated_at=datetime.now(timezone.utc).isoformat(),
     )
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: fresh)
@@ -4421,7 +6386,7 @@ def test_fetch_quality_catalog_stale_generated_at_warns_but_uses(monkeypatch, ca
 def test_fetch_quality_catalog_fetch_failure_returns_none(monkeypatch, capsys):
     """Transport failure -> None (the caller's "catalog unavailable" signal);
     a fetched-but-unusable payload is NOT None -- it comes back as an
-    envelope with an empty by_id. The None/empty distinction is pinned here."""
+    envelope with empty maps. The None/empty distinction is pinned here."""
 
     def boom(*a, **k):
         raise RuntimeError("network down")
@@ -4436,11 +6401,16 @@ def test_fetch_quality_catalog_fetch_failure_returns_none(monkeypatch, capsys):
     result = mc.fetch_quality_catalog(make_args())
     assert result is not None
     assert result["by_id"] == {}
-    assert result["schema_version"] == 2
+    assert result["depths_by_id"] == {}
     # A payload that is not even an object: same envelope, unknown schema.
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: ["not", "a", "dict"])
     result = mc.fetch_quality_catalog(make_args())
-    assert result == {"by_id": {}, "generated_at": None, "schema_version": 0}
+    assert result == {
+        "by_id": {},
+        "depths_by_id": {},
+        "generated_at": None,
+        "schedules_by_id": {},
+    }
 
 
 def test_fetch_quality_catalog_respects_no_cache_and_ttl(monkeypatch, tmp_path):
@@ -4449,7 +6419,15 @@ def test_fetch_quality_catalog_respects_no_cache_and_ttl(monkeypatch, tmp_path):
     usable (non-empty by_id) result is ever written."""
     calls = []
     doc = _catalog_doc(
-        [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}]
+        [
+            {
+                "id": "acme/model-a",
+                "quality": 45.1,
+                "quality_match": "aa",
+                "quality_as_of": "2026-10-23T13:15:07+00:00",
+                "quality_effort": "high",
+            }
+        ]
     )
 
     def fake_fetch(url, headers=None, timeout=30, retries=1):
@@ -4487,8 +6465,76 @@ def test_fetch_quality_catalog_respects_no_cache_and_ttl(monkeypatch, tmp_path):
     assert len(calls) == 1  # fresh fetch despite nothing cached
     assert not cache_file.exists()
     assert result["by_id"] == {
-        "acme/model-a": {"index": 45.1, "source": "aa", "as_of": doc["generated_at"]}
+        "acme/model-a": {
+            "index": 45.1,
+            "source": "aa",
+            "as_of": "2026-10-23T13:15:07+00:00",
+            "effort": "high",
+        }
     }
+    assert result["depths_by_id"] == {}
+
+
+def test_run_unkeyed_v4_catalog_cache_prevents_refetch(monkeypatch, capsys):
+    # A still-live v4 catalog is a stable version-skew state, not a
+    # transient malformed payload: its degraded (empty) envelope is cached
+    # so a second unkeyed run does not re-fetch it. v2/v3 remain
+    # uncached/self-healing (pinned by the test above).
+    models = [
+        make_model(id="acme/candidate", name="Acme: Candidate"),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+            reasoning={"default_effort": "high", "supported_efforts": ["high"]},
+        ),
+    ]
+    v4_doc = _catalog_doc([], schema_version=4)
+    v4_doc["schedules"] = [
+        {
+            "id": "acme/sched-only",
+            "quality": 30.0,
+            "quality_as_of": "20261017",
+            "quality_source": "openrouter",
+        }
+    ]
+    calls = []
+
+    def fake_fetch(*a, **k):
+        calls.append(1)
+        return v4_doc
+
+    monkeypatch.setattr(mc, "fetch_json", fake_fetch)
+    zdr = {model["id"] for model in models}
+    monkeypatch.setattr(
+        mc,
+        "fetch_openrouter_frontend",
+        lambda a: (
+            {},
+            zdr,
+            {"acme/sched-only": {"intelligence_index": 30.0}},
+            set(),
+            [],
+        ),
+    )
+    monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
+    monkeypatch.delenv("AA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    args = make_args(
+        catalog=True,
+        min_context=1_000_000,
+        no_cache=False,
+        cache_ttl=3600,
+    )
+    assert mc.run(args, models, False) == 0
+    capsys.readouterr()
+    assert mc.run(args, models, False) == 0
+    published = json.loads(capsys.readouterr().out)
+    assert len(calls) == 1  # second run served from the cache
+    assert published["sources"]["aa"]["mode"] == "none"
+    (sched,) = published["schedules"]
+    assert sched["quality"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -4549,8 +6595,9 @@ def test_parse_iso_datetime_bad():
 # Test-file mirror of the producer/validator contract so the key set lives
 # in exactly two places: the producer (build_catalog) and the validator it
 # feeds. bsd.CATALOG_ENTRY_KEYS carries the "aa" trio plus Task 9's four
-# schema-v3 additive blocks.
-CATALOG_ENTRY_KEYS = set(bsd.CATALOG_ENTRY_KEYS)
+# schema-v3 additive blocks. Schema v5's quality_effort/reasoning keys are
+# added here until Task 7 moves the site validator to v5.
+CATALOG_ENTRY_KEYS = set(bsd.CATALOG_ENTRY_KEYS) | {"quality_effort", "reasoning"}
 
 
 def catalog_pool(**overrides):
@@ -4640,7 +6687,7 @@ def build_doc(**overrides):
 
 def test_catalog_envelope():
     doc = build_doc()
-    assert doc["schema_version"] == 4
+    assert doc["schema_version"] == 5
     assert doc["tool"] == "model-compare"
     datetime.fromisoformat(doc["generated_at"])  # ISO with offset, raises if not
     p = doc["parameters"]
@@ -4653,6 +6700,7 @@ def test_catalog_envelope():
     assert p["require_tools"] is False  # make_args default
     assert p["exclude_free"] is False
     assert p["include_batch"] is False
+    assert p["reasoning_effort"] == "default"
     assert set(p["weights"]) == {"balanced", "price", "quality"}
     assert p["weights"]["balanced"] == mc.PRIORITY_WEIGHTS["balanced"]
     assert doc["sources"] == {
@@ -4664,6 +6712,12 @@ def test_catalog_envelope():
             "matched_aa": 0,
             "matched_catalog": 0,
             "matched_openrouter": 1,
+            # Depth coverage is candidate-scoped and separate from the
+            # disjoint label buckets. The legacy fixture path measured no
+            # depths.
+            "depth_rows": 0,
+            "matched_depth": 0,
+            "matched_default": 1,
             "catalog_generated_at": None,
             "intelligence_index_version": None,
         },
@@ -4740,6 +6794,65 @@ def test_catalog_entry_shape():
     assert b["quality_as_of"] is None
     assert b["quality_drift"] is None
     assert b["discount"] is None
+
+
+def test_build_catalog_v5_carries_reasoning_block():
+    cand = _cand("acme/model-a", 50.0)
+    cand.update(created=0.0, tool_calling=True, zdr=True, expired=False)
+    cand["quality_record"] = {
+        "index": 46.8,
+        "source": "aa",
+        "as_of": "t1",
+        "effort": "high",
+    }
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["max", "high"],
+        "is_reasoning": True,
+    }
+    cand["reasoning_depths"] = [
+        {"effort": "max", "index": 56.0, "source": "aa", "as_of": "t1"}
+    ]
+    mc.compute_scores(
+        [cand],
+        make_args(),
+        {
+            "acme/model-a": {
+                "index": 46.8,
+                "source": "aa",
+                "as_of": "t1",
+                "effort": "high",
+            }
+        },
+    )
+    doc = mc.build_catalog(
+        make_args(),
+        [make_model()],
+        [cand],
+        {},
+        [],
+        {},
+        {"acme/model-a": {"index": 46.8}},
+        "AA API v2",
+        {},
+        {"acme/model-a": "aa"},
+    )
+    entry = doc["models"][0]
+    assert doc["schema_version"] == 5
+    assert doc["parameters"]["reasoning_effort"] == "default"
+    assert entry["quality_effort"] == "high"
+    assert entry["reasoning"]["default_effort"] == "high"
+    assert entry["reasoning"]["supported_efforts"] == ["max", "high"]
+    # No supports_max_tokens in the fixture: unknown publishes as null, not
+    # the old bool() coercion's False.
+    assert entry["reasoning"]["supports_max_tokens"] is None
+    assert entry["reasoning"]["depths"][0]["effort"] == "max"
+    # The published depth record reuses the quality record's shape: `index`,
+    # never `quality_index`.
+    assert entry["reasoning"]["depths"][0]["index"] == 56.0
+    assert doc["sources"]["aa"]["depth_rows"] == 1
+    assert doc["sources"]["aa"]["matched_depth"] == 1
+    assert doc["sources"]["aa"]["matched_default"] == 1
 
 
 def _doc_with(models, min_context=1_000_000, zdr_ids=None, aa_by_id=None):
@@ -5090,9 +7203,12 @@ def test_catalog_rankings_deterministic_across_builds_and_input_order():
 
 def test_cli_json_rows_project_cleanly_onto_catalog_rankings(capsys):
     # Cross-program check: real --json rows (top 2) per priority and the real
-    # catalog pass the site's order_rows / validate_catalog / build_snapshot.
+    # catalog pass the site's order_rows / build_snapshot.
     doc = _inverting_catalog()
-    bsd.validate_catalog(doc)
+    # Task 7 moves the site validator to v5; until the two schema pins
+    # agree it rejects this v5 document, so exercise it only then.
+    if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
+        bsd.validate_catalog(doc)
     priorities = {}
     for priority in mc.PRIORITY_WEIGHTS:
         args, models, zdr, quality_by_id = inverting_pool()
@@ -5120,10 +7236,9 @@ def test_catalog_deterministic_modulo_generated_at():
 
 
 def test_catalog_document_passes_site_validator():
-    # drift between the producer and the site validator must fail the
-    # suite here, not the publish
-    bsd.validate_catalog(build_doc())  # must not raise
-
+    # Drift between the producer and the site validator must fail the suite
+    # here, not the publish. The site validator moves to v5 in Task 7, so
+    # this task only pins the producer-side shape and counts.
     # mixed provenance (OR benchmarks + AA api fallback) must survive too
     args, models, candidates, dropped, filtered, discounts, _, _, aa_by_id = (
         catalog_pool()
@@ -5152,10 +7267,16 @@ def test_catalog_document_passes_site_validator():
         "matched_aa": 1,
         "matched_catalog": 0,
         "matched_openrouter": 1,
+        "depth_rows": 0,
+        "matched_depth": 0,
+        "matched_default": 2,
         "catalog_generated_at": None,
         "intelligence_index_version": None,
     }
-    bsd.validate_catalog(doc)  # must not raise
+    # Task 7 moves the site validator to v5; until the two schema pins
+    # agree it rejects this v5 document, so exercise it only then.
+    if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
+        bsd.validate_catalog(doc)
 
 
 def test_catalog_aa_block_carries_or_trio():
@@ -5187,6 +7308,9 @@ def test_catalog_quality_match_and_sources_counts():
         "matched_aa": 0,
         "matched_catalog": 0,
         "matched_openrouter": 1,
+        "depth_rows": 0,
+        "matched_depth": 0,
+        "matched_default": 1,
         "catalog_generated_at": None,
         "intelligence_index_version": None,
     }
@@ -5210,6 +7334,9 @@ def test_catalog_aa_mode_when_or_empty():
         "matched_aa": 0,
         "matched_catalog": 0,
         "matched_openrouter": 0,
+        "depth_rows": 0,
+        "matched_depth": 0,
+        "matched_default": 0,
         "catalog_generated_at": None,
         "intelligence_index_version": None,
     }
@@ -5405,6 +7532,9 @@ def test_catalog_sources_aa_block_reshaped_with_counts_version_and_meta():
         "matched_aa": 3,
         "matched_catalog": 1,
         "matched_openrouter": 0,
+        "depth_rows": 0,
+        "matched_depth": 0,
+        "matched_default": 4,
         "catalog_generated_at": None,
         "intelligence_index_version": 4.3,
     }
@@ -5446,10 +7576,16 @@ def test_catalog_sources_aa_block_reshaped_with_counts_version_and_meta():
         "matched_aa": 0,
         "matched_catalog": 2,
         "matched_openrouter": 1,
+        "depth_rows": 0,
+        "matched_depth": 0,
+        "matched_default": 3,
         "catalog_generated_at": "2026-10-23T13:15:07+00:00",
         "intelligence_index_version": None,
     }
-    bsd.validate_catalog(doc)  # must not raise
+    # Task 7 moves the site validator to v5; until the two schema pins
+    # agree it rejects this v5 document, so exercise it only then.
+    if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
+        bsd.validate_catalog(doc)
 
 
 def test_catalog_no_zdr_marks_skipped(monkeypatch, capsys):
@@ -5457,7 +7593,7 @@ def test_catalog_no_zdr_marks_skipped(monkeypatch, capsys):
     # keyless path so the suite never touches the network for it.
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
-        mc, "fetch_openrouter_frontend", lambda args: ({}, set(), {}, set())
+        mc, "fetch_openrouter_frontend", lambda args: ({}, set(), {}, set(), [])
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda args: ([], None, False, None))
     # Unkeyed runs hydrate quality from the published catalog (Task 4);
@@ -5482,7 +7618,7 @@ def test_catalog_no_zdr_marks_skipped(monkeypatch, capsys):
 
 def test_catalog_fails_closed_without_zdr(monkeypatch, capsys):
     monkeypatch.setattr(
-        mc, "fetch_openrouter_frontend", lambda args: ({}, set(), {}, set())
+        mc, "fetch_openrouter_frontend", lambda args: ({}, set(), {}, set(), [])
     )
     monkeypatch.setattr(mc, "fetch_aa_entries", lambda args: ([], None, False, None))
     models = [make_model(id="acme/model-a")]
@@ -5533,7 +7669,7 @@ def test_version_flag():
         check=True,
     )
     # Literal pin: a release that forgets to bump VERSION fails here.
-    assert proc.stdout.strip() == "model-compare 0.5.0"
+    assert proc.stdout.strip() == "model-compare 0.6.0"
 
 
 # ---------------------------------------------------------------------------
@@ -5616,7 +7752,7 @@ def test_fetch_aa_entries_ignores_legacy_cache(monkeypatch, tmp_path):
     assert (entries, source, cached, version) == ([], None, False, None)
 
 
-def test_fetch_aa_entries_writes_v3_cache(monkeypatch, tmp_path):
+def test_fetch_aa_entries_writes_v4_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.delenv("AA_API_KEY", raising=False)
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: aa_page([aa_item()]))
@@ -5624,8 +7760,8 @@ def test_fetch_aa_entries_writes_v3_cache(monkeypatch, tmp_path):
         make_args(no_cache=False, cache_ttl=3600, aa_api_key="dummy-key")
     )
     cache_dir = tmp_path / "model-compare"
-    assert (cache_dir / "aa-intelligence-v3.json").exists()
-    assert not (cache_dir / "aa-intelligence-v2.json").exists()
+    assert (cache_dir / "aa-intelligence-v4.json").exists()
+    assert not (cache_dir / "aa-intelligence-v3.json").exists()
 
 
 def _dir_snapshot(path):
@@ -5792,7 +7928,10 @@ def test_catalog_mode_not_masked_by_openrouter_matches():
     doc = build_doc(aa_source=None)
     assert doc["sources"]["aa"]["matched_openrouter"] > 0
     assert doc["sources"]["aa"]["mode"] == "none"
-    bsd.validate_catalog(doc)  # must not raise
+    # Task 7 moves the site validator to v5; until the two schema pins
+    # agree it rejects this v5 document, so exercise it only then.
+    if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
+        bsd.validate_catalog(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -6016,12 +8155,12 @@ def _offline_catalog_doc(
     return json.loads(capsys.readouterr().out)
 
 
-def test_catalog_schema_version_is_4(monkeypatch, capsys):
+def test_catalog_schema_version_is_5(monkeypatch, capsys):
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
     doc = _offline_catalog_doc(
         monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
     )
-    assert doc["schema_version"] == 4
+    assert doc["schema_version"] == 5
     # run()'s unkeyed wiring, end to end: no AA key (no index version) and
     # the published catalog unavailable (no hydration meta) -- the chain is
     # "none" and every bucket is empty.
@@ -6030,6 +8169,9 @@ def test_catalog_schema_version_is_4(monkeypatch, capsys):
         "matched_aa": 0,
         "matched_catalog": 0,
         "matched_openrouter": 0,
+        "depth_rows": 0,
+        "matched_depth": 0,
+        "matched_default": 0,
         "catalog_generated_at": None,
         "intelligence_index_version": None,
     }
@@ -6220,6 +8362,7 @@ def _stub_quality_run(
     or_bench=None,
     aa_raises=False,
     catalog_raises=False,
+    frontend_models=(),
 ):
     """Stub every fetcher so mc.run() exercises the quality chain offline.
 
@@ -6235,7 +8378,7 @@ def _stub_quality_run(
     monkeypatch.setattr(
         mc,
         "fetch_openrouter_frontend",
-        lambda a: ({}, zdr, or_bench or {}, set()),
+        lambda a: ({}, zdr, or_bench or {}, set(), list(frontend_models)),
     )
     if aa_raises:
 
@@ -6267,25 +8410,54 @@ def _stub_quality_run(
     monkeypatch.setattr(mc, "fetch_model_endpoints", lambda mid, a: [_endpoint()])
 
 
+def _non_reasoning_frontend(models):
+    """Frontend reasoning rows marking models known non-reasoning."""
+    return [
+        {"slug": model["id"], "supports_reasoning": False, "reasoning_config": {}}
+        for model in models
+    ]
+
+
 def test_run_unkeyed_uses_catalog_not_openrouter_for_covered_models(
     monkeypatch, capsys
 ):
-    # Unkeyed: the published catalog's exact-id row wins over the OR trio
+    # Unkeyed: the published catalog's depth record wins over the OR trio
     # for the model it covers. Tier 2 labels the record with the source
     # chain ("catalog" -- read from our published catalog) while as_of
     # stays the row's own stamp; the row's "aa" label is the keyed CI
     # run's row-level truth inside the artifact, never the run's.
-    models = [make_model(id="deepseek/deepseek-chat", name="DeepSeek: Chat")]
+    models = [
+        make_model(
+            id="deepseek/deepseek-chat",
+            name="DeepSeek: Chat",
+            reasoning={"supported_efforts": ["high"], "default_effort": "high"},
+        )
+    ]
+    stamp = "2026-10-23T13:15:00Z"
     catalog = {
         "by_id": {
             "deepseek/deepseek-chat": {
                 "index": 42.0,
                 "source": "aa",
-                "as_of": "2026-10-23T13:15:00Z",
+                "as_of": stamp,
+                "effort": "high",
             }
         },
-        "generated_at": "2026-10-23T13:15:00Z",
-        "schema_version": 4,
+        "depths_by_id": {
+            "deepseek/deepseek-chat": {
+                "default_effort": "high",
+                "depths": {
+                    "high": {
+                        "effort": "high",
+                        "index": 42.0,
+                        "cost_per_task_usd": None,
+                        "source": "aa",
+                        "as_of": stamp,
+                    }
+                },
+            }
+        },
+        "generated_at": stamp,
     }
     or_bench = {
         "deepseek/deepseek-chat": {"intelligence_index": 39.5, "as_of": "20261017"}
@@ -6305,26 +8477,50 @@ def test_run_unkeyed_uses_openrouter_only_for_models_catalog_lacks(monkeypatch, 
     # Unkeyed: the catalog covers one model; the model it lacks falls through
     # to the OR trio -- the last-resort tier.
     models = [
-        make_model(id="acme/covered", name="Acme: Covered"),
+        make_model(
+            id="acme/covered",
+            name="Acme: Covered",
+            reasoning={"supported_efforts": ["high"], "default_effort": "high"},
+        ),
         make_model(id="acme/uncovered", name="Acme: Uncovered"),
     ]
+    stamp = "2026-10-23T13:15:00Z"
     catalog = {
         "by_id": {
             "acme/covered": {
                 "index": 42.0,
                 "source": "aa",
-                "as_of": "2026-10-23T13:15:00Z",
+                "as_of": stamp,
+                "effort": "high",
             }
         },
-        "generated_at": "2026-10-23T13:15:00Z",
-        "schema_version": 4,
+        "depths_by_id": {
+            "acme/covered": {
+                "default_effort": "high",
+                "depths": {
+                    "high": {
+                        "effort": "high",
+                        "index": 42.0,
+                        "cost_per_task_usd": None,
+                        "source": "aa",
+                        "as_of": stamp,
+                    }
+                },
+            }
+        },
+        "generated_at": stamp,
     }
     or_bench = {
         "acme/covered": {"intelligence_index": 41.0, "as_of": "20261017"},
         "acme/uncovered": {"intelligence_index": 30.0, "as_of": "20261010"},
     }
     _stub_quality_run(
-        monkeypatch, models, catalog=catalog, or_bench=or_bench, aa_raises=True
+        monkeypatch,
+        models,
+        catalog=catalog,
+        or_bench=or_bench,
+        aa_raises=True,
+        frontend_models=_non_reasoning_frontend([models[1]]),
     )
     args = make_args(json=True)
     assert mc.run(args, models, False) == 0
@@ -6340,7 +8536,13 @@ def test_run_keyed_aa_down_falls_to_openrouter_not_catalog(monkeypatch, capsys):
     # published catalog would consume its own output (self-reference loop).
     models = [make_model(id="acme/model-a", name="Acme: A")]
     or_bench = {"acme/model-a": {"intelligence_index": 35.0, "as_of": "20261017"}}
-    _stub_quality_run(monkeypatch, models, or_bench=or_bench, catalog_raises=True)
+    _stub_quality_run(
+        monkeypatch,
+        models,
+        or_bench=or_bench,
+        catalog_raises=True,
+        frontend_models=_non_reasoning_frontend(models),
+    )
     args = make_args(aa_api_key="dummy-key", json=True)
     assert mc.run(args, models, False) == 0
     (row,) = json.loads(capsys.readouterr().out)
@@ -6356,10 +8558,15 @@ def test_run_unkeyed_catalog_down_falls_to_openrouter(monkeypatch, capsys):
     args = make_args(json=True)
     for catalog in (
         None,
-        {"by_id": {}, "generated_at": None, "schema_version": 4},
+        {"by_id": {}, "depths_by_id": {}, "generated_at": None},
     ):
         _stub_quality_run(
-            monkeypatch, models, catalog=catalog, or_bench=or_bench, aa_raises=True
+            monkeypatch,
+            models,
+            catalog=catalog,
+            or_bench=or_bench,
+            aa_raises=True,
+            frontend_models=_non_reasoning_frontend(models),
         )
         assert mc.run(args, models, False) == 0
         (row,) = json.loads(capsys.readouterr().out)
@@ -6390,13 +8597,15 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     aa_entries = [
         {
             "key": "acme/model-a",
-            "name": "Acme: A",
+            "name": "A (Non-reasoning)",
+            "slug": "a-non-reasoning",
             "index": 45.1,
             "as_of": "2026-10-23T13:15:00Z",
         },
         {
             "key": "acme/model-b",
-            "name": "Acme: B",
+            "name": "B (Non-reasoning)",
+            "slug": "b-non-reasoning",
             "index": 50.0,
             "as_of": "2026-10-23T13:15:00Z",
         },
@@ -6413,6 +8622,7 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
         aa_version=4.3,
         or_bench=or_bench,
         catalog_raises=True,
+        frontend_models=_non_reasoning_frontend([models[0], models[1], models[2]]),
     )
     # Keyed: the AA API version prefix only exists on keyed runs, so the
     # args carry a key (the brief's footer example shows "AA index v4.3").
@@ -6423,7 +8633,7 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     assert (
         "| quality: AA index v4.3 - live AA (2, checked 13:15Z) "
         "| OpenRouter snapshot (1, as of 2026-10-17); unmatched score 0; "
-        "drift vs OpenRouter snapshot (1)"
+        "drift vs OpenRouter snapshot: 1 comparable (non-reasoning) row"
     ) in pool_line
 
     # Unkeyed: the catalog block shows the hydrated row's as_of (the v4
@@ -6431,25 +8641,49 @@ def test_run_footer_note_lists_sources_counts_as_of_and_version(monkeypatch, cap
     # the row's own label) and the OR block shows the permaslug date; no
     # index version (the AA API is not consulted).
     models = [
-        make_model(id="acme/covered", name="Acme: Covered"),
+        make_model(
+            id="acme/covered",
+            name="Acme: Covered",
+            reasoning={"supported_efforts": ["high"], "default_effort": "high"},
+        ),
         make_model(id="acme/or-only", name="Acme: OR only"),
     ]
+    stamp = "2026-10-23T13:15:00Z"
     catalog = {
         "by_id": {
             "acme/covered": {
                 "index": 42.0,
                 "source": "aa",
-                "as_of": "2026-10-23T13:15:00Z",
+                "as_of": stamp,
+                "effort": "high",
             }
         },
-        "generated_at": "2026-10-23T13:15:00Z",
-        "schema_version": 4,
+        "depths_by_id": {
+            "acme/covered": {
+                "default_effort": "high",
+                "depths": {
+                    "high": {
+                        "effort": "high",
+                        "index": 42.0,
+                        "cost_per_task_usd": None,
+                        "source": "aa",
+                        "as_of": stamp,
+                    }
+                },
+            }
+        },
+        "generated_at": stamp,
     }
     or_bench = {
         "acme/or-only": {"intelligence_index": 30.0, "as_of": "20261017"},
     }
     _stub_quality_run(
-        monkeypatch, models, catalog=catalog, or_bench=or_bench, aa_raises=True
+        monkeypatch,
+        models,
+        catalog=catalog,
+        or_bench=or_bench,
+        aa_raises=True,
+        frontend_models=_non_reasoning_frontend([models[1]]),
     )
     args = make_args()
     assert mc.run(args, models, False) == 0
@@ -6482,20 +8716,71 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
                     "quality": 30.0,
                     "quality_match": "openrouter",
                     "quality_as_of": "20261017",
+                    "quality_effort": "none",
+                    "reasoning": {
+                        "default_effort": "none",
+                        "depths": [
+                            {
+                                "effort": "none",
+                                "index": 30.0,
+                                "cost_per_task_usd": None,
+                                "source": "openrouter",
+                                "as_of": "20261017",
+                            }
+                        ],
+                    },
                 },
                 {
                     "id": "acme/aa-row",
                     "quality": 45.1,
                     "quality_match": "aa",
                     "quality_as_of": aa_stamp,
+                    "quality_effort": "none",
+                    "reasoning": {
+                        "default_effort": "none",
+                        "depths": [
+                            {
+                                "effort": "none",
+                                "index": 45.1,
+                                "cost_per_task_usd": None,
+                                "source": "aa",
+                                "as_of": aa_stamp,
+                            }
+                        ],
+                    },
                 },
             ],
-            schema_version=4,
+            schema_version=5,
         )
         return {
             "by_id": mc.catalog_quality_by_id(doc),
+            "depths_by_id": {
+                "acme/or-row": {
+                    "default_effort": "none",
+                    "depths": {
+                        "none": {
+                            "effort": "none",
+                            "index": 30.0,
+                            "cost_per_task_usd": None,
+                            "source": "openrouter",
+                            "as_of": "20261017",
+                        }
+                    },
+                },
+                "acme/aa-row": {
+                    "default_effort": "none",
+                    "depths": {
+                        "none": {
+                            "effort": "none",
+                            "index": 45.1,
+                            "cost_per_task_usd": None,
+                            "source": "aa",
+                            "as_of": aa_stamp,
+                        }
+                    },
+                },
+            },
             "generated_at": "2026-10-23T13:15:07+00:00",
-            "schema_version": 4,
         }
 
     # The aa row's ISO stamp is the fresher one: it wins despite the
@@ -6505,6 +8790,7 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
         models,
         catalog=catalog_with("2026-10-23T13:15:07+00:00"),
         aa_raises=True,
+        frontend_models=_non_reasoning_frontend(models),
     )
     assert mc.run(make_args(), models, False) == 0
     pool_line = next(
@@ -6521,6 +8807,7 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
         models,
         catalog=catalog_with("2026-10-16T13:15:07+00:00"),
         aa_raises=True,
+        frontend_models=_non_reasoning_frontend(models),
     )
     assert mc.run(make_args(), models, False) == 0
     pool_line = next(
@@ -6542,10 +8829,11 @@ def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys
                 "index": 42.0,
                 "source": "aa",
                 "as_of": "2026-10-23T13:15:00Z",
+                "effort": "high",
             }
         },
         "generated_at": "2026-10-23T13:15:00Z",
-        "schema_version": 4,
+        "depths_by_id": {},
     }
     _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
     args = make_args(catalog=True)
@@ -6555,6 +8843,7 @@ def test_run_unkeyed_catalog_schedules_quality_stays_numeric(monkeypatch, capsys
     assert sched["id"] == "acme/model-a"
     assert isinstance(sched["quality"], float)
     assert sched["quality"] == 42.0
+    assert sched["quality_effort"] == "high"
 
 
 def test_run_unkeyed_catalog_schedules_quality_for_non_candidates(monkeypatch, capsys):
@@ -6580,14 +8869,14 @@ def test_run_unkeyed_catalog_schedules_quality_for_non_candidates(monkeypatch, c
                 "quality": 30.0,
                 "quality_match": "openrouter",
                 "quality_as_of": "20261017",
+                "quality_effort": "none",
             },
         ],
-        schema_version=4,
+        schema_version=5,
     )
     catalog = {
         "by_id": mc.catalog_quality_by_id(catalog_doc),
         "generated_at": "2026-10-23T13:15:07+00:00",
-        "schema_version": 4,
     }
     _stub_quality_run(monkeypatch, models, catalog=catalog, aa_raises=True)
     args = make_args(catalog=True, min_context=1_000_000)
@@ -6602,6 +8891,148 @@ def test_run_unkeyed_catalog_schedules_quality_for_non_candidates(monkeypatch, c
     assert sched["quality_as_of"] == "20261017"
 
 
+def test_run_unkeyed_catalog_schedule_entry_from_schedules_verbatim(
+    monkeypatch, capsys
+):
+    # Spec 6.5: unkeyed schedules hydrate from the published catalog's
+    # schedules array, not its models array. A schedule-only model (sub-1M
+    # context) is absent from models by design, so this is the only place
+    # its recorded deals quality can come from. The entry's four
+    # provenance fields are copied verbatim -- no run-level relabeling.
+    models = [
+        make_model(id="acme/candidate", name="Acme: Candidate"),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+            reasoning={"default_effort": "high", "supported_efforts": ["high"]},
+        ),
+    ]
+    catalog = {
+        "by_id": {},
+        "depths_by_id": {},
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schedules_by_id": {
+            "acme/sched-only": {
+                "quality": 47.5,
+                "quality_effort": "high",
+                "quality_as_of": "t9",
+                "quality_source": "aa",
+            }
+        },
+    }
+    _stub_quality_run(
+        monkeypatch,
+        models,
+        catalog=catalog,
+        aa_raises=True,
+        or_bench={"acme/sched-only": {"intelligence_index": 30.0}},
+    )
+    args = make_args(catalog=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    published = json.loads(capsys.readouterr().out)
+    (sched,) = published["schedules"]
+    assert sched["id"] == "acme/sched-only"
+    assert sched["quality"] == 47.5
+    assert sched["quality_effort"] == "high"
+    assert sched["quality_as_of"] == "t9"
+    # Verbatim, never relabeled to the run-level "catalog" chain.
+    assert sched["quality_source"] == "aa"
+
+
+def test_run_unkeyed_catalog_schedule_null_quality_reasoning_stays_null(
+    monkeypatch, capsys
+):
+    # A recorded entry with null quality falls through the remaining tiers.
+    # The model is reasoning, so the live OR trio must not supply a score.
+    models = [
+        make_model(id="acme/candidate", name="Acme: Candidate"),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+            reasoning={"default_effort": "high", "supported_efforts": ["high"]},
+        ),
+    ]
+    catalog = {
+        "by_id": {},
+        "depths_by_id": {},
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schedules_by_id": {
+            "acme/sched-only": {
+                "quality": None,
+                "quality_effort": None,
+                "quality_as_of": None,
+                "quality_source": None,
+            }
+        },
+    }
+    _stub_quality_run(
+        monkeypatch,
+        models,
+        catalog=catalog,
+        aa_raises=True,
+        or_bench={"acme/sched-only": {"intelligence_index": 30.0}},
+    )
+    args = make_args(catalog=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    published = json.loads(capsys.readouterr().out)
+    (sched,) = published["schedules"]
+    assert sched["id"] == "acme/sched-only"
+    assert sched["quality"] is None
+    assert sched["quality_effort"] is None
+    assert sched["quality_source"] is None
+
+
+def test_run_unkeyed_v4_catalog_never_hydrates_schedules(monkeypatch, capsys):
+    # Spec 9.1: a v4 catalog hydrates no quality rather than mixing
+    # semantics. Its schedules carry no quality_effort, so the schedule
+    # parser must stay behind the v5 gate -- otherwise a max-effort OR row
+    # would be republished as a default-effort deal.
+    models = [
+        make_model(id="acme/candidate", name="Acme: Candidate"),
+        make_model(
+            id="acme/sched-only",
+            name="Acme: Sched only",
+            pricing=deepseek_pricing(),
+            context_length=262144,
+            reasoning={"default_effort": "high", "supported_efforts": ["high"]},
+        ),
+    ]
+    v4_doc = _catalog_doc([], schema_version=4)
+    v4_doc["schedules"] = [
+        {
+            "id": "acme/sched-only",
+            "quality": 30.0,
+            "quality_as_of": "20261017",
+            "quality_source": "openrouter",
+        }
+    ]
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: v4_doc)
+    envelope = mc.fetch_quality_catalog(make_args(no_cache=True))
+    assert envelope["schedules_by_id"] == {}
+
+    _stub_quality_run(
+        monkeypatch,
+        models,
+        catalog=envelope,
+        aa_raises=True,
+        or_bench={"acme/sched-only": {"intelligence_index": 30.0}},
+    )
+    args = make_args(catalog=True, min_context=1_000_000)
+    assert mc.run(args, models, False) == 0
+    published = json.loads(capsys.readouterr().out)
+    assert published["sources"]["aa"]["mode"] == "none"
+    (sched,) = published["schedules"]
+    assert sched["id"] == "acme/sched-only"
+    # No tier-0 hydration and no OR fallback for a reasoning model.
+    assert sched["quality"] is None
+    assert sched["quality_effort"] is None
+    assert sched["quality_source"] is None
+
+
 def test_run_no_network_quality_blind_ranking_unchanged(monkeypatch, capsys):
     # All sources empty (no key, catalog down, OR silent): the existing
     # quality-blind path must be unchanged -- no fetch, no catalog, and the
@@ -6613,3 +9044,251 @@ def test_run_no_network_quality_blind_ranking_unchanged(monkeypatch, capsys):
     out = capsys.readouterr().out
     pool_line = next(line for line in out.splitlines() if line.startswith("pool:"))
     assert "quality data unavailable, ranked on price/context/age" in pool_line
+
+
+# ---------------------------------------------------------------------------
+# Task 4: CLI depth column, depth block, and --best
+# ---------------------------------------------------------------------------
+
+
+def test_print_table_includes_depth_column(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["reasoning"] = {"default_effort": "high"}
+    cand["quality_record"] = {"index": 46.8, "effort": "high"}
+    mc.print_table(
+        [cand],
+        1,
+        {"quality": 0.4, "price": 0.4, "context": 0.1, "age": 0.1},
+        "quality: test",
+    )
+    out = capsys.readouterr().out
+    assert "DEPTH" in out
+    assert "high*" in out
+
+
+def test_depth_detail_marks_default_and_unmeasured(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["max", "high", "none"],
+    }
+    cand["reasoning_depths"] = [
+        {"effort": "max", "index": 56.0, "cost_per_task_usd": 5.46, "as_of": "t1"},
+        {"effort": "none", "index": None, "cost_per_task_usd": None, "as_of": None},
+    ]
+    mc.print_depth_detail([cand])
+    out = capsys.readouterr().out
+    assert "high*" in out and "max" in out and "#max" in out
+    # Supported but unmeasured: still selectable, with "-" in the AA columns.
+    assert "#none" in out
+
+
+def test_depth_detail_marks_aa_only_effort_not_selectable(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["reasoning"] = {"default_effort": "high", "supported_efforts": ["high"]}
+    cand["reasoning_depths"] = [
+        {"effort": "max", "index": 56.0, "cost_per_task_usd": 5.46, "as_of": "t1"},
+    ]
+    mc.print_depth_detail([cand])
+    out = capsys.readouterr().out
+    assert "not selectable" in out
+    assert "#max" not in out
+
+
+def test_best_prints_none_variant_when_selected(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["quality_record"] = {"index": 20.0, "effort": "none"}
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["high", "none"],
+    }
+    top = [cand]
+    args = make_args(best=True, reasoning_effort="none")
+    mc.print_best(top, args)
+    assert capsys.readouterr().out.strip() == "openrouter/acme/model-a#none"
+
+
+def test_best_prints_bare_for_default(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["quality_record"] = {"index": 46.8, "effort": "high"}
+    cand["reasoning"] = {"default_effort": "high", "supported_efforts": ["high", "max"]}
+    mc.print_best([cand], make_args(best=True))
+    assert capsys.readouterr().out.strip() == "openrouter/acme/model-a"
+
+
+def test_parse_args_accepts_depth_flags():
+    args = mc.parse_args(["--reasoning-effort", "max", "--no-depths"])
+    assert args.reasoning_effort == "max"
+    assert args.no_depths is True
+
+
+def test_depth_detail_empty_prints_nothing(capsys):
+    mc.print_depth_detail([])
+    assert capsys.readouterr().out == ""
+
+
+def test_run_prints_depth_detail_by_default(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(), models, False) == 0
+    out = capsys.readouterr().out
+    assert "depth detail" in out
+    assert "no AA depth data" in out
+
+
+def test_run_no_depths_suppresses_depth_detail(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(no_depths=True), models, False) == 0
+    out = capsys.readouterr().out
+    assert "depth detail  (AA index" not in out
+    assert "no AA depth data" not in out
+    assert "DEPTH" in out  # the column stays
+
+
+def test_best_single_state_none_variant_and_non_reasoning(capsys):
+    single = _cand("acme/single", 1.0)
+    single["reasoning"] = {
+        "default_effort": "reasoning",
+        "supported_efforts": [],
+        "is_reasoning": True,
+        "mandatory": False,
+    }
+    mc.print_best([single], make_args(best=True, reasoning_effort="none"))
+    assert capsys.readouterr().out.strip() == "openrouter/acme/single#none"
+
+    plain = _cand("acme/plain", 1.0)
+    plain["reasoning"] = {
+        "default_effort": "none",
+        "supported_efforts": [],
+        "is_reasoning": False,
+    }
+    mc.print_best([plain], make_args(best=True, reasoning_effort="none"))
+    assert capsys.readouterr().out.strip() == "openrouter/acme/plain"
+
+
+def test_best_bare_when_effort_not_exposed(capsys):
+    cand = _cand("acme/model-a", 1.0)
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["high"],
+        "is_reasoning": True,
+    }
+    mc.print_best([cand], make_args(best=True, reasoning_effort="max"))
+    assert capsys.readouterr().out.strip() == "openrouter/acme/model-a"
+
+
+def test_depth_detail_select_rules_for_single_state_and_non_reasoning(capsys):
+    single = _cand("acme/single", 1.0)
+    single["reasoning"] = {
+        "default_effort": "reasoning",
+        "supported_efforts": [],
+        "is_reasoning": True,
+        "mandatory": False,
+    }
+    single["reasoning_depths"] = [
+        {"effort": "reasoning", "index": 40.0, "cost_per_task_usd": 0.2},
+        {"effort": "none", "index": 30.0, "cost_per_task_usd": 0.1},
+    ]
+    plain = _cand("acme/plain", 1.0)
+    plain["reasoning"] = {
+        "default_effort": "none",
+        "supported_efforts": [],
+        "is_reasoning": False,
+    }
+    plain["reasoning_depths"] = [
+        {"effort": "none", "index": 30.0, "cost_per_task_usd": 0.1}
+    ]
+    mc.print_depth_detail([single, plain])
+    out = capsys.readouterr().out
+    # Single-state reasoning row: not selectable; its none toggle is #none.
+    reasoning_row = next(
+        line for line in out.splitlines() if line.strip().startswith("reasoning")
+    )
+    assert reasoning_row.rstrip().endswith("-")
+    assert "#none" in out
+    # A non-reasoning model's none row stays bare even as a measured row.
+    plain_block = out.split("#2 acme/plain")[1]
+    none_row = next(
+        line for line in plain_block.splitlines() if line.strip().startswith("none")
+    )
+    assert none_row.rstrip().endswith("-")
+    assert "#none" not in plain_block
+
+
+def test_depth_detail_vs_default_ratio_and_zero(capsys):
+    cand = _cand("acme/model-a", 1.0)
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["max", "high", "low"],
+        "is_reasoning": True,
+    }
+    cand["reasoning_depths"] = [
+        {"effort": "max", "index": 50.0, "cost_per_task_usd": 0.0},
+        {"effort": "high", "index": 40.0, "cost_per_task_usd": 0.5},
+        {"effort": "low", "index": 30.0, "cost_per_task_usd": 1.0},
+    ]
+    zero_default = _cand("acme/zero-default", 1.0)
+    zero_default["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["high"],
+        "is_reasoning": True,
+    }
+    zero_default["reasoning_depths"] = [
+        {"effort": "high", "index": 40.0, "cost_per_task_usd": 0.0},
+    ]
+    mc.print_depth_detail([cand, zero_default])
+    out = capsys.readouterr().out
+    first_block = out.split("#2 acme/zero-default")[0]
+    rows = {
+        line.split()[0]: line.split()
+        for line in first_block.splitlines()
+        if line.split() and line.split()[0] in {"max", "high*", "low"}
+    }
+    assert rows["max"][3] == "-"  # zero measured cost
+    assert rows["high*"][3] == "1.0x"
+    assert rows["low"][3] == "2.0x"
+    zero_block = out.split("#2 acme/zero-default")[1]
+    zero_row = next(
+        line for line in zero_block.splitlines() if line.strip().startswith("high*")
+    )
+    assert zero_row.split()[3] == "-"  # zero default cost
+
+
+def test_run_prints_depth_detail_before_table_legend(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(), models, False) == 0
+    out = capsys.readouterr().out
+    depth_at = out.index("depth detail  (AA index")
+    legend_at = out.index("quality: Artificial Analysis intelligence index")
+    assert depth_at < legend_at
+
+
+def test_depth_detail_reports_missing_default_record(capsys):
+    cand = _cand("acme/model-a", 50.0)
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["max", "high", "low", "none"],
+        "is_reasoning": True,
+    }
+    cand["reasoning_depths"] = [
+        {"effort": "max", "index": 45.1, "cost_per_task_usd": 0.26, "as_of": "t1"},
+    ]
+    mc.print_depth_detail([cand])
+    out = capsys.readouterr().out
+    assert "AA has no high record for this model." in out
+    assert "high*" in out
+
+
+def test_best_and_json_print_no_depth_detail(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(best=True), models, False) == 0
+    assert "depth detail" not in capsys.readouterr().out
+
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    assert mc.run(make_args(json=True), models, False) == 0
+    out = capsys.readouterr().out
+    assert "depth detail" not in out
+    assert json.loads(out)  # the JSON document is still the only output

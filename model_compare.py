@@ -68,10 +68,27 @@ OPENROUTER_ZDR_URL = "https://openrouter.ai/api/v1/endpoints/zdr"
 # (legacy endpoints 410 after 2026-11-04; see
 # https://artificialanalysis.ai/data-api/migrate-v2-data).
 AA_API_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
-# Cache key for the AA API entries envelope. v3 adds the per-fetch `as_of`
-# timestamp on every entry and the envelope's intelligence_index_version;
-# payloads under the pre-v3 keys predate those fields and must never be read.
-AA_ENTRIES_CACHE = "aa-intelligence-v3"
+# Cache key for the AA API entries envelope. v4 adds the per-effort fields
+# (id, slug, base, effort, creator, cost_per_task) parsed from each row's
+# name/slug; v3 payloads predate them and must never be read.
+AA_ENTRIES_CACHE = "aa-intelligence-v4"
+# Reasoning-effort labels AA encodes in a row's name parenthetical or slug
+# suffix. AA_EFFORT_ORDER is the display order (deepest first);
+# REASONING_GATEWAY_EFFORTS is what OpenRouter accepts as a discrete effort.
+AA_EFFORT_ORDER = (
+    "max",
+    "xhigh",
+    "high",
+    "medium",
+    "low",
+    "minimal",
+    "none",
+    "reasoning",
+)
+REASONING_GATEWAY_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
+# --reasoning-effort values: "default" keeps each model's effective default
+# and does not filter; the rest select and filter (spec §7).
+REASONING_EFFORT_CHOICES = ("default",) + tuple(reversed(REASONING_GATEWAY_EFFORTS))
 # The repo's own published catalog.json -- built by keyed CI runs, hydrated
 # by unkeyed local runs (design: quality source reconciliation, source 2).
 # The github.io host 301s to plain http://model-compare.dev/catalog.json, an
@@ -84,7 +101,7 @@ QUALITY_CATALOG_CACHE = "published-catalog"
 # A published catalog generated more than this many days ago is stale:
 # warn but use -- the records' as_of makes the staleness visible downstream.
 QUALITY_CATALOG_MAX_AGE_DAYS = 14
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
 # opencode expects provider-qualified model ids: openrouter/<provider/model>.
@@ -103,7 +120,7 @@ PRIORITY_WEIGHTS = {
     "quality": {"quality": 0.60, "price": 0.20, "context": 0.10, "age": 0.10},
 }
 
-CATALOG_SCHEMA_VERSION = 4
+CATALOG_SCHEMA_VERSION = 5
 
 # The drop-reason keys build_candidates counts, verbatim -- keep in sync with
 # its drop() call sites. pool.dropped lists all of them zero-filled so the
@@ -125,6 +142,7 @@ CATALOG_DROP_REASONS = (
     "tool calling",
     "expired",
     "age",
+    "reasoning effort",
     "no_baseline_eligible_endpoint",
     "endpoint_fetch_failed",
 )
@@ -1217,110 +1235,229 @@ def fetch_session_cost(args) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-# Pre-reconciliation published catalogs (schema v3, written before the AA
-# tier was relabeled) record the AA tier as "api"; hydration normalizes it
-# to the final "aa" label. Every other recorded label passes through as-is.
-_QUALITY_SOURCE_NORMALIZATION = {"api": "aa"}
+# Pre-reconciliation published catalogs (schema v3/v4) are retired: v5 is
+# the only shape whose `quality` means "the index at the requested effort".
+CATALOG_QUALITY_SCHEMA_VERSION = 5
 
 
-def catalog_quality_by_id(doc) -> dict:
-    """Pure parser: a published catalog document -> {id: quality record}.
+def _catalog_index(value) -> float | None:
+    """A finite in-range catalog index, or None for poisoned/absent input."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        index = float(value)  # huge ints raise OverflowError
+    except OverflowError:
+        return None
+    if not math.isfinite(index) or not 0.0 <= index <= 100.0:
+        return None
+    return index
 
-    No fetch, no cache, no args object -- the fetcher owns transport and
-    freshness; this owns shape. Records are {"index", "source", "as_of"}
-    and feed resolve_quality's catalog_quality parameter on unkeyed runs;
-    the values were produced by a keyed CI run, so hydration is an exact
-    catalog-id join with no re-matching.
+
+def _parse_catalog_v5(doc) -> tuple[dict, dict]:
+    """Pure parser: a published catalog v5 document -> (by_id, depths_by_id).
+
+    by_id maps id -> {"index", "source", "as_of", "effort"} for the model's
+    main quality (the index at the keyed run's requested effort). The
+    depth map maps id -> {"default_effort", "depths": {effort: record}} for
+    the model's full measured depth list; resolve_quality re-selects from
+    it at the unkeyed run's live effective default.
 
     Gates (design: failure modes):
-    - schema_version must be an int >= 3; anything older warns
-      "published catalog schema vX, expected >= 3; skipping hydration"
-      and yields {}. Accepting v3 is the deploy-day skew case: the live
-      artifact predates the v4 per-row quality_as_of.
+    - schema_version must be an int == 5. v3/v4 predate the depth contract
+      (their `quality` means max effort), so they warn
+      "published catalog schema vX, expected 5; skipping hydration" and
+      yield empty maps. Mixing semantics is never allowed.
     - Any shape surprise -- a non-dict document, a non-int schema_version,
-      a non-list models, a row without a usable id, or a matched row whose
-      quality is not a finite number or whose quality_match is not a
-      non-empty string -- warns and yields {} for the WHOLE artifact.
-      Never a partial hydration, never a raise: the catalog is
-      machine-generated, so one malformed row means this is not the
-      artifact we think it is.
+      a non-list models, a row without a usable id, a main quality that is
+      not finite/in-range, or malformed depth data -- warns and yields
+      empty maps for the WHOLE artifact. Never a partial hydration, never
+      a raise: the catalog is machine-generated, so one malformed row
+      means this is not the artifact we think it is.
     - Rows with quality None and quality_match None are legitimate
-      unmatched models; they are skipped silently (nothing to hydrate).
+      unmatched models; they are skipped in by_id but their depth block is
+      still parsed (a model can have measured depths without a main score).
 
-    Normalization: v3 rows map quality_match "api" -> "aa" and date every
-    row with the catalog's generated_at -- the live v3 artifact carries
-    quality_as_of: null, which must be ignored, not passed through.
-    v4+ rows keep their recorded quality_as_of (None when absent) and
-    source label as-is: that label is the row-level truth inside the
-    published artifact (a keyed CI run emits "aa"/"openrouter", never
-    "catalog"). resolve_quality's catalog tier owns the run-level label:
-    it relabels every hydrated record to the chain label "catalog".
+    Per-depth records use the published shape {effort, index,
+    cost_per_task_usd, source, as_of} -- the quality record's own shape
+    (`index`, never `quality_index`).
     """
     if not isinstance(doc, dict):
         warn("published catalog returned an unexpected response shape")
-        return {}
+        return {}, {}
     schema_version = doc.get("schema_version")
     if type(schema_version) is not int:
         warn("published catalog returned an unexpected response shape")
-        return {}
-    if schema_version < 3:
+        return {}, {}
+    if schema_version != CATALOG_QUALITY_SCHEMA_VERSION:
         warn(
-            f"published catalog schema v{schema_version}, expected >= 3; "
-            "skipping hydration"
+            f"published catalog schema v{schema_version}, expected "
+            f"{CATALOG_QUALITY_SCHEMA_VERSION}; skipping hydration"
         )
-        return {}
+        return {}, {}
     models = doc.get("models")
     if not isinstance(models, list):
         warn("published catalog returned an unexpected response shape")
-        return {}
-    generated_at = doc.get("generated_at")
-    v3_as_of = generated_at if isinstance(generated_at, str) and generated_at else None
+        return {}, {}
     by_id: dict = {}
+    depths_by_id: dict = {}
     for entry in models:
         if not isinstance(entry, dict):
             warn("published catalog returned an unexpected response shape")
-            return {}
+            return {}, {}
         model_id = entry.get("id")
         if not (isinstance(model_id, str) and model_id):
             warn("published catalog returned an unexpected response shape")
-            return {}
+            return {}, {}
         quality = entry.get("quality")
         match = entry.get("quality_match")
-        if match is None and quality is None:
-            continue  # legitimate unmatched row: nothing to hydrate
-        if not (isinstance(match, str) and match):
-            warn("published catalog returned an unexpected response shape")
-            return {}
-        if not isinstance(quality, (int, float)) or isinstance(quality, bool):
-            warn("published catalog returned an unexpected response shape")
-            return {}
-        try:
-            index = float(quality)  # huge ints raise OverflowError
-        except OverflowError:
-            warn("published catalog returned an unexpected response shape")
-            return {}
-        # Non-finite indexes would serialize as NaN and poison quality.
-        if not math.isfinite(index):
-            warn("published catalog returned an unexpected response shape")
-            return {}
-        # The AA indexes run 0..100 (the range the catalog validator
-        # enforces on quality); an out-of-range value is poisoned data and
-        # degrades the whole artifact. The surface is unkeyed runs: only
-        # they hydrate from the published catalog.
-        if not 0.0 <= index <= 100.0:
-            warn("published catalog returned an unexpected response shape")
-            return {}
-        if schema_version == 3:
-            as_of = v3_as_of
-        else:
+        if not (match is None and quality is None):
+            if not (isinstance(match, str) and match):
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            index = _catalog_index(quality)
+            if index is None:
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            effort = entry.get("quality_effort")
+            if effort is not None and not (isinstance(effort, str) and effort):
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
             recorded = entry.get("quality_as_of")
-            as_of = recorded if isinstance(recorded, str) and recorded else None
-        by_id[model_id] = {
-            "index": index,
-            "source": _QUALITY_SOURCE_NORMALIZATION.get(match, match),
-            "as_of": as_of,
+            by_id[model_id] = {
+                "index": index,
+                "source": match,
+                "as_of": recorded if isinstance(recorded, str) and recorded else None,
+                "effort": effort,
+            }
+        reasoning = entry.get("reasoning")
+        if reasoning is None:
+            continue
+        if not isinstance(reasoning, dict):
+            warn("published catalog returned an unexpected response shape")
+            return {}, {}
+        default_effort = reasoning.get("default_effort")
+        if default_effort is not None and not isinstance(default_effort, str):
+            warn("published catalog returned an unexpected response shape")
+            return {}, {}
+        raw_depths = reasoning.get("depths")
+        if raw_depths is None:
+            raw_depths = []
+        if not isinstance(raw_depths, list):
+            warn("published catalog returned an unexpected response shape")
+            return {}, {}
+        depths: dict = {}
+        for depth in raw_depths:
+            if not isinstance(depth, dict):
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            effort = depth.get("effort")
+            if not (isinstance(effort, str) and effort):
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            index = _catalog_index(depth.get("index"))
+            if index is None:
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            cost = depth.get("cost_per_task_usd")
+            if cost is not None:
+                cost = _finite_cost(cost)
+                if cost is None:
+                    warn("published catalog returned an unexpected response shape")
+                    return {}, {}
+            source = depth.get("source")
+            if not (isinstance(source, str) and source):
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            as_of = depth.get("as_of")
+            if as_of is not None and not isinstance(as_of, str):
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            if effort in depths:
+                # Duplicate efforts are ambiguous: fail closed, never guess.
+                warn("published catalog returned an unexpected response shape")
+                return {}, {}
+            depths[effort] = {
+                "effort": effort,
+                "index": index,
+                "cost_per_task_usd": cost,
+                "source": source,
+                "as_of": as_of if as_of else None,
+            }
+        depths_by_id[model_id] = {
+            "default_effort": default_effort if default_effort else None,
+            "depths": depths,
         }
-    return by_id
+    return by_id, depths_by_id
+
+
+def catalog_quality_by_id(doc) -> dict:
+    """The v5 main-quality map {id: {"index", "source", "as_of", "effort"}}.
+
+    Pure parser; see _parse_catalog_v5 for the gates and the depth map.
+    """
+    return _parse_catalog_v5(doc)[0]
+
+
+def _catalog_schedule_entries(doc) -> dict:
+    """Pure parser: published catalog v5 schedules -> id -> recorded provenance.
+
+    Spec 6.5: unkeyed runs rebuild the Deals table from the published
+    catalog's schedules array, because schedule-only models (sub-1M context,
+    non-ZDR) never appear in the models array. Each value is
+    {"quality", "quality_effort", "quality_as_of", "quality_source"},
+    copied verbatim so the rebuild publishes the keyed run's recorded
+    provenance unchanged.
+
+    A non-list schedules block yields an empty map. Individual malformed
+    rows (not an object, no usable id, a non-finite/out-of-range quality, or
+    a wrong-typed provenance field) are skipped rather than guessed; the
+    model then falls through the existing tiers.
+
+    Schema gate: only a v5 catalog contributes schedule entries. v4/v3
+    schedules predate ``quality_effort``, so hydrating them would mix the
+    old max-effort semantics into a default-effort run (spec 9.1).
+    """
+    if not isinstance(doc, dict):
+        return {}
+    schema_version = doc.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version != CATALOG_QUALITY_SCHEMA_VERSION
+    ):
+        return {}
+    schedules = doc.get("schedules")
+    if not isinstance(schedules, list):
+        return {}
+    entries = {}
+    for entry in schedules:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not (isinstance(model_id, str) and model_id):
+            continue
+        quality = entry.get("quality")
+        if quality is not None:
+            quality = _catalog_index(quality)
+            if quality is None:
+                continue
+        quality_effort = entry.get("quality_effort")
+        if quality_effort is not None and not (
+            isinstance(quality_effort, str) and quality_effort
+        ):
+            continue
+        quality_as_of = entry.get("quality_as_of")
+        if quality_as_of is not None and not isinstance(quality_as_of, str):
+            continue
+        quality_source = entry.get("quality_source")
+        if quality_source is not None and not isinstance(quality_source, str):
+            continue
+        entries[model_id] = {
+            "quality": quality,
+            "quality_effort": quality_effort,
+            "quality_as_of": quality_as_of,
+            "quality_source": quality_source,
+        }
+    return entries
 
 
 def fetch_quality_catalog(args) -> dict | None:
@@ -1330,47 +1467,60 @@ def fetch_quality_catalog(args) -> dict | None:
     catalog artifact, built by keyed CI runs and hydrated by unkeyed local
     runs. Never called on keyed runs -- a CI/site build hydrating from the
     published catalog would consume its own output (self-reference loop);
-    Task 4 owns that wiring.
+    run() owns that wiring.
 
     Returns None only on TRANSPORT failure (after fetch_json's retries);
-    otherwise the envelope {"by_id": {id: record}, "generated_at":
-    str|None, "schema_version": int}. An empty by_id means
+    otherwise the envelope {"by_id": {id: record}, "depths_by_id":
+    {id: {"default_effort", "depths": {effort: record}}}, "generated_at":
+    str|None, "schedules_by_id": {id: recorded schedule provenance}}. An
+    empty by_id AND empty depths_by_id AND empty schedules_by_id means
     fetched-but-unusable (schema gate fail, malformed shape) -- Task 4's
-    footer treats None and empty by_id identically ("catalog unavailable").
+    footer treats None and empty maps identically ("catalog unavailable").
 
     The envelope is cached under QUALITY_CATALOG_CACHE with the standard
-    TTL, and only a usable (non-empty by_id) result is ever written: a
-    degraded payload must self-heal on the next run. --no-cache neither
-    reads nor writes. Staleness: generated_at older than
-    QUALITY_CATALOG_MAX_AGE_DAYS warns but uses -- as_of makes the
-    staleness visible downstream (the check runs only when rows actually
-    hydrate -- warning about the age of a catalog we are not using is
-    noise); an unusable generated_at warns that
-    staleness cannot be checked and still uses the rows (their as_of then
-    shows None rather than a wrong date).
+    TTL. A usable result (non-empty by_id, depths_by_id or schedules_by_id)
+    is written; so is a v4 catalog's deliberately empty envelope -- that is
+    the stable deploy-skew state, and caching it avoids a refetch loop.
+    Older/unknown schemas and malformed v5 payloads stay uncached so a
+    degraded payload self-heals on the next run. A cached envelope from
+    before the v5 depth contract lacks depths_by_id, and one from before
+    schedule hydration lacks schedules_by_id; both are refetched rather
+    than serving depth/schedule-blind quality. --no-cache neither reads nor
+    writes. Staleness: generated_at older than QUALITY_CATALOG_MAX_AGE_DAYS
+    warns but uses -- as_of makes the staleness visible downstream (the
+    check runs only when rows actually hydrate -- warning about the age of
+    a catalog we are not using is noise); an unusable generated_at warns
+    that staleness cannot be checked and still uses the rows (their as_of
+    then shows None rather than a wrong date).
     """
     if not args.no_cache:
         cached = load_cache(QUALITY_CATALOG_CACHE, args.cache_ttl)
-        if isinstance(cached, dict) and isinstance(cached.get("by_id"), dict):
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("by_id"), dict)
+            and isinstance(cached.get("depths_by_id"), dict)
+            and isinstance(cached.get("schedules_by_id"), dict)
+        ):
             return cached
     try:
         doc = fetch_json(QUALITY_CATALOG_URL, timeout=30, retries=3)
     except Exception as exc:
         warn(f"published catalog request failed ({exc})")
         return None
-    by_id = catalog_quality_by_id(doc)
+    by_id, depths_by_id = _parse_catalog_v5(doc)
+    schedules_by_id = _catalog_schedule_entries(doc)
     generated_at = doc.get("generated_at") if isinstance(doc, dict) else None
     if not isinstance(generated_at, str):
         generated_at = None
-    schema_version = doc.get("schema_version") if isinstance(doc, dict) else 0
-    if type(schema_version) is not int:
-        schema_version = 0
+    schema_version = doc.get("schema_version") if isinstance(doc, dict) else None
     result = {
         "by_id": by_id,
+        "depths_by_id": depths_by_id,
         "generated_at": generated_at,
-        "schema_version": schema_version,
+        "schedules_by_id": schedules_by_id,
     }
-    if by_id:
+    usable = bool(by_id or depths_by_id or schedules_by_id)
+    if usable:
         generated = parse_iso_datetime(generated_at)
         if generated is None:
             warn(
@@ -1384,6 +1534,11 @@ def fetch_quality_catalog(args) -> dict | None:
                     f"published catalog is stale (generated {generated_at}, "
                     f"{age_days:.0f} days old); using it anyway"
                 )
+    # A v4 catalog is the stable deploy-skew state: its envelope is
+    # deliberately empty (no hydration), but caching it prevents a
+    # refetch-every-run loop. Older/unknown schemas and malformed v5
+    # payloads still self-heal by staying uncached.
+    if usable or (type(schema_version) is int and schema_version == 4):
         if not args.no_cache:
             save_cache(QUALITY_CATALOG_CACHE, result)
     return result
@@ -1411,23 +1566,31 @@ FRONTEND_DISCOUNTS_CACHE = "openrouter-frontend-discounts"
 # v2: AA records are keyed by exact catalog slug and carry as_of (#17);
 # v1 cached the conflated date-stripped shape, so the old key is never read.
 FRONTEND_AA_CACHE = "openrouter-frontend-aa-v2"
+# The frontend listing projected to the reasoning fields (slug, permaslug,
+# supports_reasoning, reasoning_config). Cached separately so a fully cached
+# run keeps the reasoning fallback instead of degrading it to unknown.
+FRONTEND_REASONING_CACHE = "openrouter-frontend-reasoning-v1"
 
 
 def fetch_openrouter_frontend(args):
-    """Derive discounts, ZDR ids and OR-published AA benchmarks.
+    """Derive discounts, ZDR ids, OR-published AA benchmarks and reasoning.
 
-    Two loads: the base frontend URL serves discounts and benchmarks in one
-    response; the per-endpoint ZDR list serves ZDR and is skipped entirely
-    under --no-zdr. Each payload caches independently under its own key and is
-    cached only when non-empty, so a degraded payload self-heals on the
-    next run. A base-URL outage never blocks the ZDR fetch, and vice
-    versa. Returns (discounts, zdr_ids, aa_by_id, cache_hits) where
+    Two loads: the base frontend URL serves discounts, benchmarks and the
+    per-model reasoning config in one response; the per-endpoint ZDR list
+    serves ZDR and is skipped entirely under --no-zdr. Each payload caches
+    independently under its own key and is cached only when non-empty, so a
+    degraded payload self-heals on the next run. A base-URL outage never
+    blocks the ZDR fetch, and vice versa. Returns
+    (discounts, zdr_ids, aa_by_id, cache_hits, frontend_models) where
     cache_hits names the payloads served from cache ("discounts", "zdr",
-    "aa").
+    "aa"), and frontend_models is the frontend listing projected to the
+    fields build_reasoning_metadata needs (slug, permaslug,
+    supports_reasoning, reasoning_config).
     """
     discounts = {}
     aa_by_id = {}
     zdr_ids = set()
+    frontend_models = []
     cache_hits = set()
 
     aa_from_cache = False
@@ -1441,6 +1604,9 @@ def fetch_openrouter_frontend(args):
             aa_by_id = cached
             aa_from_cache = True
             cache_hits.add("aa")
+        cached = load_cache(FRONTEND_REASONING_CACHE, args.cache_ttl)
+        if cached:
+            frontend_models = cached
 
     if not discounts or not aa_from_cache:
         try:
@@ -1490,21 +1656,31 @@ def fetch_openrouter_frontend(args):
                         "no AA benchmark entries found; treating OpenRouter "
                         "benchmarks as unavailable"
                     )
+            fresh_reasoning = _frontend_reasoning_entries(entries)
+            if fresh_reasoning:
+                frontend_models = fresh_reasoning
+                save_cache(FRONTEND_REASONING_CACHE, frontend_models)
 
     if args.no_zdr:
-        return discounts, zdr_ids, aa_by_id, cache_hits
+        return discounts, zdr_ids, aa_by_id, cache_hits, frontend_models
     if not args.no_cache:
         # v3: the id set now comes from the per-endpoint ZDR list; v1/v2
         # sets were derived from the models/find response and must never
         # be read.
         cached = load_cache("openrouter-zdr-v3", args.cache_ttl)
         if cached:
-            return discounts, set(cached), aa_by_id, cache_hits | {"zdr"}
+            return (
+                discounts,
+                set(cached),
+                aa_by_id,
+                cache_hits | {"zdr"},
+                frontend_models,
+            )
     try:
         payload = fetch_json(OPENROUTER_ZDR_URL, timeout=30)
     except Exception as exc:
         warn(f"could not fetch ZDR data: {exc}")
-        return discounts, zdr_ids, aa_by_id, cache_hits
+        return discounts, zdr_ids, aa_by_id, cache_hits, frontend_models
     # One entry per ZDR endpoint, keyed by the exact model id (variants
     # such as :free are listed individually). An id is ZDR iff it has at
     # least one ZDR endpoint. The models/find ?zdr=true filter cannot be
@@ -1530,9 +1706,9 @@ def fetch_openrouter_frontend(args):
             ids.add(model_id)
     if not ids:
         warn("no ZDR entries found; treating ZDR data as unavailable")
-        return discounts, zdr_ids, aa_by_id, cache_hits
+        return discounts, zdr_ids, aa_by_id, cache_hits, frontend_models
     save_cache("openrouter-zdr-v3", sorted(ids))
-    return discounts, ids, aa_by_id, cache_hits
+    return discounts, ids, aa_by_id, cache_hits, frontend_models
 
 
 def parse_price(value) -> float | None:
@@ -1959,18 +2135,146 @@ def parse_iso_datetime(value):
 # Artificial Analysis intelligence index
 # ---------------------------------------------------------------------------
 
+_AA_DISCRETE_EFFORTS = frozenset(("max", "xhigh", "high", "medium", "low", "minimal"))
+_AA_TRAILING_PAREN_RE = re.compile(r"\s*\(([^()]*)\)\s*$")
+_AA_SLUG_EFFORT_RE = re.compile(
+    r"-(max|xhigh|high|medium|low|minimal|non-reasoning|reasoning)$", re.IGNORECASE
+)
+_AA_SLUG_EFFORT_LABELS = {
+    "max": "max",
+    "xhigh": "xhigh",
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+    "minimal": "minimal",
+    "non-reasoning": "none",
+    "reasoning": "reasoning",
+}
+# Shapes (normalized parenthetical text, or the no-label case) already
+# warned about. Spec §6.1: one warning per unknown row shape, not per row.
+_AA_WARNED_UNKNOWN_SHAPES: set[str] = set()
+
+
+def _classify_aa_effort_tokens(raw: str) -> tuple[str | None, bool]:
+    """Classify one name parenthetical's comma-separated tokens.
+
+    "Default Fallback" is a qualifier, not a label. A parenthetical that
+    names two different states -- two discrete efforts, or non-reasoning
+    plus an effort -- is ambiguous: no effort, never guessed.
+    """
+    labels = set()
+    for token in (raw or "").split(","):
+        token = token.strip().lower()
+        if not token or token == "default fallback":
+            continue
+        if token in _AA_DISCRETE_EFFORTS:
+            labels.add(token)
+        elif token == "non-reasoning":
+            labels.add("none")
+        elif token == "reasoning":
+            labels.add("reasoning")
+    if len(labels) > 1:
+        return None, True
+    if labels:
+        return labels.pop(), False
+    return None, False
+
+
+def _warn_unknown_aa_shape(parenthetical: str | None) -> None:
+    """Warn once per distinct unrecognized effort shape (spec §6.1)."""
+    if parenthetical is not None:
+        detail = f"parenthetical {parenthetical!r}"
+        shape = "parenthetical:" + norm_key(parenthetical)
+    else:
+        detail = "no effort label"
+        shape = "no-effort-label"
+    if shape in _AA_WARNED_UNKNOWN_SHAPES:
+        return
+    _AA_WARNED_UNKNOWN_SHAPES.add(shape)
+    warn(f"AA row has an unrecognized effort shape ({detail}); row is display-only")
+
+
+def parse_aa_effort(name: str, slug: str) -> dict:
+    """Split an AA row's name/slug into its base model and effort label.
+
+    The name's trailing parenthetical is authoritative; when it names no
+    effort (and is not ambiguous) the slug suffix is the fallback. Returns
+    base_name/base_slug with the label stripped, effort (None when unknown
+    or ambiguous), and ambiguous=True for contradictory labels such as
+    "(Non-reasoning, High)" or "(High, Max)". Ambiguous and unknown rows
+    are display-only: callers must never guess an effort for them.
+    """
+    name = name if isinstance(name, str) else ""
+    slug = slug if isinstance(slug, str) else ""
+
+    name_match = _AA_TRAILING_PAREN_RE.search(name)
+    if name_match:
+        base_name = name[: name_match.start()].strip()
+        effort, ambiguous = _classify_aa_effort_tokens(name_match.group(1))
+    else:
+        base_name = name.strip()
+        effort, ambiguous = None, False
+
+    slug_match = _AA_SLUG_EFFORT_RE.search(slug)
+    if slug_match:
+        base_slug = slug[: slug_match.start()]
+        slug_effort = _AA_SLUG_EFFORT_LABELS[slug_match.group(1).lower()]
+    else:
+        base_slug = slug
+        slug_effort = None
+
+    if effort is None and not ambiguous:
+        effort = slug_effort
+
+    if effort is None and not ambiguous:
+        _warn_unknown_aa_shape(name_match.group(1) if name_match is not None else None)
+
+    return {
+        "base_name": base_name,
+        "base_slug": base_slug,
+        "effort": effort,
+        "ambiguous": ambiguous,
+    }
+
+
+def _finite_cost(value) -> float | None:
+    """A finite float cost, or None for absent/non-numeric/non-finite input."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        value = float(value)  # huge ints raise OverflowError
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _aa_cost_per_task(item: dict) -> float | None:
+    """AA's measured cost per benchmark task, or None when not reported."""
+    block = item.get("artificial_analysis_intelligence_index_cost")
+    if not isinstance(block, dict):
+        return None
+    cost_per_task = block.get("cost_per_task")
+    if not isinstance(cost_per_task, dict):
+        return None
+    return _finite_cost(cost_per_task.get("total_cost"))
+
 
 def aa_api_entries(api_key: str) -> tuple[list, float | int | None]:
     """Intelligence entries from AA's V2 language models endpoint.
 
     Documented envelope: {tier, intelligence_index_version, pagination,
     data[]} with snake_case fields; the index lives at
-    data[].evaluations.artificial_analysis_intelligence_index. Items
-    without a usable slug/name or without a finite numeric index are
-    skipped (nulls mean "not measured"). Pagination follows the documented
-    has_more/total_pages contract with a 25-page hard cap; a failure past
-    page 1 is best-effort (warn, keep earlier pages), a page-1 failure
-    propagates.
+    data[].evaluations.artificial_analysis_intelligence_index and the
+    measured benchmark cost at
+    data[].artificial_analysis_intelligence_index_cost.cost_per_task.total_cost.
+    AA returns one row per measured reasoning-effort variant; the effort is
+    parsed from the row's name/slug by parse_aa_effort. Items without a
+    usable slug/name or without a finite numeric index are skipped (nulls
+    mean "not measured"). Rows are deduped by their AA `id` (fallback
+    (slug, name)), never by slug alone: variants often share a slug.
+    Pagination follows the documented has_more/total_pages contract with a
+    25-page hard cap; a failure past page 1 is best-effort (warn, keep
+    earlier pages), a page-1 failure propagates.
 
     Returns (entries, version): version is the envelope's
     intelligence_index_version (number-or-null) -- provenance for the whole
@@ -2030,18 +2334,36 @@ def aa_api_entries(api_key: str) -> tuple[list, float | int | None]:
                 continue
             if not math.isfinite(index):
                 continue
-            entries.setdefault(
-                key,
-                {
-                    "key": key,
-                    "name": name if isinstance(name, str) and name else key,
-                    "index": index,
-                    # One fetch timestamp for the whole fetch: every entry
-                    # from this run shares it, so the cache payload and any
-                    # downstream record can date the data exactly.
-                    "as_of": as_of,
-                },
-            )
+            entry_id = item.get("id")
+            entry_id = entry_id if isinstance(entry_id, str) and entry_id else None
+            slug = slug if isinstance(slug, str) and slug else None
+            raw_name = name if isinstance(name, str) and name else ""
+            parsed = parse_aa_effort(raw_name, slug or "")
+            name = raw_name or key
+            dedupe_key = entry_id if entry_id else (slug, name)
+            if dedupe_key in entries:
+                continue
+            creator = None
+            raw_creator = item.get("model_creator")
+            if isinstance(raw_creator, dict):
+                raw_creator_name = raw_creator.get("name")
+                if isinstance(raw_creator_name, str) and raw_creator_name:
+                    creator = raw_creator_name
+            entries[dedupe_key] = {
+                "key": key,
+                "name": name,
+                "index": index,
+                # One fetch timestamp for the whole fetch: every entry
+                # from this run shares it, so the cache payload and any
+                # downstream record can date the data exactly.
+                "as_of": as_of,
+                "id": entry_id,
+                "slug": slug,
+                "base": parsed["base_slug"] or parsed["base_name"],
+                "effort": parsed["effort"],
+                "creator": creator,
+                "cost_per_task": _aa_cost_per_task(item),
+            }
         pag = payload.get("pagination") if isinstance(payload, dict) else None
         if not isinstance(pag, dict):
             break  # undocumented shape: single-page degrade
@@ -2070,10 +2392,10 @@ def fetch_aa_entries(args):
     ones.
     """
     if not args.no_cache:
-        # v3: payloads cached under earlier keys predate the as_of stamp and
-        # the intelligence_index_version capture and must never be read.
-        # Only AA API entries are read; build_catalog rejects any other
-        # source as unknown.
+        # v4: payloads cached under earlier keys predate the per-effort
+        # fields (id, base, effort, creator, cost_per_task) and must never
+        # be read. Only AA API entries are read; build_catalog rejects any
+        # other source as unknown.
         cached = load_cache(AA_ENTRIES_CACHE, args.cache_ttl)
         if isinstance(cached, dict) and cached.get("source") == "AA API v2":
             return (
@@ -2103,6 +2425,26 @@ def fetch_aa_entries(args):
 # ---------------------------------------------------------------------------
 # Matching AA entries to OpenRouter model ids
 # ---------------------------------------------------------------------------
+
+
+def dedupe_aa_entries_by_key(entries):
+    """Restore the legacy lookup's one-entry-per-key contract.
+
+    The depth path keeps every effort variant (aa_api_entries dedupes by AA
+    id), but build_aa_lookup expects the old slug-keyed selection: for each
+    `key`, the first occurrence in list order wins. This is the seam between
+    the per-effort ingestion and the unchanged legacy matcher.
+    """
+    unique = []
+    seen = set()
+    for entry in entries:
+        key = entry.get("key")
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        unique.append(entry)
+    return unique
 
 
 def build_aa_lookup(entries):
@@ -2143,6 +2485,167 @@ def build_aa_lookup(entries):
         if tokens:
             fuzzy.append((tokens, (index, as_of)))
     return exact, fuzzy
+
+
+def build_aa_depth_lookup(entries):
+    """Index AA entries as base key -> effort -> depth record.
+
+    Each record is normalized for downstream publication:
+    {"effort", "index", "cost_per_task_usd", "source": "aa", "as_of"}.
+    Rows whose effort is absent or ambiguous are display-only and skipped.
+    Duplicate (base key, effort) records from different AA rows are stored
+    as None (ambiguous: matched as absent), never guessed. Base keys come
+    from the name and slug with the effort label stripped, both
+    unqualified and creator-qualified ("<creator_norm>:<base_key>"), where
+    creator_norm is normalize_provider(model_creator.name).
+    """
+    lookup = {}
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        dedupe_key = (
+            entry_id
+            if isinstance(entry_id, str) and entry_id
+            else (entry.get("slug"), entry.get("name"))
+        )
+        if dedupe_key in seen:
+            continue
+        parsed = parse_aa_effort(entry.get("name") or "", entry.get("slug") or "")
+        effort = parsed["effort"]
+        if not effort or parsed["ambiguous"]:
+            continue
+        raw_index = entry.get("index")
+        if not isinstance(raw_index, (int, float)) or isinstance(raw_index, bool):
+            continue
+        index = float(raw_index)
+        if not math.isfinite(index):
+            continue
+        seen.add(dedupe_key)
+        record = {
+            "effort": effort,
+            "index": index,
+            "cost_per_task_usd": _finite_cost(entry.get("cost_per_task")),
+            "source": "aa",
+            "as_of": (
+                entry.get("as_of") if isinstance(entry.get("as_of"), str) else None
+            ),
+        }
+        base_keys = []
+        for base in (parsed["base_name"], parsed["base_slug"]):
+            normalized = norm_key(base)
+            if normalized and normalized not in base_keys:
+                base_keys.append(normalized)
+        creator = entry.get("creator")
+        if not isinstance(creator, str) or not creator:
+            raw_creator = entry.get("model_creator")
+            if isinstance(raw_creator, dict) and isinstance(
+                raw_creator.get("name"), str
+            ):
+                creator = raw_creator["name"]
+        creator_norm = normalize_provider(creator) if isinstance(creator, str) else ""
+        keys = list(base_keys)
+        if creator_norm:
+            keys.extend(f"{creator_norm}:{base_key}" for base_key in base_keys)
+        for base_key in keys:
+            efforts = lookup.setdefault(base_key, {})
+            if effort in efforts:
+                efforts[effort] = None
+            else:
+                efforts[effort] = record
+    return lookup
+
+
+def _depth_group(model, lookup):
+    """The candidate's matching base group (effort -> record), or None.
+
+    Exact tiers only, in the legacy order: full id, base id, display name,
+    display name sans parentheticals. At each tier the creator-qualified
+    key (the OpenRouter author prefix normalized with normalize_provider)
+    is tried before the unqualified key. The first tier that resolves a
+    base group wins; a tier whose group lacks the requested effort yields
+    nothing rather than falling through to a lower tier. Ambiguous
+    (base, effort) records are stored as None by build_aa_depth_lookup and
+    match as absent; exact-key lookup means one tier cannot otherwise
+    resolve to multiple base groups. The fuzzy pass is never used here --
+    it is the #17 conflation bug.
+    """
+    if not isinstance(lookup, dict):
+        return None
+    model_id = model.get("id") or ""
+    name = model.get("name") or ""
+    display = PROVIDER_PREFIX_RE.sub("", name).strip()
+    without_variant = model_id.split(":", 1)[0]
+    _, _, base = without_variant.partition("/")
+    creator = normalize_provider(without_variant.partition("/")[0])
+    for raw in (model_id, base, display, PAREN_RE.sub(" ", display)):
+        normalized = norm_key(raw)
+        if not normalized:
+            continue
+        if creator:
+            qualified = lookup.get(f"{creator}:{normalized}")
+            if qualified is not None:
+                return qualified
+        group = lookup.get(normalized)
+        if group is not None:
+            return group
+    return None
+
+
+def match_depth_quality(model, lookup, effort):
+    """The depth record at `effort` for the candidate, or None.
+
+    Strict selection: a matched base group with no record at this exact
+    effort yields None. Another effort is never substituted, and the
+    caller must not fall through to a lower tier.
+    """
+    if not effort:
+        return None
+    group = _depth_group(model, lookup)
+    if group is None:
+        return None
+    return group.get(effort)
+
+
+def _ordered_depth_records(group):
+    """Measured depth records from an effort-keyed group, display-ordered.
+
+    Skips ambiguous/absent entries (a None record) and any record without a
+    finite index. Every record carries the internal shape resolve_quality
+    attaches to cand["reasoning_depths"]:
+    {"effort", "index", "cost_per_task_usd", "source", "as_of"}.
+    """
+    records = []
+    for effort, record in (group or {}).items():
+        if not isinstance(record, dict):
+            continue
+        index = record.get("index")
+        if (
+            not isinstance(index, (int, float))
+            or isinstance(index, bool)
+            or not math.isfinite(index)
+        ):
+            continue
+        records.append(
+            {
+                "effort": record.get("effort") or effort,
+                "index": float(index),
+                "cost_per_task_usd": record.get("cost_per_task_usd"),
+                "source": record.get("source"),
+                "as_of": record.get("as_of"),
+            }
+        )
+
+    def order(record):
+        effort = record["effort"]
+        try:
+            return (AA_EFFORT_ORDER.index(effort), effort)
+        except ValueError:
+            return (len(AA_EFFORT_ORDER), effort or "")
+
+    records.sort(key=order)
+    return records
 
 
 def match_quality(model, exact, fuzzy, allow_fuzzy=False):
@@ -2191,6 +2694,67 @@ def base_model_id(model_id: str) -> str:
 
 
 AA_BENCHMARK_FIELDS = ("intelligence_index", "coding_index", "agentic_index")
+
+
+def _pair_permaslug_payloads(valid, models):
+    """Resolve permaslug-keyed payloads to exact catalog slugs.
+
+    ``valid`` maps a permaslug (or an undated catalog id) to
+    ``(payload, date)``, where ``date`` is the key's trailing -YYYYMMDD or
+    "" for an undated key. ``models`` carries the catalog's own
+    slug/permaslug pairing. The three passes are the #17-safe pairing
+    documented on build_aa_benchmarks: permaslug pairs first (latest date
+    wins per slug), then undated keys self-map, then an unambiguous dated
+    strip. Returns ``{slug: (payload, date)}``.
+    """
+    permaslug_to_slug = {}
+    for entry in models or []:
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get("slug") or ""
+        permaslug = entry.get("permaslug") or ""
+        if slug and permaslug:
+            # standard and batch variants repeat an identical pair; the
+            # overwrite is the dedup
+            permaslug_to_slug[permaslug] = slug
+
+    paired = {}
+    claimed = set()
+
+    # Pass 1: permaslug keys pair with their own slug; same-slug
+    # snapshots resolve to the latest date (first wins on an equal date).
+    seen_date = {}
+    for key, (payload, date) in valid.items():
+        slug = permaslug_to_slug.get(key)
+        if slug is None or (slug in seen_date and seen_date[slug] >= date):
+            continue
+        seen_date[slug] = date
+        paired[slug] = (payload, date)
+        claimed.add(slug)
+
+    # Pass 2: undated keys self-map unless pass 1 claimed the id.
+    for key, (payload, date) in valid.items():
+        if date or key in permaslug_to_slug or key in claimed:
+            continue
+        paired[key] = (payload, date)
+        claimed.add(key)
+
+    # Pass 3: unpaired dated keys strip, but only onto an unclaimed id
+    # and only when the strip is unambiguous.
+    strip_candidates = {}
+    for key, (payload, date) in valid.items():
+        if not date or key in permaslug_to_slug:
+            continue
+        stripped = strip_permaslug_date(key)
+        strip_candidates.setdefault(stripped, []).append((date, payload))
+    for bare, candidates in strip_candidates.items():
+        if bare in claimed or len(candidates) > 1:
+            continue
+        date, payload = candidates[0]
+        paired[bare] = (payload, date)
+        claimed.add(bare)
+
+    return paired
 
 
 def build_aa_benchmarks(benchmarks, models=None) -> dict:
@@ -2244,131 +2808,421 @@ def build_aa_benchmarks(benchmarks, models=None) -> dict:
         # the key was dated; the date is then the final 8 characters.
         valid[key] = (trio, "" if bare == key else key[-8:])
 
-    permaslug_to_slug = {}  # the catalog's own slug/permaslug pairing
-    for entry in models or []:
+    paired = _pair_permaslug_payloads(valid, models)
+    return {
+        slug: {**trio, "as_of": date or None} for slug, (trio, date) in paired.items()
+    }
+
+
+FRONTEND_REASONING_FIELDS = (
+    "slug",
+    "permaslug",
+    "supports_reasoning",
+    "reasoning_config",
+)
+
+
+def _frontend_reasoning_entries(entries):
+    """Project frontend model entries to the fields reasoning metadata needs."""
+    projected = []
+    for entry in entries or []:
         if not isinstance(entry, dict):
             continue
         slug = entry.get("slug") or ""
+        if slug.startswith("~"):
+            continue
+        if not (slug or entry.get("permaslug")):
+            continue
+        projected.append(
+            {field: entry.get(field) for field in FRONTEND_REASONING_FIELDS}
+        )
+    return projected
+
+
+def _effort_list(value):
+    """Expand a supported-efforts field; null means all gateway efforts."""
+    if value is None:
+        return list(REASONING_GATEWAY_EFFORTS)
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [effort for effort in value if isinstance(effort, str)]
+
+
+def _reasoning_field(primary, config, primary_key, frontend_key):
+    """Field precedence: models API field, then frontend config, then unknown."""
+    if isinstance(primary, dict) and primary_key in primary:
+        return primary[primary_key]
+    if isinstance(config, dict) and frontend_key in config:
+        return config[frontend_key]
+    return None
+
+
+def _optional_bool(value, field):
+    """A published boolean field: bool, or null when the source is unknown.
+
+    Spec 9.1 publishes ``supports_max_tokens`` as bool or null. The old
+    bool() coercion conflated an omitted/unknown field with false. Explicit
+    booleans pass through; common string forms are coerced; anything else
+    warns and degrades to null (fail closed, never guess).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no"):
+            return False
+    warn(f"unexpected reasoning.{field} value {value!r}; treating it as unknown")
+    return None
+
+
+def _optional_effort(value):
+    """A published effort label: a non-empty string, or null when unknown.
+
+    Malformed external metadata must degrade to unknown rather than poison
+    the published catalog (the catalog validator rejects a non-string
+    default_effort, which would fail the whole artifact).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value
+    warn(f"unexpected reasoning.default_effort value {value!r}; treating it as unknown")
+    return None
+
+
+def _supported_efforts(primary, config):
+    """The expanded effort list; an omitted field stays empty.
+
+    The models API object is authoritative for effort selection: when it is
+    present but omits supported_efforts, the model has no discrete efforts
+    (single-state), even if the frontend's null "all efforts" marker would
+    expand. The frontend list is only consulted when the primary object is
+    absent entirely.
+    """
+    if isinstance(primary, dict):
+        if "supported_efforts" in primary:
+            return _effort_list(primary["supported_efforts"])
+        return []
+    if isinstance(config, dict) and "supported_reasoning_efforts" in config:
+        return _effort_list(config["supported_reasoning_efforts"])
+    return []
+
+
+def effective_default_effort(reasoning: dict | None) -> str | None:
+    """The effort a request with no ``reasoning`` field actually runs at (§5.2).
+
+    Single-state/token-budget models (no discrete efforts after expansion)
+    resolve to ``reasoning`` or ``none`` by ``default_enabled``; that branch
+    runs before the discrete-effort rules. Non-reasoning models are ``none``;
+    missing metadata is unknown (None).
+    """
+    if not isinstance(reasoning, dict):
+        return None
+    if reasoning.get("is_reasoning") is False:
+        return "none"
+    if reasoning.get("is_reasoning") is not True:
+        return None
+    efforts = reasoning.get("supported_efforts") or []
+    mandatory = reasoning.get("mandatory")
+    default_enabled = reasoning.get("default_enabled")
+    if mandatory is True and default_enabled is False:
+        warn(
+            "contradictory reasoning metadata: mandatory=true with "
+            "default_enabled=false; treating the effective default as unknown"
+        )
+        return None
+    if not efforts:
+        # Single-state or token-budget model: reasoning is one state.
+        return "reasoning" if default_enabled is not False else "none"
+    if default_enabled is False:
+        return "none"
+    default_effort = reasoning.get("default_effort")
+    if default_effort == "none":
+        return "none"
+    if isinstance(default_effort, str) and default_effort:
+        return default_effort
+    return None
+
+
+def supports_effort(reasoning: dict | None, effort: str) -> bool:
+    """Whether a model can run ``effort`` (the §7 filter rule)."""
+    if not isinstance(reasoning, dict):
+        return False
+    efforts = reasoning.get("supported_efforts") or []
+    if effort in efforts:
+        return True
+    if effort == "none":
+        if reasoning.get("is_reasoning") is False:
+            return True
+        # A non-mandatory single-state model exposes a reasoning toggle.
+        return (
+            not efforts
+            and reasoning.get("is_reasoning") is True
+            and reasoning.get("mandatory") is not True
+        )
+    if effort == "reasoning":
+        return not efforts and reasoning.get("is_reasoning") is True
+    return False
+
+
+def build_reasoning_metadata(
+    models: list[dict], frontend_models: list[dict] | None = None
+) -> dict[str, dict]:
+    """Per-model reasoning metadata, models API first and frontend second.
+
+    Each value carries the raw flags for provenance plus the *effective*
+    default effort (§5.2) and the expanded supported-effort list. Frontend
+    entries are keyed by slug/permaslug, so they attach to a candidate id
+    through the same three-pass pairing build_aa_benchmarks uses.
+    """
+    models = [
+        model for model in models or [] if isinstance(model, dict) and model.get("id")
+    ]
+    frontend_models = _frontend_reasoning_entries(frontend_models)
+
+    valid = {}
+    for entry in frontend_models:
+        slug = entry.get("slug") or ""
         permaslug = entry.get("permaslug") or ""
-        if slug and permaslug:
-            # standard and batch variants repeat an identical pair; the
-            # overwrite is the dedup
-            permaslug_to_slug[permaslug] = slug
-
-    aa_by_id = {}
-    claimed = set()
-
-    def record(trio, date):
-        return {**trio, "as_of": date or None}
-
-    # Pass 1: permaslug keys pair with their own slug; same-slug
-    # snapshots resolve to the latest date (first wins on an equal date).
-    seen_date = {}
-    for key, (trio, date) in valid.items():
-        slug = permaslug_to_slug.get(key)
-        if slug is None or (slug in seen_date and seen_date[slug] >= date):
+        key = permaslug or slug
+        if not key:
             continue
-        seen_date[slug] = date
-        aa_by_id[slug] = record(trio, date)
-        claimed.add(slug)
+        bare = strip_permaslug_date(key)
+        valid[key] = (entry, "" if bare == key else key[-8:])
+        if slug and slug != key:
+            # The undated slug is the exact-id self-map (pass 2). Keep it
+            # even when a dated permaslug is present, so a listing whose
+            # permaslug is unpaired still resolves by its own id.
+            valid[slug] = (entry, "")
 
-    # Pass 2: undated keys self-map unless pass 1 claimed the id.
-    for key, (trio, date) in valid.items():
-        if date or key in permaslug_to_slug or key in claimed:
-            continue
-        aa_by_id[key] = record(trio, date)
-        claimed.add(key)
+    catalog_pairs = [
+        {"slug": model["id"], "permaslug": model.get("canonical_slug") or ""}
+        for model in models
+    ]
+    frontend_by_id = {
+        candidate_id: entry
+        for candidate_id, (entry, _date) in _pair_permaslug_payloads(
+            valid, catalog_pairs
+        ).items()
+    }
+    # Exact-slug self-map. The permaslug pairing is authoritative when it
+    # resolves a listing, but a shared canonical slug (base and :batch) is
+    # claimed by only one listing, so the other still needs its own slug.
+    frontend_by_slug = {
+        entry["slug"]: entry for entry in frontend_models if entry.get("slug")
+    }
 
-    # Pass 3: unpaired dated keys strip, but only onto an unclaimed id
-    # and only when the strip is unambiguous.
-    strip_candidates = {}
-    for key, (trio, date) in valid.items():
-        if not date or key in permaslug_to_slug:
-            continue
-        stripped = strip_permaslug_date(key)
-        strip_candidates.setdefault(stripped, []).append((date, trio))
-    for bare, candidates in strip_candidates.items():
-        if bare in claimed or len(candidates) > 1:
-            continue
-        date, trio = candidates[0]
-        aa_by_id[bare] = record(trio, date)
-        claimed.add(bare)
+    metadata = {}
+    for model in models:
+        model_id = model["id"]
+        primary = model.get("reasoning")
+        if not isinstance(primary, dict):
+            primary = None
+        entry = frontend_by_id.get(model_id) or frontend_by_slug.get(model_id)
+        config = None
+        supports_reasoning = None
+        if isinstance(entry, dict):
+            config = entry.get("reasoning_config")
+            if not isinstance(config, dict):
+                config = None
+            supports_reasoning = entry.get("supports_reasoning")
 
-    return aa_by_id
+        if primary is not None:
+            is_reasoning = True
+        elif isinstance(supports_reasoning, bool):
+            is_reasoning = supports_reasoning
+        else:
+            is_reasoning = None
+
+        reasoning = {
+            "default_effort": _optional_effort(
+                _reasoning_field(
+                    primary, config, "default_effort", "default_reasoning_effort"
+                )
+            ),
+            "supported_efforts": _supported_efforts(primary, config),
+            "default_enabled": _optional_bool(
+                _reasoning_field(
+                    primary, config, "default_enabled", "default_reasoning_enabled"
+                ),
+                "default_enabled",
+            ),
+            "mandatory": _optional_bool(
+                _reasoning_field(
+                    primary, config, "mandatory", "is_mandatory_reasoning"
+                ),
+                "mandatory",
+            ),
+            "supports_max_tokens": _optional_bool(
+                _reasoning_field(
+                    primary,
+                    config,
+                    "supports_max_tokens",
+                    "supports_reasoning_max_tokens",
+                ),
+                "supports_max_tokens",
+            ),
+            "is_reasoning": is_reasoning,
+        }
+        reasoning["default_effort"] = effective_default_effort(reasoning)
+        metadata[model_id] = reasoning
+    return metadata
 
 
 def resolve_quality(
-    candidates, aa_by_id, exact, fuzzy, aa_source, catalog_quality=None
+    candidates,
+    aa_by_id,
+    exact,
+    fuzzy,
+    aa_source,
+    catalog_quality=None,
+    *,
+    depth_lookup=None,
+    catalog_depths=None,
+    requested_effort="default",
 ):
     """Per-candidate quality records: AA API primary, catalog next, OR last.
 
-    Resolution order per candidate (inverted from the pre-reconciliation
-    behavior where OpenRouter's benchmarks won):
-      1. AA API entries -- match_quality's exact tiers (fuzzy stays off in
-         production: it is the proven variant-conflation bug).
-      2. catalog_quality -- records hydrated from the published catalog on
-         unkeyed runs. Every winner is labeled "catalog": the run-level
-         provenance is the source chain (read from our published catalog),
-         overriding the row's own "aa"/"openrouter" label -- that label is
-         the keyed CI run's row-level truth inside the artifact, and no
-         real catalog row ever carries "catalog". as_of stays the row's
-         own stamp.
-      3. OpenRouter's benchmark trio -- per-slug, matched via
-         base_model_id, so a :variant suffix inherits its base's trio.
-      4. No match -- the candidate stays quality-blind downstream.
+    Depth-aware mode (either new input is not None; run() always passes the
+    AA depth lookup) selects the record at the requested effort -- the
+    candidate's effective default when requested_effort is "default", else
+    the explicit --reasoning-effort value. Resolution order per candidate:
+      1. AA depth lookup -- match_depth_quality's exact tiers. source "aa",
+         effort from the record.
+      2. catalog_depths -- the published catalog's per-model depth map,
+         re-selected at the LIVE effective default (which may differ from
+         the keyed run's recorded default). source "catalog", the record's
+         own as_of.
+      3. OpenRouter's benchmark trio -- only for a model known to be
+         non-reasoning (is_reasoning False) at effort "none". The trio has
+         no effort label, so a reasoning model never uses it as its main
+         score; unknown reasoning is not non-reasoning.
+      4. No record -- the candidate stays quality-blind.
 
-    Every winner is a record {"index", "source", "as_of", "drift",
-    "or_index", "or_as_of"}; compute_scores and build_schedules read
-    record["index"], so cand["quality"] stays the float index they already
-    expect. Drift is computed only when the winner is NOT OpenRouter: the
-    OR trio for the same base model acts as the check value, and a
-    disagreement of >= 3.0 points flags the record. When the winner IS
-    OpenRouter (or no OR value exists) the drift pair is None -- there is
-    no second source to disagree with.
+    Strict selection: a matched base group with no record at the requested
+    effort yields nothing at that tier. Another effort is never
+    substituted, and a reasoning model never falls through to the OR trio.
+
+    The legacy path (both new inputs None) keeps the pre-depth behavior:
+    match_quality's exact tiers, then the hydrated catalog_quality by id,
+    then the OR trio for any model.
+
+    Every depth-mode record is {"index", "source", "as_of", "effort",
+    "drift", "or_index", "or_as_of"}; legacy records omit "effort".
+    Drift is computed only when the winner is not OpenRouter and only
+    like-for-like: the old |index - or_index| >= 3.0 rule applies at effort
+    "none"; any other effort keeps the OR reference but sets drift None.
+    cand["reasoning_depths"] carries the full measured depth list (AA or
+    catalog group, or the single OR "none" record). The list is single-source:
+    it comes from whichever tier supplied the main record, and sources are
+    never merged.
     """
     quality_by_id = {}
     source_by_id = {}
+    depth_mode = depth_lookup is not None or catalog_depths is not None
     for cand in candidates:
         record = None
-        # Tier 1: AA API exact match. match_quality returns the winning
-        # entry's (index, as_of) pair.
-        match = match_quality({"id": cand["id"], "name": cand["name"]}, exact, fuzzy)
-        if match is not None:
-            index, as_of = match
-            record = {"index": index, "source": "aa", "as_of": as_of}
-        # Tier 2: catalog record (unkeyed runs hydrate from the published
-        # catalog). The run-level provenance label is the source chain:
-        # every hydrated record is tagged "catalog" -- read from our
-        # published catalog -- overriding the row's own label, which is
-        # the keyed CI run's row-level truth inside the artifact ("aa"/
-        # "openrouter"; no real catalog row ever carries "catalog").
-        # as_of stays the row's own stamp (v4 rows carry the CI run's
-        # recorded quality_as_of; v3 rows the catalog's generated_at --
-        # catalog_quality_by_id normalizes that).
-        if record is None and catalog_quality is not None:
-            catalog_record = catalog_quality.get(cand["id"])
-            if catalog_record is not None:
-                record = {
-                    "index": catalog_record["index"],
-                    "source": "catalog",
-                    "as_of": catalog_record["as_of"],
-                }
-        # Tier 3: OpenRouter's per-slug benchmark trio (last resort).
-        if record is None:
-            bench = aa_by_id.get(base_model_id(cand["id"]))
-            intelligence = bench.get("intelligence_index") if bench else None
-            if intelligence is not None:
-                record = {
-                    "index": intelligence,
-                    "source": "openrouter",
-                    "as_of": bench.get("as_of"),
-                }
+        if depth_mode:
+            effort = (
+                requested_effort
+                if requested_effort != "default"
+                else cand.get("default_effort")
+            )
+            measured = []
+            group = _depth_group(cand, depth_lookup) if depth_lookup else None
+            if group is not None:
+                measured = _ordered_depth_records(group)
+                depth_record = group.get(effort) if effort else None
+                if isinstance(depth_record, dict):
+                    record = {
+                        "index": depth_record["index"],
+                        "source": "aa",
+                        "as_of": depth_record.get("as_of"),
+                        "effort": depth_record.get("effort") or effort,
+                    }
+            if record is None and catalog_depths is not None:
+                catalog_entry = catalog_depths.get(cand["id"])
+                if isinstance(catalog_entry, dict):
+                    catalog_group = catalog_entry.get("depths")
+                    if isinstance(catalog_group, dict):
+                        measured = _ordered_depth_records(catalog_group)
+                        depth_record = catalog_group.get(effort) if effort else None
+                        if isinstance(depth_record, dict):
+                            record = {
+                                "index": depth_record["index"],
+                                "source": "catalog",
+                                "as_of": depth_record.get("as_of"),
+                                "effort": depth_record.get("effort") or effort,
+                            }
+            reasoning = cand.get("reasoning")
+            is_non_reasoning = (
+                isinstance(reasoning, dict) and reasoning.get("is_reasoning") is False
+            )
+            if record is None and is_non_reasoning and effort == "none":
+                bench = aa_by_id.get(base_model_id(cand["id"]))
+                intelligence = bench.get("intelligence_index") if bench else None
+                if intelligence is not None:
+                    record = {
+                        "index": intelligence,
+                        "source": "openrouter",
+                        "as_of": bench.get("as_of"),
+                        "effort": "none",
+                    }
+                    measured = [
+                        {
+                            "effort": "none",
+                            "index": intelligence,
+                            "cost_per_task_usd": None,
+                            "source": "openrouter",
+                            "as_of": bench.get("as_of"),
+                        }
+                    ]
+            cand["reasoning_depths"] = measured
+        else:
+            # Tier 1: AA API exact match. match_quality returns the winning
+            # entry's (index, as_of) pair.
+            match = match_quality(
+                {"id": cand["id"], "name": cand["name"]}, exact, fuzzy
+            )
+            if match is not None:
+                index, as_of = match
+                record = {"index": index, "source": "aa", "as_of": as_of}
+            # Tier 2: catalog record (unkeyed runs hydrate from the published
+            # catalog). The run-level provenance label is the source chain:
+            # every hydrated record is tagged "catalog" -- read from our
+            # published catalog -- overriding the row's own label, which is
+            # the keyed CI run's row-level truth inside the artifact ("aa"/
+            # "openrouter"; no real catalog row ever carries "catalog").
+            # as_of stays the row's own stamp.
+            if record is None and catalog_quality is not None:
+                catalog_record = catalog_quality.get(cand["id"])
+                if catalog_record is not None:
+                    record = {
+                        "index": catalog_record["index"],
+                        "source": "catalog",
+                        "as_of": catalog_record["as_of"],
+                    }
+            # Tier 3: OpenRouter's per-slug benchmark trio (last resort).
+            if record is None:
+                bench = aa_by_id.get(base_model_id(cand["id"]))
+                intelligence = bench.get("intelligence_index") if bench else None
+                if intelligence is not None:
+                    record = {
+                        "index": intelligence,
+                        "source": "openrouter",
+                        "as_of": bench.get("as_of"),
+                    }
         if record is None:
             continue
 
         # Drift: only meaningful when the winner is not OpenRouter itself.
         bench = aa_by_id.get(base_model_id(cand["id"])) or {}
         or_intelligence = bench.get("intelligence_index")
+        reasoning = cand.get("reasoning") or {}
         if (
             record["source"] in ("aa", "catalog")
             and isinstance(or_intelligence, (int, float))
@@ -2377,7 +3231,18 @@ def resolve_quality(
         ):
             record["or_index"] = or_intelligence
             record["or_as_of"] = bench.get("as_of")
-            record["drift"] = abs(record["index"] - or_intelligence) >= 3.0
+            # The comparable case is a non-reasoning MODEL at effort "none",
+            # not merely an effort label: a reasoning model whose effective
+            # default is "none" still has an OR snapshot measured at its
+            # reasoning state, so a difference may be a depth difference.
+            comparable = (not depth_mode) or (
+                reasoning.get("is_reasoning") is False
+                and record.get("effort") == "none"
+            )
+            if comparable:
+                record["drift"] = abs(record["index"] - or_intelligence) >= 3.0
+            else:
+                record["drift"] = None
         else:
             record["or_index"] = None
             record["or_as_of"] = None
@@ -2410,7 +3275,18 @@ def _per_1m(price_per_token: float) -> float:
 
 
 def build_schedules(
-    models, args, quality_by_id, aa_by_id, balanced_by_id, catalog_quality=None
+    models,
+    args,
+    quality_by_id,
+    aa_by_id,
+    balanced_by_id,
+    catalog_quality=None,
+    *,
+    depth_lookup=None,
+    catalog_depths=None,
+    reasoning_by_id=None,
+    requested_effort="default",
+    schedule_entries=None,
 ):
     """Catalog-wide off-peak index built from the RAW model list (spec 5.4).
 
@@ -2420,12 +3296,39 @@ def build_schedules(
     (~ids) and malformed ids are excluded; :batch variants are included as
     distinct deals. Sorted by id.
 
-    Quality falls back through the same chain resolve_quality walks, minus
-    its AA tier (the AA lookup only ever matched candidates): candidate
-    records, then the hydrated catalog (unkeyed runs), then OpenRouter's
-    benchmark trio. Every schedule row carries the winner's provenance
-    (quality_source/quality_as_of) so the site's QUAL tooltip can render.
+    Depth-aware mode (run() always supplies the AA depth lookup; an unkeyed
+    run supplies the catalog depth map and the published schedule entries)
+    follows spec 6.5:
+      0. ``schedule_entries`` (unkeyed runs): the published catalog's v5
+         schedules array is the source of truth for Deals. Whenever an
+         entry exists with a non-null quality AND a non-empty
+         ``quality_effort``, its quality and all three provenance fields
+         are copied VERBATIM (no run-level relabeling); requested_effort is
+         ignored because there is no depth list to re-select from. An entry
+         with no effort label is legacy/unknown (spec 6.5): its quality is
+         null and the lower tiers are skipped. A null-quality or absent
+         entry falls through to the tiers below.
+      1. AA depth lookup at the effective default effort (or the explicit
+         ``requested_effort``) -- keyed runs only.
+      2. Catalog depth map at the entry's recorded default effort -- unkeyed
+         runs use that provenance as-is, never re-selecting at the live
+         default.
+      3. Catalog main-quality map, only when the record carries an effort
+         (a record without one is legacy/unknown: quality stays null).
+      4. OpenRouter's benchmark trio, only for a model known to be
+         non-reasoning (``is_reasoning`` False) at effort "none". A
+         reasoning model never falls through to the trio: it has no effort
+         label, so using it would publish a max-effort snapshot as the
+         default.
+    Strict selection at tiers 1-2: a matched group with no record at the
+    selected effort yields nothing; another effort is never substituted.
+
+    The legacy path (both new inputs None) keeps the pre-depth fallback
+    chain: candidate record, hydrated catalog, then the OR trio. Every row
+    carries ``quality_effort`` (string or null) alongside the winning
+    record's provenance (quality_source/quality_as_of).
     """
+    depth_mode = depth_lookup is not None or catalog_depths is not None
     entries = []
     for model in models:
         model_id = model.get("id") or ""
@@ -2452,35 +3355,107 @@ def build_schedules(
         # quality_by_id values are records {"index", "source", ...}; the
         # schedule row keeps the bare float index verbatim (never a dict)
         # and echoes the winning record's provenance for the QUAL tooltip.
-        # Fallback chain mirrors resolve_quality's minus its AA tier:
-        # candidate record, hydrated catalog record (unkeyed runs; every
-        # hydrated record is relabeled with the run-level chain label
-        # "catalog", exactly like resolve_quality's catalog tier), then
-        # OpenRouter's benchmark trio (row label "openrouter").
-        record = quality_by_id.get(model_id)
-        if isinstance(record, dict):
-            quality = record.get("index")
-            quality_source = record.get("source")
-            quality_as_of = record.get("as_of")
+        quality = None
+        quality_source = None
+        quality_as_of = None
+        quality_effort = None
+        schedule_entry = (schedule_entries or {}).get(model_id)
+        if (
+            isinstance(schedule_entry, dict)
+            and schedule_entry.get("quality") is not None
+        ):
+            effort_label = schedule_entry.get("quality_effort")
+            if isinstance(effort_label, str) and effort_label:
+                # Unkeyed source of truth: recorded provenance verbatim.
+                quality = schedule_entry.get("quality")
+                quality_source = schedule_entry.get("quality_source")
+                quality_as_of = schedule_entry.get("quality_as_of")
+                quality_effort = effort_label
+            # else: a recorded entry with no effort label is legacy/unknown
+            # (spec 6.5): its quality is null, and the lower tiers are
+            # skipped rather than re-deriving a max-effort OR snapshot.
+        elif depth_mode:
+            reasoning = (reasoning_by_id or {}).get(model_id)
+            if not isinstance(reasoning, dict):
+                reasoning = None
+            effort = (
+                requested_effort
+                if requested_effort != "default"
+                else (reasoning or {}).get("default_effort")
+            )
+            # Tier 1: AA depth lookup (keyed runs).
+            group = _depth_group(model, depth_lookup) if depth_lookup else None
+            record = group.get(effort) if group is not None and effort else None
+            if isinstance(record, dict):
+                quality = record.get("index")
+                quality_source = "aa"
+                quality_as_of = record.get("as_of")
+                quality_effort = record.get("effort") or effort
+            # Tier 2: catalog depth map (unkeyed runs), recorded default
+            # effort as-is -- the keyed run's provenance, not a live
+            # re-selection.
+            if quality is None and catalog_depths is not None:
+                catalog_entry = catalog_depths.get(model_id)
+                if isinstance(catalog_entry, dict):
+                    recorded_default = catalog_entry.get("default_effort")
+                    group = catalog_entry.get("depths")
+                    record = (
+                        group.get(recorded_default)
+                        if isinstance(group, dict) and recorded_default
+                        else None
+                    )
+                    if isinstance(record, dict):
+                        quality = record.get("index")
+                        quality_source = "catalog"
+                        quality_as_of = record.get("as_of")
+                        quality_effort = record.get("effort") or recorded_default
+            # Tier 3: catalog main-quality map (unkeyed runs). A record with
+            # no quality_effort is legacy/unknown: null, never a guess.
+            if quality is None and catalog_quality is not None:
+                catalog_record = catalog_quality.get(model_id)
+                if isinstance(catalog_record, dict) and catalog_record.get("effort"):
+                    quality = catalog_record.get("index")
+                    quality_source = "catalog"
+                    quality_as_of = catalog_record.get("as_of")
+                    quality_effort = catalog_record.get("effort")
+            # Tier 4: OR trio only for known non-reasoning models.
+            if (
+                quality is None
+                and reasoning is not None
+                and reasoning.get("is_reasoning") is False
+            ):
+                benchmark = aa_by_id.get(base_model_id(model_id)) or {}
+                quality = benchmark.get("intelligence_index")
+                if quality is not None:
+                    quality_source = "openrouter"
+                    quality_as_of = benchmark.get("as_of")
+                    quality_effort = "none"
         else:
-            quality = record
-            quality_source = None
-            quality_as_of = None
-        if quality is None and catalog_quality is not None:
-            catalog_record = catalog_quality.get(model_id)
-            if catalog_record is not None:
-                quality = catalog_record["index"]
-                quality_source = "catalog"
-                quality_as_of = catalog_record["as_of"]
-        if quality is None:
-            benchmark = aa_by_id.get(base_model_id(model_id)) or {}
-            quality = benchmark.get("intelligence_index")
-            if quality is not None:
-                quality_source = "openrouter"
-                quality_as_of = benchmark.get("as_of")
+            # Legacy path: candidate record, hydrated catalog, OR trio.
+            record = quality_by_id.get(model_id)
+            if isinstance(record, dict):
+                quality = record.get("index")
+                quality_source = record.get("source")
+                quality_as_of = record.get("as_of")
+                quality_effort = record.get("effort")
             else:
-                quality_source = None
-                quality_as_of = None
+                quality = record
+            if quality is None and catalog_quality is not None:
+                catalog_record = catalog_quality.get(model_id)
+                if catalog_record is not None:
+                    quality = catalog_record["index"]
+                    quality_source = "catalog"
+                    quality_as_of = catalog_record["as_of"]
+                    quality_effort = catalog_record.get("effort")
+            if quality is None:
+                benchmark = aa_by_id.get(base_model_id(model_id)) or {}
+                quality = benchmark.get("intelligence_index")
+                if quality is not None:
+                    quality_source = "openrouter"
+                    quality_as_of = benchmark.get("as_of")
+                else:
+                    quality_source = None
+                    quality_as_of = None
         name = model.get("name") or model_id
         entries.append(
             {
@@ -2492,6 +3467,7 @@ def build_schedules(
                 # quality came without any -- e.g. a bare-float test map).
                 "quality_source": quality_source,
                 "quality_as_of": quality_as_of,
+                "quality_effort": quality_effort,
                 "score": balanced_by_id.get(model_id),
                 "max_discount": eff["max_discount"],
                 "sched_note": fmt_sched_note(eff["max_discount"]),
@@ -2548,9 +3524,17 @@ def catalog_weights(candidates, quality_by_id):
 # ---------------------------------------------------------------------------
 
 
-def build_candidates(models, args, discounts, zdr_ids, filtered_out=None):
+def build_candidates(
+    models,
+    args,
+    discounts,
+    zdr_ids,
+    filtered_out=None,
+    reasoning_by_id: dict[str, dict] | None = None,
+):
     now = time.time()
     require_tools = not args.no_require_tools
+    requested_effort = getattr(args, "reasoning_effort", "default")
     dropped = {}
     candidates = []
 
@@ -2597,6 +3581,22 @@ def build_candidates(models, args, discounts, zdr_ids, filtered_out=None):
             # No valid peak window means no deterministic base (spec rule 9):
             # schedule-only AND mixed models fail closed here.
             drop("schedule", model_id, model.get("name"))
+            continue
+        # The effort filter runs before the ZDR/discount gates: it is the
+        # caller's explicit request, so it is the most useful drop reason
+        # when several gates would reject the model.
+        reasoning = (reasoning_by_id or {}).get(model_id)
+        if not isinstance(reasoning, dict):
+            reasoning = None
+        # A model can always run at its own effective default (§7 equality
+        # carve-out), even when that effort is absent from supported_efforts
+        # -- e.g. default_enabled false resolves to "none" while the list
+        # omits it.
+        if requested_effort != "default" and not (
+            supports_effort(reasoning, requested_effort)
+            or requested_effort == (reasoning or {}).get("default_effort")
+        ):
+            drop("reasoning effort", model_id, model.get("name"))
             continue
         price_in, price_out = eff["price_in"], eff["price_out"]
         if args.exclude_free and price_in == 0 and price_out == 0:
@@ -2666,6 +3666,11 @@ def build_candidates(models, args, discounts, zdr_ids, filtered_out=None):
                 "tool_calling": tool_calling,
                 "zdr": None if args.no_zdr else model_id in (zdr_ids or set()),
                 "expired": expired,
+                "reasoning": reasoning,
+                "default_effort": (reasoning or {}).get("default_effort"),
+                "supported_efforts": list(
+                    (reasoning or {}).get("supported_efforts") or []
+                ),
             }
         )
 
@@ -2809,6 +3814,42 @@ def fmt_discount(value) -> str:
     return f"{value:.0%}" if has_discount(value) else "--"
 
 
+def _display_default_effort(cand):
+    """The effort a default run uses, for the DEPTH cell and the depth block.
+
+    Production candidates carry it on both ``cand["default_effort"]`` and the
+    reasoning block; partial rows (tests, legacy paths) may carry only one.
+    """
+    return cand.get("default_effort") or (cand.get("reasoning") or {}).get(
+        "default_effort"
+    )
+
+
+def _published_reasoning_block(cand):
+    """The six published reasoning keys plus the measured depth records.
+
+    ``is_reasoning`` is an internal flag: neither catalog v5 nor spec §8.4
+    publishes it, so it never appears here.
+    """
+    reasoning = cand.get("reasoning") or {}
+    return {
+        "default_effort": reasoning.get("default_effort"),
+        "supported_efforts": reasoning.get("supported_efforts") or [],
+        "default_enabled": reasoning.get("default_enabled"),
+        "mandatory": reasoning.get("mandatory"),
+        "supports_max_tokens": reasoning.get("supports_max_tokens"),
+        "depths": cand.get("reasoning_depths") or [],
+    }
+
+
+def fmt_depth(cand) -> str:
+    """DEPTH cell: the effort QUAL was measured at, ``*`` on the default."""
+    effort = (cand.get("quality_record") or {}).get("effort")
+    if not effort:
+        return "-"
+    return f"{effort}*" if effort == _display_default_effort(cand) else effort
+
+
 def fmt_prec(cand) -> str:
     """PREC cell: the precision the ranked price is quoted at.
 
@@ -2909,8 +3950,9 @@ def quality_footer_note(quality_by_id, aa_index_version, unmatched):
     | our catalog (12, as of 2026-10-23 13:15Z) | OpenRouter snapshot (2,
     as of 2026-10-17)". A trailing "unmatched score 0" names candidates
     with no quality record, and a drift footnote appears when any resolved
-    record disagrees with the OpenRouter check value. Returns None when no
-    record resolved -- run() falls back to the quality-blind note.
+    record disagrees with the OpenRouter check value; that count covers only
+    comparable (non-reasoning) rows and the footnote says so. Returns None
+    when no record resolved -- run() falls back to the quality-blind note.
     """
     labels = {
         "aa": "live AA",
@@ -2950,7 +3992,10 @@ def quality_footer_note(quality_by_id, aa_index_version, unmatched):
         note += "; unmatched score 0"
     drift = sum(1 for record in quality_by_id.values() if record.get("drift"))
     if drift:
-        note += f"; drift vs OpenRouter snapshot ({drift})"
+        rows = "row" if drift == 1 else "rows"
+        note += (
+            f"; drift vs OpenRouter snapshot: {drift} comparable (non-reasoning) {rows}"
+        )
     return note
 
 
@@ -2958,6 +4003,7 @@ def print_table(top, total_candidates, weights, quality_note):
     headers = [
         "RANK",
         "MODEL",
+        "DEPTH",
         "QUAL",
         "$IN/M",
         "$OUT/M",
@@ -2974,6 +4020,7 @@ def print_table(top, total_candidates, weights, quality_note):
             [
                 str(rank),
                 cand["id"],
+                fmt_depth(cand),
                 "-" if cand["quality"] is None else f"{cand['quality']:.1f}",
                 fmt_price(cand["price_in"]),
                 fmt_price(cand["price_out"]),
@@ -3010,9 +4057,21 @@ def print_table(top, total_candidates, weights, quality_note):
     print(
         f"pool: {total_candidates} candidates | weights: {weight_bits} | {quality_note}"
     )
+
+
+def print_table_legend():
+    """The main table's legend paragraphs.
+
+    Printed after any depth detail, so the DEPTH line says "above".
+    """
     print(
         "quality: Artificial Analysis intelligence index (- = unknown); prices in USD per 1M tokens; "
         "DISC = active discount; AGE = time since listed on OpenRouter"
+    )
+    print(
+        "DEPTH is the reasoning effort the QUAL score was measured at; "
+        "* = OpenRouter's default. QUAL - means AA has not measured the model "
+        "at that effort. --no-depths hides the depth detail above."
     )
     print(
         "Prices shown are what a long session pays: several models bill at a "
@@ -3033,6 +4092,165 @@ def print_table(top, total_candidates, weights, quality_note):
     )
 
 
+def print_depth_detail(top):
+    """Per-model AA depth detail: measured scores and selectable variants.
+
+    One block per model in the given (rank) order, listing the union of
+    OpenRouter-supported and AA-measured efforts, deepest first. Models with
+    no measured depths get a single ``no AA depth data`` line. Display only:
+    AA $/task never enters the weighted score.
+    """
+    if not top:
+        return
+
+    headers = ["effort", "AA idx", "AA $/task", "vs default", "select"]
+
+    def finite(value):
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        ):
+            return value
+        return None
+
+    def order(effort):
+        try:
+            return (AA_EFFORT_ORDER.index(effort), effort)
+        except ValueError:
+            return (len(AA_EFFORT_ORDER), effort or "")
+
+    blocks = []
+    for rank, cand in enumerate(top, 1):
+        reasoning = cand.get("reasoning") or {}
+        supported = list(reasoning.get("supported_efforts") or [])
+        records = [
+            record
+            for record in (cand.get("reasoning_depths") or [])
+            if isinstance(record, dict) and record.get("effort")
+        ]
+        measured = {record["effort"]: record for record in records}
+        default = _display_default_effort(cand)
+        is_non_reasoning = reasoning.get("is_reasoning") is False
+        # A non-mandatory single-state model exposes only the "none" toggle.
+        single_state_none = (
+            reasoning.get("is_reasoning") is True
+            and reasoning.get("mandatory") is not True
+            and not supported
+        )
+        default_cost = (
+            finite((measured.get(default) or {}).get("cost_per_task_usd"))
+            if default
+            else None
+        )
+        efforts = sorted(set(supported) | set(measured), key=order)
+        rows = []
+        for effort in efforts:
+            record = measured.get(effort) or {}
+            index = finite(record.get("index"))
+            cost = finite(record.get("cost_per_task_usd"))
+            if effort == "reasoning":
+                # Single-state reasoning row: the bare id is the only form.
+                select = "-"
+            elif effort == "none" and is_non_reasoning:
+                # A non-reasoning model's bare id is the only form.
+                select = "-"
+            elif effort in supported:
+                select = f"#{effort}"
+            elif effort == "none" and single_state_none:
+                select = "#none"
+            else:
+                select = "- not selectable"
+            ratio = "-"
+            if cost and default_cost:
+                value = cost / default_cost
+                ratio = f"{value:.1f}x" if value >= 1 else f"{value:.2f}x"
+            rows.append(
+                [
+                    f"{effort}*" if effort == default else effort,
+                    "-" if index is None else f"{index:.1f}",
+                    "-" if cost is None else f"{cost:.2f}",
+                    ratio,
+                    select,
+                ]
+            )
+        has_measured = any(
+            finite(record.get("index")) is not None for record in measured.values()
+        )
+        blocks.append(
+            {
+                "rank": rank,
+                "cand": cand,
+                "default": default,
+                "rows": rows,
+                "has_records": bool(records),
+                "missing_default": (
+                    bool(default)
+                    and default in efforts
+                    and finite((measured.get(default) or {}).get("index")) is None
+                    and has_measured
+                ),
+            }
+        )
+
+    widths = [len(header) for header in headers]
+    for block in blocks:
+        for row in block["rows"]:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+    def emit(cells):
+        padded = [cell.ljust(width) for cell, width in zip(cells[:-1], widths[:-1])]
+        print("   " + "   ".join(padded + [cells[-1]]))
+
+    print("depth detail  (AA index / AA $ per task; OR $/M is constant across depths)")
+    for position, block in enumerate(blocks):
+        if position:
+            print()
+        cand = block["cand"]
+        print(
+            f"#{block['rank']} {cand['id']}   "
+            f"OR ${cand['price_in']:.2f} in / ${cand['price_out']:.2f} out per 1M   "
+            f"default: {block['default'] or '-'}"
+        )
+        if not block["has_records"]:
+            print("   no AA depth data")
+            continue
+        if block["missing_default"]:
+            print(f"   AA has no {block['default']} record for this model.")
+        emit(headers)
+        for row in block["rows"]:
+            emit(row)
+
+    print()
+    print(
+        "* = OpenRouter default; append #effort to the model id in OpenCode; "
+        "- in select = not selectable; AA $/task is AA's measured benchmark "
+        "cost at AA's reference price, not the OR per-token price; it never "
+        "enters the weighted score."
+    )
+
+
+def print_best(top, args):
+    """Print the top candidate as an OpenCode model id.
+
+    A non-default ``--reasoning-effort`` appends ``#<effort>`` only when the
+    model exposes that variant; otherwise the bare id selects the default.
+    """
+    cand = top[0]
+    model_id = opencode_model_id(cand["id"])
+    effort = args.reasoning_effort
+    reasoning = cand.get("reasoning")
+    if (
+        effort != "default"
+        and isinstance(reasoning, dict)
+        and reasoning.get("is_reasoning") is not False
+        and supports_effort(reasoning, effort)
+    ):
+        model_id += f"#{effort}"
+    print(model_id)
+
+
 def print_json(top):
     payload = [
         {
@@ -3050,6 +4268,18 @@ def print_json(top):
             "quality_drift": (cand.get("quality_record") or {}).get("drift"),
             "quality_or_index": (cand.get("quality_record") or {}).get("or_index"),
             "quality_or_as_of": (cand.get("quality_record") or {}).get("or_as_of"),
+            # The effort the quality record was measured at. Legacy records
+            # (pre-depth paths) carry no "effort" key, so this degrades to
+            # None exactly like a missing record.
+            "quality_effort": (cand.get("quality_record") or {}).get("effort"),
+            # The model's effective default effort, duplicated at top level:
+            # data.json rows must keep it after the nested reasoning block is
+            # dropped downstream. Same resolver as the DEPTH cell.
+            "default_effort": _display_default_effort(cand),
+            # The six published reasoning fields plus the measured depth
+            # records; the internal is_reasoning flag never leaves the
+            # process (catalog v5 and spec §8.4 publish only these keys).
+            "reasoning": _published_reasoning_block(cand),
             "input_usd_per_m": round(cand["price_in"], 6),
             "output_usd_per_m": round(cand["price_out"], 6),
             "blended_usd_per_m": round(cand["blended"], 6),
@@ -3123,6 +4353,12 @@ def build_catalog(
     index_version=None,
     catalog_generated_at=None,
     catalog_quality=None,
+    *,
+    depth_lookup=None,
+    catalog_depths=None,
+    reasoning_by_id=None,
+    requested_effort="default",
+    schedule_entries=None,
 ):
     """Assemble the full-catalog document (see README "Catalog output").
 
@@ -3141,6 +4377,8 @@ def build_catalog(
     catalog_quality is the hydrated record map (or None): candidates read
     it through resolve_quality, and build_schedules falls back to it for
     non-candidates.
+    The keyword-only depth inputs feed build_schedules (spec 6.5); run()
+    always supplies them, direct callers may omit them for the legacy path.
     """
     now = datetime.now(timezone.utc)
     weights = catalog_weights(candidates, quality_by_id)
@@ -3167,6 +4405,14 @@ def build_catalog(
     )
     if unknown:
         raise ValueError(f"unknown quality source: {unknown[0]!r}")
+    # Depth counts are candidate-scoped and separate from the disjoint label
+    # buckets above (spec 9.1): schedule entries carry their own provenance
+    # and never enter these counts or the pool invariants. matched_default
+    # is the number of main quality records under strict selection -- exactly
+    # the label buckets' sum, kept explicit for the publish gate.
+    matched_default = matched_aa + matched_catalog + matched_openrouter
+    depth_rows = sum(len(cand.get("reasoning_depths") or []) for cand in candidates)
+    matched_depth = sum(1 for cand in candidates if cand.get("reasoning_depths"))
     # mode is the run's quality chain, not a match outcome: "aa" when the
     # AA API returned usable entries, "catalog" when unkeyed runs hydrated
     # the published catalog, "none" when neither tier produced data.
@@ -3213,9 +4459,26 @@ def build_catalog(
         # The quality record map is already a parameter; the winning
         # record's as_of and drift verdict become entry fields verbatim.
         # Unmatched candidates degrade to null -- same shape as the v3
-        # additive blocks below.
-        record = quality_by_id.get(cand["id"])
-        record = record if isinstance(record, dict) else None
+        # additive blocks below. The candidate's own record wins (it is the
+        # same object compute_scores attached), with the map as the fallback
+        # for direct callers that skip compute_scores.
+        record = cand.get("quality_record")
+        if not isinstance(record, dict):
+            record = quality_by_id.get(cand["id"])
+            record = record if isinstance(record, dict) else None
+        reasoning = cand.get("reasoning")
+        reasoning = reasoning if isinstance(reasoning, dict) else {}
+        depths = [
+            {
+                "effort": depth.get("effort"),
+                "index": depth.get("index"),
+                "cost_per_task_usd": depth.get("cost_per_task_usd"),
+                "source": depth.get("source"),
+                "as_of": depth.get("as_of"),
+            }
+            for depth in (cand.get("reasoning_depths") or [])
+            if isinstance(depth, dict)
+        ]
         entries.append(
             {
                 "id": cand["id"],
@@ -3286,8 +4549,22 @@ def build_catalog(
                 # Provenance (schema v4), verbatim from the record: the
                 # winning source's own as_of and the drift verdict against
                 # OpenRouter's check value.
-                "quality_as_of": record["as_of"] if record else None,
-                "quality_drift": record["drift"] if record else None,
+                "quality_as_of": record.get("as_of") if record else None,
+                "quality_drift": record.get("drift") if record else None,
+                # Schema v5 depth contract: the effort the main quality was
+                # measured at, and the model's reasoning metadata plus every
+                # measured depth record (record shape: effort/index/
+                # cost_per_task_usd/source/as_of -- `index`, never
+                # `quality_index`).
+                "quality_effort": record.get("effort") if record else None,
+                "reasoning": {
+                    "default_effort": reasoning.get("default_effort"),
+                    "supported_efforts": reasoning.get("supported_efforts") or [],
+                    "default_enabled": reasoning.get("default_enabled"),
+                    "mandatory": reasoning.get("mandatory"),
+                    "supports_max_tokens": reasoning.get("supports_max_tokens"),
+                    "depths": depths,
+                },
                 "scores": {**scores, "overall": overall},
                 # Additive provider-aware blocks (schema v3), verbatim from
                 # the candidate. Candidates that never went through the
@@ -3312,7 +4589,17 @@ def build_catalog(
 
     return {
         "schedules": build_schedules(
-            models, args, quality_by_id, aa_by_id, balanced_by_id, catalog_quality
+            models,
+            args,
+            quality_by_id,
+            aa_by_id,
+            balanced_by_id,
+            catalog_quality,
+            depth_lookup=depth_lookup,
+            catalog_depths=catalog_depths,
+            reasoning_by_id=reasoning_by_id,
+            requested_effort=requested_effort,
+            schedule_entries=schedule_entries,
         ),
         "schema_version": CATALOG_SCHEMA_VERSION,
         "tool": "model-compare",
@@ -3327,6 +4614,9 @@ def build_catalog(
             "require_tools": not args.no_require_tools,
             "exclude_free": args.exclude_free,
             "include_batch": args.include_batch,
+            # The requested effort documents the semantic of every model's
+            # quality value (default = each model's effective default).
+            "reasoning_effort": getattr(args, "reasoning_effort", "default"),
             "weights": weights,
         },
         "sources": {
@@ -3336,6 +4626,11 @@ def build_catalog(
                 "matched_aa": matched_aa,
                 "matched_catalog": matched_catalog,
                 "matched_openrouter": matched_openrouter,
+                # Depth coverage (schema v5), candidate-scoped like the
+                # label buckets above. Schedule entries never contribute.
+                "depth_rows": depth_rows,
+                "matched_depth": matched_depth,
+                "matched_default": matched_default,
                 # Provenance meta (schema v4): the published catalog's stamp
                 # when this run hydrated from it, and the AA envelope's
                 # intelligence index version when the AA API ran. Both null
@@ -3448,6 +4743,24 @@ def parse_args(argv=None):
         help="AA intelligence index that counts as full quality score (default: 70)",
     )
     parser.add_argument(
+        "--reasoning-effort",
+        choices=REASONING_EFFORT_CHOICES,
+        default="default",
+        help=(
+            "reasoning effort used for quality and filtering: a specific "
+            "effort drops models that cannot run it (default: each model's "
+            "effective default, no filter)"
+        ),
+    )
+    parser.add_argument(
+        "--no-depths",
+        action="store_true",
+        help=(
+            "hide the per-model depth detail below the table (the DEPTH and "
+            "QUAL columns stay)"
+        ),
+    )
+    parser.add_argument(
         "--aa-api-key",
         default=None,
         help="Artificial Analysis API key (or set AA_API_KEY; free at artificialanalysis.ai)",
@@ -3520,7 +4833,13 @@ def main(argv=None) -> int:
 
 
 def run(args, models, or_cached) -> int:
-    discounts, zdr_ids, aa_by_id, frontend_cache_hits = fetch_openrouter_frontend(args)
+    (
+        discounts,
+        zdr_ids,
+        aa_by_id,
+        frontend_cache_hits,
+        frontend_models,
+    ) = fetch_openrouter_frontend(args)
     if not args.no_zdr and not zdr_ids:
         warn(
             "ZDR data unavailable; refusing to rank possibly non-ZDR models "
@@ -3536,25 +4855,43 @@ def run(args, models, or_cached) -> int:
     if args.aa_api_key or os.environ.get("AA_API_KEY"):
         aa_entries, aa_source, aa_cached, aa_index_version = fetch_aa_entries(args)
         catalog_quality = None
+        catalog_depths = None
         catalog_generated_at = None
+        # Keyed runs never hydrate schedules from the published catalog.
+        schedule_entries = None
     else:
         aa_entries, aa_source, aa_cached, aa_index_version = [], None, False, None
-        # None (transport failure) and an empty by_id (fetched-but-unusable
+        # None (transport failure) and empty maps (fetched-but-unusable
         # artifact) both degrade to no catalog tier -- resolve_quality and
         # the footer treat them identically as "catalog unavailable".
         catalog_doc = fetch_quality_catalog(args)
         catalog_quality = (catalog_doc or {}).get("by_id") or None
+        catalog_depths = (catalog_doc or {}).get("depths_by_id") or None
+        # Spec 6.5: the published schedules array is the unkeyed Deals
+        # source of truth -- schedule-only models never appear in models.
+        schedule_entries = (catalog_doc or {}).get("schedules_by_id") or None
         # The catalog meta only means something when hydration actually
         # produced rows: an unusable artifact contributes no meta, so the
         # sources block and the mode never credit a catalog that yielded
         # nothing.
         catalog_generated_at = (
-            (catalog_doc or {}).get("generated_at") if catalog_quality else None
+            (catalog_doc or {}).get("generated_at")
+            if (catalog_quality or catalog_depths)
+            else None
         )
-    exact, fuzzy = build_aa_lookup(aa_entries)
+    exact, fuzzy = build_aa_lookup(dedupe_aa_entries_by_key(aa_entries))
+    depth_lookup = build_aa_depth_lookup(aa_entries)
 
     filtered = []
-    candidates, dropped = build_candidates(models, args, discounts, zdr_ids, filtered)
+    reasoning_by_id = build_reasoning_metadata(models, frontend_models)
+    candidates, dropped = build_candidates(
+        models,
+        args,
+        discounts,
+        zdr_ids,
+        filtered,
+        reasoning_by_id=reasoning_by_id,
+    )
     # The provider-aware stage: every surviving candidate is repriced at its
     # baseline endpoint (or dropped fail-closed) before any scoring runs.
     candidates, extra_dropped = apply_endpoint_pricing(candidates, args, filtered)
@@ -3576,7 +4913,15 @@ def run(args, models, or_cached) -> int:
         return 2
 
     quality_by_id, quality_source_by_id = resolve_quality(
-        candidates, aa_by_id, exact, fuzzy, aa_source, catalog_quality
+        candidates,
+        aa_by_id,
+        exact,
+        fuzzy,
+        aa_source,
+        catalog_quality,
+        depth_lookup=depth_lookup,
+        catalog_depths=catalog_depths,
+        requested_effort=args.reasoning_effort,
     )
     weights = compute_scores(candidates, args, quality_by_id)
 
@@ -3621,6 +4966,11 @@ def run(args, models, or_cached) -> int:
                 aa_index_version,
                 catalog_generated_at,
                 catalog_quality,
+                depth_lookup=depth_lookup,
+                catalog_depths=catalog_depths,
+                reasoning_by_id=reasoning_by_id,
+                requested_effort=args.reasoning_effort,
+                schedule_entries=schedule_entries,
             )
         )
         return 0
@@ -3629,7 +4979,7 @@ def run(args, models, or_cached) -> int:
     top = candidates[:limit]
 
     if args.best:
-        print(opencode_model_id(top[0]["id"]))
+        print_best(top, args)
     elif args.json:
         print_json(top)
     else:
@@ -3668,6 +5018,11 @@ def run(args, models, or_cached) -> int:
             file=sys.stderr,
         )
         print_table(top, len(candidates), weights, quality_note)
+        if not args.no_depths:
+            print()
+            print_depth_detail(top)
+            print()
+        print_table_legend()
     return 0
 
 

@@ -47,6 +47,12 @@
           <th title="Rank change in the last 7 days">7-DAY</th>
           <th title="Provider-qualified model id">MODEL</th>
           <th
+            class="hide-simple"
+            title="Reasoning effort the QUAL score was measured at; * = OpenRouter's default. - = no known effort."
+          >
+            DEPTH
+          </th>
+          <th
             title="Intelligence index (Artificial Analysis) — hover a cell for its source and as-of date"
           >
             <span class="lbl-expert">QUAL</span>
@@ -103,6 +109,21 @@
       Hover a cell to see where the number came from: the source and the
       as-of date. A cell whose number differs from OpenRouter's snapshot by
       3 or more index points says so.
+    </p>
+    <p class="hint">
+      <strong>QUAL</strong> is the AA intelligence index at the model's
+      effective OpenRouter default reasoning effort. A model can score higher
+      at a deeper effort; the muted number in the cell and the row detail show
+      the best selectable measured depth. Append <code>#effort</code> to the
+      model id in OpenCode to select one. AA <code>$/task</code> is AA's
+      measured benchmark cost at AA's reference price, not the
+      <strong>TASK$</strong> session cost.
+    </p>
+    <p class="hint hide-simple">
+      <strong>DEPTH</strong> is the reasoning effort the QUAL score was
+      measured at; <strong>*</strong> = OpenRouter's default.
+      <strong>QUAL -</strong> means AA has not measured the model at that
+      effort.
     </p>
     <p class="hint hide-simple">
       <strong><span class="tier">TIER</span></strong> marks how prices vary: a
@@ -170,7 +191,8 @@
         <span class="offpeak">SCHEDULE</span> shows when the discounted rate
         applies — long windows are clipped, hover for the full text. $IN/$OUT
         are the discounted prices during those windows; the standard rate
-        applies at all other times.
+        applies at all other times. QUAL is the AA index at the reasoning
+        effort shown after it; hover for its source and as-of date.
       </p>
       <p class="hint" id="deals-empty" hidden>
         No scheduled off-peak discounts in the current data.

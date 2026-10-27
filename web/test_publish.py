@@ -52,7 +52,7 @@ def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
     """
     docs = {
         "data.json": {
-            "schema_version": 2,
+            "schema_version": 3,
             "generated_at": STAMP,
             "source_revision": STUB_REV,
         },
@@ -71,13 +71,18 @@ def _write_artifacts(out_dir, overrides=None, best_id="z-ai/glm-5.3-flash"):
 
 # What the stubbed `model_compare.py --catalog` run prints: the AA and
 # endpoint-drop gates read it from scratch before any other step runs.
-# Catalog v4 shape: the keyed run's chain is "aa" and its three disjoint
-# match buckets sum to the pool's matched entries (12 + 0 + 8 = 20).
+# Catalog v5 shape: the keyed run's chain is "aa", its three disjoint match
+# buckets sum to the pool's matched entries (12 + 0 + 8 = 20), and the
+# depth coverage counts are candidate-scoped (40 rows over 12 models, all
+# 20 candidates carrying a default-effort main score).
 HEALTHY_AA = {
     "mode": "aa",
     "matched_aa": 12,
     "matched_catalog": 0,
     "matched_openrouter": 8,
+    "depth_rows": 40,
+    "matched_depth": 12,
+    "matched_default": 20,
     "catalog_generated_at": None,
     "intelligence_index_version": 4.3,
 }
@@ -333,7 +338,7 @@ def test_build_site_fails_when_expected_artifacts_missing(tmp_path, monkeypatch)
         (
             "data.json",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "generated_at": "2026-09-27T06:00:00Z",
                 "source_revision": STUB_REV,
             },
@@ -378,12 +383,12 @@ def test_build_site_fails_on_malformed_artifact(tmp_path, monkeypatch, name):
             {"generated_at": STAMP, "source_revision": STUB_REV},
         ),  # missing only schema_version
         # missing only source_revision
-        ("data.json", {"schema_version": 2, "generated_at": STAMP}),
+        ("data.json", {"schema_version": 3, "generated_at": STAMP}),
         (
             "data.json",
-            {"schema_version": 3, "generated_at": STAMP, "source_revision": STUB_REV},
+            {"schema_version": 2, "generated_at": STAMP, "source_revision": STUB_REV},
         ),
-        # strict identity: 2.0 compares equal to 2 but is not v2; True is a
+        # strict identity: 3.0 compares equal to 3 but is not v3; True is a
         # bool, not an int
         (
             "data.json",
@@ -395,7 +400,7 @@ def test_build_site_fails_on_malformed_artifact(tmp_path, monkeypatch, name):
         ),
         (
             "data.json",
-            {"schema_version": 2.0, "generated_at": STAMP, "source_revision": STUB_REV},
+            {"schema_version": 3.0, "generated_at": STAMP, "source_revision": STUB_REV},
         ),
         ("catalog.json", []),
         # the best.txt gate reads rankings; a catalog without them is broken
@@ -414,8 +419,8 @@ def test_build_site_requires_data_json_schema_version(tmp_path, monkeypatch):
     # Regression pin for the required-tuple half of the gate: a data.json
     # missing only schema_version must fail at load ("lacks"), not slip
     # through to a later check -- reverting the tuple to ("generated_at",)
-    # must turn this red. The version VALUE (now 2) is pinned separately in
-    # test_data_json_version_pin_is_2.
+    # must turn this red. The version VALUE (now 3) is pinned separately in
+    # test_data_json_version_pin_is_3.
     overrides = {
         "data.json": json.dumps({"generated_at": STAMP, "source_revision": STUB_REV})
     }
@@ -432,17 +437,17 @@ def test_build_site_requires_data_json_source_revision(tmp_path, monkeypatch):
     # ("schema_version", "generated_at") must turn this red. _load_artifact
     # names every absent key at once, so the exact one-key message proves
     # the other two were present.
-    overrides = {"data.json": json.dumps({"schema_version": 2, "generated_at": STAMP})}
+    overrides = {"data.json": json.dumps({"schema_version": 3, "generated_at": STAMP})}
     monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=overrides))
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     with pytest.raises(RuntimeError, match="data.json lacks source_revision"):
         publish.build_site(tmp_path / "site")
 
 
-def test_data_json_version_pin_is_2(tmp_path, monkeypatch):
+def test_data_json_version_pin_is_3(tmp_path, monkeypatch):
     # publish imports nothing from build_site_data, so check_stamps pins the
     # expected data.json version itself: a stale v1 document must fail, the
-    # pinned v2 must pass.
+    # pinned v3 must pass.
     overrides = {
         "data.json": json.dumps(
             {"schema_version": 1, "generated_at": STAMP, "source_revision": STUB_REV}
@@ -450,9 +455,9 @@ def test_data_json_version_pin_is_2(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=overrides))
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
-    with pytest.raises(RuntimeError, match="data.json schema_version must be 2, got 1"):
+    with pytest.raises(RuntimeError, match="data.json schema_version must be 3, got 1"):
         publish.build_site(tmp_path / "site")
-    # v2 passes: rerun with the happy-path fixtures (no v1 override).
+    # v3 passes: rerun with the happy-path fixtures (no v1 override).
     monkeypatch.setattr(publish.subprocess, "run", _fake_run([], overrides=None))
     publish.build_site(tmp_path / "site")
 
@@ -597,15 +602,18 @@ FAVICON_FILES = (
 )
 
 
-def test_publish_healthy_aa_v4_fixture(tmp_path, monkeypatch):
+def test_publish_healthy_aa_v5_fixture(tmp_path, monkeypatch):
     # The fixture every pipeline test publishes through the AA gate must
-    # stay producer-faithful: exactly the v4 sources.aa shape build_catalog
+    # stay producer-faithful: exactly the v5 sources.aa shape build_catalog
     # emits for a keyed run, and the gate accepts it with the key set.
     assert set(HEALTHY_AA) == {
         "mode",
         "matched_aa",
         "matched_catalog",
         "matched_openrouter",
+        "depth_rows",
+        "matched_depth",
+        "matched_default",
         "catalog_generated_at",
         "intelligence_index_version",
     }
@@ -624,7 +632,15 @@ def test_build_site_aa_gate_passes_live_aa(tmp_path, monkeypatch, matched_aa):
     monkeypatch.setattr(
         publish.subprocess,
         "run",
-        _catalog_run({"mode": "aa", "matched_aa": matched_aa}, calls),
+        _catalog_run(
+            {
+                "mode": "aa",
+                "matched_aa": matched_aa,
+                "depth_rows": 10,
+                "matched_default": matched_aa,
+            },
+            calls,
+        ),
     )
     monkeypatch.setattr(publish, "fetch_prev", lambda url: None)
     monkeypatch.setenv("AA_API_KEY", "dummy-key")
@@ -659,6 +675,34 @@ def test_build_site_aa_gate_fails_when_aa_yields_no_matches(tmp_path, monkeypatc
     with pytest.raises(RuntimeError, match="AA_API_KEY is set") as exc:
         publish.build_site(tmp_path / "site")
     assert "matched_aa" in str(exc.value)
+
+
+def test_check_aa_source_requires_depth_rows_and_default_matches(
+    tmp_path, monkeypatch, capsys
+):
+    # The v5 depth gates: a keyed publish must prove the AA API produced
+    # per-effort rows and at least one candidate got a default-effort score.
+    # Coverage below 25% is a warning, never a failure.
+    monkeypatch.setenv("AA_API_KEY", "dummy-key")
+    path = tmp_path / "catalog.json"
+
+    def write(aa, candidates=20):
+        path.write_text(
+            json.dumps({"sources": {"aa": aa}, "pool": {"candidates": candidates}})
+        )
+
+    healthy = {**HEALTHY_AA, "depth_rows": 10, "matched_default": 10}
+    write({**healthy, "depth_rows": 0})
+    with pytest.raises(RuntimeError, match="depth_rows"):
+        publish.check_aa_source(path)
+    write({**healthy, "matched_default": 0})
+    with pytest.raises(RuntimeError, match="matched_default"):
+        publish.check_aa_source(path)
+    write({**healthy, "matched_default": 4})  # 4/20 = 20% < 25%
+    publish.check_aa_source(path)
+    err = capsys.readouterr().err
+    assert "matched_default" in err
+    assert "25%" in err
 
 
 @pytest.mark.parametrize(

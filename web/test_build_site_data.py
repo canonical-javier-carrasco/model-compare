@@ -37,6 +37,11 @@ def make_row(**overrides):
         "quality_drift": None,
         "quality_or_index": None,
         "quality_or_as_of": None,
+        # data.json v3 row keys (thinking depth): print_json always emits
+        # the main score's effort and the model's effective default effort;
+        # null is its unknown-effort degradation.
+        "quality_effort": None,
+        "default_effort": None,
     }
     row.update(overrides)
     return row
@@ -350,6 +355,19 @@ def make_catalog_entry(**overrides):
         # null for this OR-matched row (no second source to disagree with).
         "quality_as_of": None,
         "quality_drift": None,
+        # Schema v5 (thinking depth): the effort the main quality was
+        # measured at, and the reasoning metadata plus measured depths. The
+        # producer emits the block on every entry; a model with no metadata
+        # and no AA depth rows degrades to this empty shape.
+        "quality_effort": None,
+        "reasoning": {
+            "default_effort": None,
+            "supported_efforts": [],
+            "default_enabled": None,
+            "mandatory": None,
+            "supports_max_tokens": None,
+            "depths": [],
+        },
         "scores": {
             "price": 0.9,
             "quality": 0.78,
@@ -370,7 +388,7 @@ def make_catalog_entry(**overrides):
 
 def make_catalog():
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "tool": "model-compare",
         "generated_at": "2026-09-02T09:15:00+00:00",
         "parameters": {
@@ -391,7 +409,7 @@ def make_catalog():
         },
         "sources": {
             "openrouter": "ok",
-            # Catalog v4: the keyed CI producer's normal chain, its three
+            # Catalog v5: the keyed CI producer's normal chain, its three
             # disjoint label buckets (the one matched entry is OR-labeled)
             # and the provenance meta (no hydration, AA index v4.3).
             "aa": {
@@ -644,6 +662,11 @@ def test_validate_catalog_rejects_removed_scrape_values(mutate, field):
         lambda doc: doc["models"][0]["aa"].update(intelligence_index=float("nan")),
         lambda doc: doc["models"][0]["aa"].update(intelligence_index=True),
         lambda doc: doc["models"][0].update(quality_match="psychic"),
+        # Schema v5: the effort label and the reasoning block are
+        # presence-required and fail closed on a malformed value.
+        lambda doc: doc["models"][0].update(quality_effort=7),
+        lambda doc: doc["models"][0].update(quality_effort=""),
+        lambda doc: doc["models"][0].update(reasoning=None),
         lambda doc: doc["sources"]["aa"].update(mode="psychic"),
         lambda doc: doc["sources"]["aa"].update(matched_openrouter=5),
         lambda doc: doc["sources"]["aa"].update(matched_aa=-1),
@@ -735,7 +758,7 @@ def test_main_writes_catalog_next_to_data_json(tmp_path):
     assert bsd.main(argv) == 0
     catalog_path = out.parent / "catalog.json"
     written = json.loads(catalog_path.read_text())
-    assert written["schema_version"] == 4
+    assert written["schema_version"] == 5
     assert written["models"][0]["id"] == "acme/model-a"
     assert out.exists()  # data.json still written
 
@@ -798,7 +821,7 @@ def make_history_snapshot(date, generated_at, **overrides):
 
 def make_history(**overrides):
     doc = {
-        "schema_version": 3,
+        "schema_version": 4,
         "updated_at": "2026-08-26T09:15:00+00:00",
         "snapshots": {
             "2026-08-26": make_history_snapshot(
@@ -932,7 +955,7 @@ def test_merge_history_upserts_and_prunes():
     assert len(merged["snapshots"]) == 10
     assert merged["snapshots"][today] == snap
     assert merged["updated_at"] == "2026-09-02T09:15:00+00:00"
-    assert merged["schema_version"] == 3
+    assert merged["schema_version"] == 4
 
 
 def test_merge_history_same_day_last_write_wins():
@@ -999,12 +1022,12 @@ def test_merge_history_drops_prev_snapshot_with_corrupt_ranks():
 
 def test_merge_history_rejects_unknown_schema_version():
     prev = make_history()
-    prev["schema_version"] = 4
+    prev["schema_version"] = 5
     merged = bsd.merge_history(
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 3
+    assert merged["schema_version"] == 4
 
 
 def test_merge_history_tolerates_prev_without_schema_version():
@@ -1100,7 +1123,7 @@ def test_validate_history_happy_and_rejections():
     doc["updated_at"] = "2026-09-02T09:15:00+00:00"
     bsd.validate_history(doc)  # must not raise
     with pytest.raises(ValueError):
-        bsd.validate_history({"schema_version": 4})
+        bsd.validate_history({"schema_version": 5})
     bad = make_history()
     bad["snapshots"]["2026-08-26"]["tabs"]["balanced"][0]["rank"] = 5
     with pytest.raises(ValueError):
@@ -1489,6 +1512,7 @@ def _schedule_entry(model_id, discount, off_in=0.66, off_out=1.98):
         # quality came without any (the producer emits the keys always).
         "quality_source": None,
         "quality_as_of": None,
+        "quality_effort": None,
         "score": None,
         "max_discount": discount,
         "sched_note": f"-{discount:.0%}",
@@ -1723,6 +1747,9 @@ def test_validate_catalog_schedules_entries():
         ("quality_source", 42),
         ("quality_as_of", 42),
         ("quality_as_of", ["20261017"]),
+        ("quality_effort", 42),
+        ("quality_effort", ""),
+        ("quality_effort", ["high"]),
     ):
         doc = make_catalog()
         schedules = make_schedules()
@@ -1742,7 +1769,10 @@ def test_validate_catalog_schedules_entries():
     doc = make_catalog()
     schedules = make_schedules()
     schedules[0].update(
-        quality=50.0, quality_source="catalog", quality_as_of="20261017"
+        quality=50.0,
+        quality_source="catalog",
+        quality_as_of="20261017",
+        quality_effort="high",
     )
     doc["schedules"] = schedules
     bsd.validate_catalog(doc)  # must not raise
@@ -1767,10 +1797,14 @@ def test_project_schedules():
     # Provenance rides through to data.json verbatim (null without a
     # winner), so the deals QUAL tooltip can render on the site.
     assert big["quality_source"] is None and big["quality_as_of"] is None
+    assert big["quality_effort"] is None
     assert big["context"] == 262144
     schedules = make_schedules()
     schedules[0].update(
-        quality=30.0, quality_source="catalog", quality_as_of="20261017"
+        quality=30.0,
+        quality_source="catalog",
+        quality_as_of="20261017",
+        quality_effort="high",
     )
     catalog["schedules"] = schedules
     (projected,) = [
@@ -1779,6 +1813,7 @@ def test_project_schedules():
     assert projected["quality"] == 30.0
     assert projected["quality_source"] == "catalog"
     assert projected["quality_as_of"] == "20261017"
+    assert projected["quality_effort"] == "high"
 
 
 def test_project_schedules_top10_cap():
@@ -1806,7 +1841,7 @@ def test_build_data_schedules_key():
 
 def test_build_data_emits_schema_version():
     data = bsd.build_data("openrouter/acme/model-a", make_priorities())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
 
 
 def test_row_keys_optional_passthrough():
@@ -1829,11 +1864,11 @@ def test_merge_history_resets_v1():
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 3
+    assert merged["schema_version"] == 4
 
 
 # ---------------------------------------------------------------------------
-# Catalog v3: provider-aware blocks, data.json v2 rows, history v3 reset
+# Catalog v3: provider-aware blocks, data.json v3 rows, history v4 reset
 # ---------------------------------------------------------------------------
 
 
@@ -2106,7 +2141,7 @@ def test_rows_carry_new_keys_ordered_by_ranking():
             for model_id in scrambled
         ]
     data = bsd.build_data("acme/a", rows, catalog=catalog)
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     for priority in bsd.PRIORITIES:
         for row, model_id in zip(
             data["priorities"][priority], catalog["rankings"][priority]
@@ -2115,12 +2150,185 @@ def test_rows_carry_new_keys_ordered_by_ranking():
                 assert row[key] == value, (priority, model_id, key)
 
 
-def test_merge_history_resets_on_v2_history():
-    # The live site's pre-bump history (v2) must not be merged into a v3
+def test_merge_history_resets_on_v3_history():
+    # The live site's pre-bump history (v3) must not be merged into a v4
     # document: any explicit version but the current one starts fresh.
-    prev = make_history(schema_version=2)
+    prev = make_history(schema_version=3)
     merged = bsd.merge_history(
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 3
+    assert merged["schema_version"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Catalog v5 / data.json v3 / history v4 (thinking-depth)
+# ---------------------------------------------------------------------------
+
+
+def _reasoning_block(**overrides):
+    """A well-formed schema-v5 reasoning block (producer shape)."""
+    block = {
+        "default_effort": "high",
+        "supported_efforts": ["max", "high", "low"],
+        "default_enabled": True,
+        "mandatory": False,
+        "supports_max_tokens": None,
+        "depths": [
+            {
+                "effort": "high",
+                "index": 46.8,
+                "cost_per_task_usd": 0.88,
+                "source": "aa",
+                "as_of": "2026-10-20",
+            },
+            {
+                "effort": "max",
+                "index": 56.0,
+                "cost_per_task_usd": None,
+                "source": "aa",
+                "as_of": None,
+            },
+        ],
+    }
+    block.update(overrides)
+    return block
+
+
+def test_catalog_v5_is_accepted_and_v4_rejected():
+    bsd.validate_catalog(make_catalog())
+    with pytest.raises(ValueError, match="unknown catalog schema_version"):
+        bsd.validate_catalog({**make_catalog(), "schema_version": 4})
+
+
+def test_data_v3_rows_require_depth_fields_and_drop_reasoning():
+    row = make_row(
+        quality_effort="high", default_effort="high", reasoning={"depths": []}
+    )
+    doc = bsd.build_data("acme/model-a", {p: [dict(row)] for p in bsd.PRIORITIES})
+    assert doc["schema_version"] == 3
+    assert "reasoning" not in doc["priorities"]["balanced"][0]
+    assert doc["priorities"]["balanced"][0]["quality_effort"] == "high"
+    assert doc["priorities"]["balanced"][0]["default_effort"] == "high"
+    # Both new keys are required: the missing-key check fails loudly.
+    for key in ("quality_effort", "default_effort"):
+        priorities = {p: [dict(row)] for p in bsd.PRIORITIES}
+        del priorities["price"][0][key]
+        with pytest.raises(ValueError, match=key):
+            bsd.build_data("acme/model-a", priorities)
+
+
+def test_history_v4_discards_v3_and_keeps_highlights_v1():
+    assert bsd.HISTORY_SCHEMA_VERSION == 4
+    assert bsd.HIGHLIGHTS_SCHEMA_VERSION == 1
+    prev = {
+        "schema_version": 3,
+        "snapshots": {
+            "2026-10-20": make_history_snapshot(
+                "2026-10-20", "2026-10-20T00:00:00+00:00"
+            )
+        },
+    }
+    merged = bsd.merge_history(
+        prev, make_history_snapshot("2026-10-26", "2026-10-26T00:00:00+00:00")
+    )
+    assert merged["schema_version"] == 4
+    assert list(merged["snapshots"]) == ["2026-10-26"]
+
+
+def test_validate_catalog_accepts_reasoning_block():
+    doc = make_catalog()
+    doc["models"][0]["reasoning"] = _reasoning_block()
+    doc["models"][0]["quality_effort"] = "high"
+    bsd.validate_catalog(doc)  # must not raise
+    # The keyless degradation shape: no metadata, no measured depths.
+    bsd.validate_catalog(make_catalog())  # must not raise
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
+        (lambda r: r.update(default_effort=7), "default_effort"),
+        (lambda r: r.update(default_effort=""), "default_effort"),
+        (lambda r: r.update(mandatory="yes"), "mandatory"),
+        (lambda r: r.update(default_enabled=1), "default_enabled"),
+        (lambda r: r.update(supports_max_tokens="true"), "supports_max_tokens"),
+        (lambda r: r.update(supported_efforts="high"), "supported_efforts"),
+        (lambda r: r.update(supported_efforts=[7]), "supported_efforts"),
+        (lambda r: r.update(supported_efforts=[""]), "supported_efforts"),
+        (lambda r: r.update(depths=None), "depths"),
+        (lambda r: r.update(depths=[{"effort": "high"}]), "depths"),
+        (lambda r: r.pop("depths"), "depths"),
+        (lambda r: r["depths"][0].update(index=float("nan")), "index"),
+        (lambda r: r["depths"][0].update(index="46.8"), "index"),
+        (lambda r: r["depths"][0].update(index=True), "index"),
+        (
+            lambda r: r["depths"][0].update(cost_per_task_usd=float("inf")),
+            "cost_per_task_usd",
+        ),
+        (
+            lambda r: r["depths"][0].update(cost_per_task_usd="0.88"),
+            "cost_per_task_usd",
+        ),
+        (lambda r: r["depths"][0].update(effort=""), "effort"),
+        (lambda r: r["depths"].append(dict(r["depths"][0])), "duplicate"),
+        (lambda r: r["depths"][0].update(source=7), "source"),
+        (lambda r: r["depths"][0].update(as_of=7), "as_of"),
+        (lambda r: r["depths"][0].pop("as_of"), "as_of"),
+    ],
+)
+def test_validate_catalog_rejects_bad_reasoning_block(mutate, field):
+    doc = make_catalog()
+    block = _reasoning_block()
+    mutate(block)
+    doc["models"][0]["reasoning"] = block
+    with pytest.raises(ValueError, match=field):
+        bsd.validate_catalog(doc)
+
+
+def test_validate_catalog_rejects_quality_index_in_depth_record():
+    # Depth records reuse the quality record's shape: the score field is
+    # `index`. `quality_index` is the pre-release draft key -- a record
+    # carrying it is malformed, never silently accepted.
+    doc = make_catalog()
+    block = _reasoning_block()
+    block["depths"][0]["quality_index"] = 46.8
+    doc["models"][0]["reasoning"] = block
+    with pytest.raises(ValueError, match="quality_index"):
+        bsd.validate_catalog(doc)
+
+
+def test_validate_catalog_requires_reasoning_and_quality_effort_keys():
+    doc = make_catalog()
+    doc["models"][0].pop("reasoning")
+    with pytest.raises(ValueError, match="reasoning"):
+        bsd.validate_catalog(doc)
+    doc = make_catalog()
+    doc["models"][0].pop("quality_effort")
+    with pytest.raises(ValueError, match="quality_effort"):
+        bsd.validate_catalog(doc)
+
+
+def test_validate_catalog_requires_schedule_quality_effort():
+    doc = make_catalog()
+    schedules = make_schedules()
+    del schedules[0]["quality_effort"]
+    doc["schedules"] = schedules
+    with pytest.raises(ValueError, match="quality_effort"):
+        bsd.validate_catalog(doc)
+
+
+def test_project_schedules_carries_quality_effort():
+    catalog = make_catalog()
+    schedules = make_schedules()
+    schedules[0].update(
+        quality=30.0,
+        quality_source="catalog",
+        quality_as_of="20261017",
+        quality_effort="high",
+    )
+    catalog["schedules"] = schedules
+    (projected,) = [
+        row for row in bsd.project_schedules(catalog) if row["model"] == "acme/big-deal"
+    ]
+    assert projected["quality_effort"] == "high"

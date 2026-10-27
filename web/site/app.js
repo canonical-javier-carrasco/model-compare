@@ -222,17 +222,186 @@
         );
       }
 
+      function finiteNumber(value) {
+        return typeof value === "number" && isFinite(value) ? value : null;
+      }
+
+      function effortOrder(effort) {
+        var index = EFFORT_ORDER.indexOf(effort);
+        return index === -1 ? EFFORT_ORDER.length : index;
+      }
+
+      // Catalog v5 keeps the provenance flags but not the producer's
+      // is_reasoning bool. A non-reasoning model has no reasoning metadata
+      // at all, so its three flags stay null and its effective default is
+      // "none"; a single-state reasoning model with reasoning off records
+      // default_enabled: false.
+      function isNonReasoningBlock(reasoning) {
+        if (!reasoning) return false;
+        if (reasoning.is_reasoning === false) return true;
+        if (reasoning.is_reasoning === true) return false;
+        return (
+          reasoning.default_effort === "none" &&
+          reasoning.default_enabled !== false &&
+          reasoning.mandatory !== true &&
+          reasoning.supports_max_tokens !== true
+        );
+      }
+
+      function isSingleStateToggle(reasoning, supported) {
+        if (!reasoning || supported.length) return false;
+        if (reasoning.mandatory === true) return false;
+        return (
+          reasoning.is_reasoning === true || reasoning.default_enabled === false
+        );
+      }
+
+      // depthRows(row): the union of OpenRouter-supported and AA-measured
+      // efforts, deepest first, normalized for both the main table (a
+      // data.json row with the catalog reasoning block joined in) and the
+      // expanded depth table (a catalog entry). A measured record may carry
+      // the pre-release draft key quality_index; the normalized field is
+      // index. ratio is AA $/task divided by the default-depth record's,
+      // null when either side is missing or zero.
+      function depthRows(row) {
+        if (!row) return [];
+        var reasoning = row.reasoning || {};
+        var supported = row.supported_efforts;
+        if (!Array.isArray(supported) || !supported.length) {
+          if (Array.isArray(reasoning.supported_efforts)) {
+            supported = reasoning.supported_efforts;
+          }
+        }
+        if (!Array.isArray(supported)) supported = [];
+        var depths = Array.isArray(reasoning.depths) ? reasoning.depths : [];
+        var measured = {};
+        depths.forEach(function (record) {
+          if (record && record.effort) measured[record.effort] = record;
+        });
+        var defaultEffort =
+          row.default_effort || reasoning.default_effort || null;
+        var selectedEffort = row.quality_effort || null;
+        var nonReasoning =
+          !supported.length && isNonReasoningBlock(reasoning);
+        var singleStateNone = isSingleStateToggle(reasoning, supported);
+        var efforts = [];
+        var seen = {};
+        supported.forEach(function (effort) {
+          if (effort && !seen[effort]) {
+            seen[effort] = true;
+            efforts.push(effort);
+          }
+        });
+        depths.forEach(function (record) {
+          if (record && record.effort && !seen[record.effort]) {
+            seen[record.effort] = true;
+            efforts.push(record.effort);
+          }
+        });
+        efforts.sort(function (a, b) {
+          return effortOrder(a) - effortOrder(b);
+        });
+        var defaultCost = null;
+        if (defaultEffort && measured[defaultEffort]) {
+          defaultCost = finiteNumber(measured[defaultEffort].cost_per_task_usd);
+        }
+        return efforts.map(function (effort) {
+          var record = measured[effort] || {};
+          var index = finiteNumber(
+            record.index === undefined ? record.quality_index : record.index,
+          );
+          var cost = finiteNumber(record.cost_per_task_usd);
+          var selectable = false;
+          if (effort === "reasoning") {
+            // Single-state reasoning row: the bare id is the only form.
+            selectable = false;
+          } else if (effort === "none" && nonReasoning) {
+            // A non-reasoning model's bare id is the only form.
+            selectable = false;
+          } else if (supported.indexOf(effort) !== -1) {
+            selectable = true;
+          } else if (effort === "none" && singleStateNone) {
+            selectable = true;
+          }
+          var ratio = null;
+          if (cost !== null && cost !== 0 && defaultCost) {
+            ratio = cost / defaultCost;
+          }
+          return {
+            effort: effort,
+            index: index,
+            cost: cost,
+            ratio: ratio,
+            selectable: selectable,
+            selected: effort === selectedEffort,
+            default: effort === defaultEffort,
+          };
+        });
+      }
+
+      // DEPTH cell: the effort QUAL was measured at, "*" on the default.
+      function fmtEffort(row) {
+        if (!row || !row.quality_effort) return "-";
+        var reasoning = row.reasoning || {};
+        var defaultEffort = row.default_effort || reasoning.default_effort;
+        return row.quality_effort === defaultEffort
+          ? row.quality_effort + "*"
+          : row.quality_effort;
+      }
+
+      // The best measured alternative the user can actually select: an
+      // unselectable AA row stays in the detail table but is never
+      // advertised here.
+      function bestDepthAlternative(row) {
+        var base = finiteNumber(row && row.quality_index);
+        if (base === null) return null;
+        var rows = depthRows(row);
+        var best = null;
+        rows.forEach(function (depth) {
+          if (!depth.selectable || depth.index === null) return;
+          if (depth.effort === row.quality_effort) return;
+          if (depth.index <= base) return;
+          if (best === null || depth.index > best.index) best = depth;
+        });
+        return best;
+      }
+
+      function fmtDepthAlternative(row) {
+        var best = bestDepthAlternative(row);
+        if (!best) return null;
+        return best.effort + " " + pyFixed(best.index, 1);
+      }
+
+      function fmtDepthRatio(value) {
+        if (value === null) return "-";
+        return pyFixed(value, value >= 1 ? 1 : 2) + "x";
+      }
+
+      function depthTooltip(row) {
+        if (!row || !row.quality_effort) return null;
+        var reasoning = row.reasoning || {};
+        var defaultEffort = row.default_effort || reasoning.default_effort;
+        var text = "Reasoning effort the QUAL score was measured at";
+        if (row.quality_effort === defaultEffort) {
+          text += " (OpenRouter's effective default)";
+        }
+        return text + ".";
+      }
+
       // QUAL cell tooltip: where the quality number came from (the source
       // label verbatim -- display strings from data.json are shown as-is)
-      // and when it was checked, plus the drift note when the producer
+      // and when it was checked, the effort it was measured at, the best
+      // selectable alternative, plus the drift note when the producer
       // flagged the row as disagreeing with OpenRouter's snapshot by >= 3
       // index points. The connective word mirrors the CLI footer's
       // stamp_words ("checked" for aa, "as of" elsewhere). The note names
       // the row's own OR pair; a flag without a finite check value cannot
       // name what it disagrees with, so the note is withheld rather than
-      // leaking "NaN". Rows without provenance (older data.json files,
-      // unmatched models) return null: the cell keeps its bare value and
-      // the column header's title carries the hint.
+      // leaking "NaN". A reasoning row's OR snapshot has no effort label,
+      // so its reference is not a like-for-like drift check. Rows without
+      // provenance (older data.json files, unmatched models) return null:
+      // the cell keeps its bare value and the column header's title carries
+      // the hint.
       function qualityTooltip(row) {
         var source = row.quality_source;
         if (!source) return null;
@@ -241,6 +410,14 @@
         if (asOf !== null) {
           text += (source === "aa" ? ", checked " : ", as of ") + asOf;
         }
+        var reasoning = row.reasoning || {};
+        var defaultEffort = row.default_effort || reasoning.default_effort;
+        if (row.quality_effort) {
+          text += ", measured at " + row.quality_effort;
+          if (row.quality_effort === defaultEffort) {
+            text += " (OpenRouter's effective default)";
+          }
+        }
         if (row.quality_drift === true && Number.isFinite(row.quality_or_index)) {
           var orDate = qualityAsOf("openrouter", row.quality_or_as_of);
           text +=
@@ -248,6 +425,39 @@
             row.quality_or_index.toFixed(1) +
             (orDate === null ? "" : ", " + orDate) +
             ")";
+        } else if (
+          row.quality_drift !== true &&
+          row.quality_drift !== false &&
+          Number.isFinite(row.quality_or_index)
+        ) {
+          var refDate = qualityAsOf("openrouter", row.quality_or_as_of);
+          text +=
+            "; OpenRouter snapshot (" +
+            row.quality_or_index.toFixed(1) +
+            (refDate === null ? "" : ", " + refDate) +
+            ") is not like-for-like: its reasoning effort is not reported";
+        }
+        if (
+          source === "openrouter" &&
+          row.quality_effort &&
+          row.quality_effort !== "none" &&
+          !Number.isFinite(row.quality_or_index)
+        ) {
+          text +=
+            "; OpenRouter does not report the reasoning effort of its " +
+            "snapshot: not like-for-like";
+        }
+        var best = bestDepthAlternative(row);
+        if (best) {
+          text +=
+            ". Best selectable alternative: " +
+            best.effort +
+            " " +
+            pyFixed(best.index, 1);
+          if (best.cost !== null) {
+            text += " at $" + pyFixed(best.cost, 2) + "/task";
+          }
+          text += ". Click the row for all depths.";
         }
         return text;
       }
@@ -424,18 +634,37 @@
       var DEFAULT_MAIN_ROWS = 10;
       var DEFAULT_DEAL_ROWS = 5;
       var FULL_DEAL_ROWS = 10;
+      // Reasoning-effort display order (deepest first), mirroring
+      // model_compare.AA_EFFORT_ORDER. Kept in sync with the CLI.
+      var EFFORT_ORDER = [
+        "max",
+        "xhigh",
+        "high",
+        "medium",
+        "low",
+        "minimal",
+        "none",
+        "reasoning",
+      ];
       // Column counts of the main ranking table; the endpoint disclosure
       // row spans all visible ones. Kept in sync with the markup's <th>
       // count by web/test_site_js.py -- bump both when a column is added.
-      var MAIN_TABLE_COLS = 13;
+      var MAIN_TABLE_COLS = 14;
       // Simple view shows rank, 7-day, model, quality, in, out, discount,
-      // age: the expert count minus the five hidden columns below.
+      // age: the expert count minus the six hidden columns below.
       var SIMPLE_TABLE_COLS = 8;
       // Columns absent from the simple view, keyed by their cells[] index
       // (render() skips the cell; the markup's <th> and the legend hints
-      // carry the matching hide-simple class). PREC, TIER, CTX, SCORE,
-      // TASK$.
-      var SIMPLE_HIDDEN_CELLS = { 6: true, 7: true, 8: true, 10: true, 11: true };
+      // carry the matching hide-simple class). DEPTH, PREC, TIER, CTX,
+      // SCORE, TASK$.
+      var SIMPLE_HIDDEN_CELLS = {
+        2: true,
+        7: true,
+        8: true,
+        9: true,
+        11: true,
+        12: true,
+      };
       var mainExpanded = false;
       var dealsExpanded = false;
 
@@ -585,6 +814,130 @@
         return tr;
       }
 
+      function depthSelectText(reasoning, depth) {
+        if (depth.effort === "reasoning") return "-";
+        var supported = Array.isArray(reasoning.supported_efforts)
+          ? reasoning.supported_efforts
+          : [];
+        if (
+          depth.effort === "none" &&
+          !supported.length &&
+          isNonReasoningBlock(reasoning)
+        ) {
+          return "-";
+        }
+        return "not selectable";
+      }
+
+      // depthTable(entry): the expanded row's Depth section table. Reads
+      // the catalog entry's reasoning block (data.json rows stay lean and
+      // drop it). Selectable efforts get a copy button for the OpenCode
+      // variant id; an AA-measured effort OpenRouter cannot run stays for
+      // transparency with a "not selectable" note and no button.
+      function depthTable(entry) {
+        var reasoning = entry && entry.reasoning;
+        if (!reasoning) return null;
+        var rows = depthRows({
+          quality_effort: entry.quality_effort,
+          default_effort: reasoning.default_effort,
+          supported_efforts: reasoning.supported_efforts,
+          reasoning: reasoning,
+        });
+        if (!rows.length) return null;
+        var table = document.createElement("table");
+        table.className = "depth-table";
+        var thead = document.createElement("thead");
+        var headTr = document.createElement("tr");
+        ["effort", "AA idx", "AA $/task", "vs default", "select"].forEach(
+          function (label) {
+            var th = document.createElement("th");
+            th.textContent = label;
+            headTr.appendChild(th);
+          },
+        );
+        thead.appendChild(headTr);
+        table.appendChild(thead);
+        var tbody = document.createElement("tbody");
+        rows.forEach(function (depth) {
+          var tr = document.createElement("tr");
+          if (depth.selected) tr.className = "depth-selected";
+          [
+            depth.effort + (depth.default ? "*" : ""),
+            depth.index === null ? "-" : pyFixed(depth.index, 1),
+            depth.cost === null ? "-" : pyFixed(depth.cost, 2),
+            fmtDepthRatio(depth.ratio),
+          ].forEach(function (cell) {
+            var td = document.createElement("td");
+            td.textContent = cell;
+            tr.appendChild(td);
+          });
+          var select = document.createElement("td");
+          if (depth.selectable) {
+            var btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "copy-depth";
+            btn.textContent = "#" + depth.effort;
+            wireCopy(btn, function () {
+              return "openrouter/" + entry.id + "#" + depth.effort;
+            });
+            select.appendChild(btn);
+          } else {
+            select.className = "not-selectable";
+            select.textContent = depthSelectText(reasoning, depth);
+          }
+          tr.appendChild(select);
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        return table;
+      }
+
+      // The depth disclosure row. Kept separate from endpointRow so each
+      // section degrades on its own (catalog failure vs a model-level join
+      // miss); render() appends this one first, then the endpoint table.
+      function depthDetailRow(entry, catalogLoaded) {
+        var tr = document.createElement("tr");
+        tr.className = "endpoint-row depth-row";
+        var td = document.createElement("td");
+        td.colSpan = view === "simple" ? SIMPLE_TABLE_COLS : MAIN_TABLE_COLS;
+        if (!catalogLoaded) {
+          td.textContent = "depth details unavailable - catalog fetch failed";
+          tr.appendChild(td);
+          return tr;
+        }
+        if (!entry || !entry.reasoning) {
+          td.textContent = "no depth data for this model.";
+          tr.appendChild(td);
+          return tr;
+        }
+        var heading = document.createElement("p");
+        heading.className = "detail-heading";
+        heading.textContent = "Depth";
+        td.appendChild(heading);
+        var note = document.createElement("p");
+        note.className = "endpoint-note";
+        note.textContent =
+          "AA index / AA $ per task; OR $/M is constant across depths.";
+        td.appendChild(note);
+        var table = depthTable(entry);
+        if (!table) {
+          var empty = document.createElement("p");
+          empty.className = "endpoint-note";
+          empty.textContent = "no depth data for this model.";
+          td.appendChild(empty);
+        } else {
+          td.appendChild(table);
+          var legend = document.createElement("p");
+          legend.className = "endpoint-note";
+          legend.textContent =
+            "* = OpenRouter default; #effort selects that depth in OpenCode; " +
+            "not selectable = AA measured it but OpenRouter cannot run it.";
+          td.appendChild(legend);
+        }
+        tr.appendChild(td);
+        return tr;
+      }
+
       function render() {
         var rows = (data && data.priorities[current]) || [];
         var shown = mainExpanded ? rows : rows.slice(0, DEFAULT_MAIN_ROWS);
@@ -627,13 +980,30 @@
               }
             }
           }
+          // data.json drops the nested reasoning block (it stays lean); the
+          // depth table and the DEPTH/QUAL hints join it back from the
+          // catalog entry looked up above.
+          var depthRow = Object.assign(
+            {},
+            row,
+            entry && entry.reasoning ? { reasoning: entry.reasoning } : {},
+          );
           var precTooltip = fmtQuantTooltip(row);
           var ctxCaveat = fmtCtxCaveat(entry, row);
-          var qualityTip = qualityTooltip(row);
+          var qualityTip = qualityTooltip(depthRow);
+          var depthTip = depthTooltip(depthRow);
+          var qualityScore =
+            row.quality_index === null ? "-" : row.quality_index.toFixed(1);
+          var simpleQuality = qualityScore;
+          if (row.quality_index !== null && depthRow.quality_effort) {
+            simpleQuality += " · " + depthRow.quality_effort;
+          }
+          var depthAlternative = fmtDepthAlternative(depthRow);
           var cells = [
             String(i + 1),
             row.model,
-            row.quality_index === null ? "-" : row.quality_index.toFixed(1),
+            fmtEffort(depthRow),
+            view === "simple" ? simpleQuality : qualityScore,
             fmtPrice(row.input_usd_per_m),
             fmtPrice(row.output_usd_per_m),
             row.discount_pct || "--",
@@ -645,7 +1015,7 @@
             fmtTaskCost(row.session_cost_usd),
           ];
           cells.forEach(function (cell, idx) {
-            // Simple view drops the five expert-only columns; the <th>
+            // Simple view drops the six expert-only columns; the <th>
             // markup and the legend hints carry the matching hide-simple
             // class, so the row and its headers stay aligned.
             if (view === "simple" && SIMPLE_HIDDEN_CELLS[idx]) return;
@@ -658,18 +1028,28 @@
             var td = document.createElement("td");
             td.textContent = cell;
             if (idx === 2) {
+              if (depthTip) td.title = depthTip;
+            } else if (idx === 3) {
               if (qualityTip) td.title = qualityTip;
-            } else if (idx === 6) {
-              if (precTooltip) td.title = precTooltip;
+              // Expert view names the best selectable alternative under
+              // the score; simple view keeps the effort tag instead.
+              if (view !== "simple" && depthAlternative) {
+                var alt = document.createElement("span");
+                alt.className = "depth-alt";
+                alt.textContent = depthAlternative;
+                td.appendChild(alt);
+              }
             } else if (idx === 7) {
+              if (precTooltip) td.title = precTooltip;
+            } else if (idx === 8) {
               td.className = "tier";
               if (tier.hover) td.title = tier.hover;
-            } else if (idx === 8) {
+            } else if (idx === 9) {
               if (ctxCaveat) {
                 td.title = ctxCaveat;
                 td.className = "caveat";
               }
-            } else if (idx === 11) {
+            } else if (idx === 12) {
               if (cell === "—") {
                 td.title = "Not available this refresh.";
                 td.className = "na";
@@ -697,6 +1077,7 @@
           });
           els.tbody.appendChild(tr);
           if (endpointExpanded[row.model]) {
+            els.tbody.appendChild(depthDetailRow(entry, catalogData));
             els.tbody.appendChild(endpointRow(entry, catalogData));
           }
         });
@@ -744,13 +1125,24 @@
           // hand-edited catalog must not throw into the fetch .catch.
           var note = deal.sched_note ? String(deal.sched_note) : "";
           var qualityTip = qualityTooltip(deal);
+          var qualityText =
+            deal.quality === null || deal.quality === undefined
+              ? "-"
+              : deal.quality.toFixed(1);
+          // Same effort tag as the main table's simple QUAL cell: the
+          // schedule entry carries the depth its recorded quality used.
+          if (
+            deal.quality !== null &&
+            deal.quality !== undefined &&
+            deal.quality_effort
+          ) {
+            qualityText += " · " + deal.quality_effort;
+          }
           var cells = [
             deal.model,
             note || "--",
             deal.sched_detail || "",
-            deal.quality === null || deal.quality === undefined
-              ? "-"
-              : deal.quality.toFixed(1),
+            qualityText,
             fmtPrice(deal.input_per_1m),
             fmtPrice(deal.output_per_1m),
             deal.context === null || deal.context === undefined

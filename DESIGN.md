@@ -11,9 +11,11 @@ How the tool works under the hood. End-user docs live in the
    catalog: per-token input/output prices, context window, listing date,
    supported parameters (used for the tool-calling check) and modality info.
 2. **Artificial Analysis** — the [AA intelligence index](https://artificialanalysis.ai/models),
-   a 0–100 composite of reasoning/coding/knowledge benchmarks. Reached
-   through three ranked quality sources (precedence, matching rules and
-   provenance live in "Quality sources and reconciliation" below):
+   a 0–100 composite of reasoning/coding/knowledge benchmarks. AA returns
+   one row per measured reasoning-effort variant, so the index is per effort;
+   the tool ranks on the model's effective OpenRouter default effort and
+   keeps every measured depth for display (see "Quality sources and
+   reconciliation" below). Reached through three ranked quality sources:
    - **AA API v2 (primary, keyed)**
      (`artificialanalysis.ai/api/v2/language/models/free`), when an API key
      is supplied through `--aa-api-key` or the `AA_API_KEY` env var
@@ -56,14 +58,23 @@ with priority-dependent weights:
   [0, 1]; free listings score 1.0. Log-scaling keeps the pool's
   three-orders-of-magnitude price spread from crushing everything above the
   cheapest listing into one undifferentiated bucket.
-- **quality score** — AA intelligence index ÷ `--quality-ref` (default 70),
-  clamped to [0, 1].
+- **quality score** — the AA intelligence index at the selected effort
+  (default: the model's effective OpenRouter default effort) ÷
+  `--quality-ref` (default 70), clamped to [0, 1].
 - **context score** — logarithmic ramp from `--min-context` up to 4× that
   threshold: headroom helps, but with diminishing returns.
 - **age score** — exponential decay with a `--recency-half-life` of 120 days:
   a listing half the age of another scores ~0.5× higher on this axis.
 - **context filter** — hard minimum (`--min-context`, default 1M tokens),
   so a cheap small-window model can never win a big-context job.
+
+`--reasoning-effort <effort>` (default `default`; choices `default`, `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) has two effects: it
+selects the effort the main quality is resolved at, and — for any value but
+`default` — it drops models that cannot run that effort (`reasoning effort`).
+`default` never filters; models with an unknown default stay in the pool and
+show `QUAL -`. Scoring itself is unchanged: `cand["quality"]` stays the float
+index, and only which effort's record fills it changes.
 
 ## What gets filtered out
 
@@ -72,21 +83,38 @@ tool-calling support (`--no-require-tools` to relax), unparseable/negative
 prices, expired listings, `:batch` variants (asynchronous completion — no
 good for interactive agents; `--include-batch` to keep them), models without
 a zero-data-retention (ZDR) endpoint by default (`--no-zdr` to consider
-everything), and (with `--exclude-free`) rate-limited `:free` variants.
+everything), (with `--exclude-free`) rate-limited `:free` variants, and (with
+`--reasoning-effort <effort>`) models that cannot run the selected effort.
 
 ## Quality sources and reconciliation
 
 Every quality value is a record, not a bare float:
-`{"index", "source", "as_of", "drift", "or_index", "or_as_of"}`. The record
-travels end to end: `--json` rows carry the five provenance fields
-(`quality_source`, `quality_as_of`, `quality_drift`, `quality_or_index`,
-`quality_or_as_of`), catalog v4 entries carry `quality_as_of` and
-`quality_drift` verbatim plus the winning source label in `quality_match`,
-the CLI footer's quality note names each source with its own as-of, and the
-site's QUAL tooltip renders it. Scoring reads only `record["index"]`:
-`cand["quality"]` stays the float index downstream consumers already
-expect, and `build_schedules` stores that float into the deals index —
-never the record dict.
+`{"index", "source", "as_of", "effort", "drift", "or_index", "or_as_of"}`.
+The record travels end to end: `--json` rows carry the five provenance
+fields (`quality_source`, `quality_as_of`, `quality_drift`,
+`quality_or_index`, `quality_or_as_of`) plus `quality_effort` and the
+top-level `default_effort`, catalog v5 entries carry `quality_as_of` and
+`quality_drift` verbatim, the winning source label in `quality_match`,
+`quality_effort`, and a `reasoning` block with the effective default, the
+expanded supported-effort list and every measured depth; the CLI footer's
+quality note names each source with its own as-of, and the site's QUAL
+tooltip renders it. Scoring reads only `record["index"]`: `cand["quality"]`
+stays the float index downstream consumers already expect, and
+`build_schedules` stores that float into the deals index — never the record
+dict.
+
+Selection is effort-aware. The requested effort is `--reasoning-effort` when
+it is not `default`, otherwise each model's **effective** OpenRouter default:
+`default_enabled` decides whether a default request enables reasoning at all
+and `default_effort` which level it pre-selects (the models API's `reasoning`
+object first, the frontend `reasoning_config` as fallback). `resolve_quality`
+takes the record at that effort; a model AA has not measured there is
+`QUAL -`, never scored with another effort's number. Every depth record is
+`{"effort", "index", "cost_per_task_usd", "source", "as_of"}` — `index`, not
+`quality_index`, the same vocabulary as the main record. The depth block's
+`select` (`#<effort>`) and `cost_ratio_vs_default` are derived by consumers,
+not stored. AA `$/task` is AA's reference-price benchmark cost: display-only,
+never in the weighted score.
 
 Precedence is a strict rank, never freshness — `as_of` never outranks
 precedence; it is display-only provenance. The chain is mode-scoped:
@@ -106,7 +134,16 @@ Per-source matching and `as_of` semantics:
 
 1. **`aa` — live AA API** (`/api/v2/language/models/free`; any tier key
    works, free is enough; responses paginate at 200 models per page and are
-   followed). Matched by exact slug/name tiers only — the fuzzy pass exists
+   followed). Each row is one measured effort variant; the effort is parsed
+   from the trailing parenthetical in `name` first and the `slug` suffix
+   second. A row whose effort cannot be parsed is display-only — never
+   guessed from the model's default — and an ambiguous parenthetical (two
+   effort tokens, or `non-reasoning` plus an effort) is not used for a
+   discrete-depth match. The lookup is `base key → effort → record`;
+   duplicate `(base, effort)` records from different rows are dropped as
+   ambiguous, and entries are deduped by AA `id` (fallback `(slug, name)`) so
+   variants cannot overwrite each other. Matched by exact slug/name tiers
+   only — the fuzzy pass exists
    in code but stays off in production (it is the proven variant-conflation
    bug that paired `z-ai/glm-5.3-flash` with AA's `glm-5-3` entry).
    `as_of` is the **fetch timestamp**: the Free API exposes no evaluation
@@ -121,12 +158,14 @@ Per-source matching and `as_of` semantics:
    the github.io host 301s to plain http — an unauthenticated downgrade on
    ranking-critical data — so the direct https URL is used deliberately).
    The values were produced by a keyed CI run, so hydration is an exact
-   catalog-id join with no re-matching. Gates: `schema_version` must be an
-   int ≥ 3 (older warns "published catalog schema vX, expected >= 3" and
-   skips — accepting v3 is the deploy-day skew case); v3 rows are
-   normalized (`quality_match` "api" → "aa", `as_of` = the catalog's
-   `generated_at` — the live v3 artifact's null `quality_as_of` is ignored,
-   not passed through); v4+ rows keep their recorded `quality_as_of`. The
+   catalog-id join with no re-matching. Gates: `schema_version` must be
+   exactly 5 (anything else — a v3/v4 artifact or a future version — warns
+   and hydrates no quality rather than mixing quality semantics); rows keep
+   their recorded `quality_as_of` and `quality_effort`. Because the catalog
+   carries every depth record, an unkeyed run re-selects the candidate's
+   quality at the **current** effective default even when the keyed run's
+   default differed; schedule rows instead use the entry's recorded quality
+   and effort (see the catalog contract). The
    row labels are the keyed CI run's row-level truth inside the artifact
    (`aa`/`openrouter` — a real catalog row never carries `catalog`); the
    catalog tier labels every hydrated record `catalog` — the run-level
@@ -150,15 +189,22 @@ Per-source matching and `as_of` semantics:
    resolve latest-date-wins). `as_of` is the permaslug date (YYYYMMDD):
    the listing's snapshot date, a proxy for the AA measurement date.
    Matched via `base_model_id`, so a `:variant` suffix inherits its base's
-   trio.
+   trio. The trio carries no effort label, so it supplies the main quality
+   only for a non-reasoning model (`quality_effort: "none"`); for a
+   reasoning model it is a reference only.
 
-Drift is always winner-vs-OR: when the winner is `aa` or `catalog` and the
-OR trio for the same base id has a finite index, the record carries
-`or_index`/`or_as_of` and `drift = |index − or_index| ≥ 3.0`. When the
-winner IS `openrouter`, or no OR value exists, the drift pair is None —
-there is no second source to disagree with. Drift surfaces in `--json`, the
-catalog, the footer ("; drift vs OpenRouter snapshot (N)") and the site
-tooltip ("differs from OpenRouter snapshot (<or_index>, <or_as_of>)").
+Drift is always winner-vs-OR, and only like-for-like: the comparison is
+valid only when both sides are non-reasoning. When the winner is `aa` or
+`catalog` for a non-reasoning model at `quality_effort: "none"` and the OR
+trio for the same base id has a finite index, the record carries
+`or_index`/`or_as_of` and `drift = |index − or_index| ≥ 3.0`. A reasoning
+model keeps `or_index`/`or_as_of` as a reference but `drift` is null — even
+when its effective default is `none`: OpenRouter's snapshot reports no
+effort, so a difference may be a depth difference, not drift. When the
+winner IS `openrouter`, or no OR value exists, the drift pair is None. Drift surfaces in `--json`, the
+catalog, the footer ("; drift vs OpenRouter snapshot: N comparable
+(non-reasoning) row(s)" — the count covers like-for-like rows only) and the
+site tooltip ("differs from OpenRouter snapshot (<or_index>, <or_as_of>)").
 
 The `sources.aa` block (reshaped in catalog v4) describes the **run's
 chain, not a match outcome**: `mode` names the tier that yielded — `aa`
@@ -170,18 +216,30 @@ neither tier produced data. OpenRouter is never a mode — its count lives
 in `matched_openrouter`. The three counts are disjoint buckets (strict rank
 gives every candidate at most one record); their sum is exactly the number
 of entries with a non-null `quality_match`, an invariant
-`web/build_site_data.py` enforces. `catalog_generated_at` and
+`web/build_site_data.py` enforces. The v5 block adds the candidate-scoped
+depth counts: `depth_rows` (total depth records across candidates),
+`matched_depth` (candidates with at least one depth record) and
+`matched_default` (candidates whose main record sits at the resolved
+requested effort — the effective default when `--reasoning-effort default`;
+it equals the number of main quality records under strict selection). They
+are separate and non-negative, and schedule entries never enter them.
+`catalog_generated_at` and
 `intelligence_index_version` are null when their source was not consulted.
 The v3 block's `fallback` and `matched` keys are gone, and with them the
 old gate's vocabulary: `web/publish.py`'s `check_aa_source` now fails
 closed when `AA_API_KEY` is set but the published catalog shows no live AA
-data — `mode` not `aa` or `matched_aa` ≤ 0 — so a rejected key or an
-AA-less chain can no longer deploy silently; it checks right after the
+data — `mode` not `aa`, or `matched_aa`/`depth_rows`/`matched_default` not a
+positive int — so a rejected key, an empty result or an AA-less chain can no
+longer deploy silently; it also warns (without failing) when
+`matched_default / candidates` falls below 25%, the provisional coverage
+threshold. It checks right after the
 `--catalog` step, before any artifact is written, and never raises without
 the key.
 
-Cache keys pin the shapes: `aa-intelligence-v3` (AA entries carry `as_of`
-and the envelope version), `openrouter-frontend-aa-v2` (slug-keyed records
+Cache keys pin the shapes: `aa-intelligence-v4` (one record per measured
+effort: `id`, `name`, `slug`, `base`, `effort`, `index`, `cost_per_task`,
+`as_of`, plus the envelope's `intelligence_index_version`),
+`openrouter-frontend-aa-v2` (slug-keyed records
 with `as_of`), `published-catalog` (the hydration envelope). Payloads
 cached under earlier keys predate those fields and are never read. The
 source label `api` was renamed `aa` with the reconciliation; consumers
@@ -255,8 +313,13 @@ The document is a **stable contract**. Downstream, `data.json` — not the
 catalog — feeds internal Canonical tooling: tokens.canonical.com (the
 `canonical/agent-provisioner` backend) fetches `data.json` daily and reads
 only its `priorities` mapping (rows with a string `model` id, optional
-`quality_index`, optional `discount`), validating nothing about
-`schema_version` — a v2 `data.json` therefore needs no downstream work. The
+`quality_index`, optional `discount`), and pins its schema. `data.json` is
+now v3: the field-level shape is unchanged, but `quality_index` is the
+default/selected-effort score and can be lower than the max-effort values
+the backend used to read. Its `ARTIFACT_SCHEMA_VERSION` pin (1 today; issue
+#21 tracks the in-flight bump to 2) needs to reach 3 in the same window,
+tracked in `canonical/agent-provisioner#638`; the backend fails closed until
+then and keeps its previous snapshot. The
 catalog's strict consumer is the [model-compare OpenCode
 plugin](https://www.npmjs.com/package/model-compare-opencode-plugin). Its
 only published release (npm 0.1.3, `latest` as of 2026-10-23; the
@@ -269,29 +332,38 @@ the vendored pin is re-pinned via the plugin's `sync-vendor.mjs` flow when
 upstream cuts a release. The plugin's remote source fetches the published
 catalog and has therefore rejected every published catalog since the v3
 publish — the v3-accepting plugin release the v3 cutover required never
-shipped — and v4 extends that rejection: remote-source users keep serving
-their last cached document until a plugin release accepts the published
-schema and is installed. Both facts were investigated against the live
-consumer repos on 2026-10-20 — see
+shipped — and v4 and v5 extend that rejection: remote-source users keep
+serving their last cached document until a plugin release accepts the
+published schema and is installed. Both facts were investigated against the
+live consumer repos on 2026-10-20 — see
 `docs/superpowers/notes/2026-10-20-downstream-investigations.md` — and the
 npm 0.1.3 source (`src/core/catalog.ts` rejects any document whose
-`schema_version` is not `2`) was re-verified on 2026-10-23. Same
+`schema_version` is not `2`) was re-verified on 2026-10-23. The v5 handoff
+is `canonical/model-compare-opencode-plugin#16`: accept v5, validate
+`quality_effort`/`reasoning` enough to use them, pin the effective effort on
+aliases (never send `effort: "reasoning"` — a catalog sentinel, not a
+gateway value), expose one variant per discrete effort, and release after
+the v5 catalog deploys. Same
 inputs still produce the same output apart from `generated_at` and the age
 score (`age_days`/`listed_at` use UTC date precision, but `scores.age` decays
 continuously, so two runs on the same day differ slightly in `scores.age`).
-`schema_version` is now `4` (v1 pinned the pricing scalars to the base tier;
+`schema_version` is now `5` (v1 pinned the pricing scalars to the base tier;
 v2 added the top-level `schedules` index; v3 made the per-model `pricing`
 block describe the baseline endpoint — see below; v4 added the quality
-provenance fields and reshaped `sources.aa` — see "Quality sources and
+provenance fields and reshaped `sources.aa`; v5 changed the meaning of
+`quality` to the selected/default-effort score and added `quality_effort`
+and the per-model `reasoning` block — see "Quality sources and
 reconciliation"): fields may be added without notice, but renaming,
 removing, **or changing the meaning of** one bumps the version.
 
-Top level: `schema_version`, `tool`, `generated_at`, `parameters` (all knobs
-plus the **effective** per-priority `weights` — reproducing `scores.overall`
+Top level: `schema_version`, `tool`, `generated_at`, `parameters` (all knobs,
+including the requested `reasoning_effort`, plus the **effective**
+per-priority `weights` — reproducing `scores.overall`
 needs nothing else), `sources` (`openrouter`, `aa` with `mode`
 `aa`/`catalog`/`none` — the run's quality chain, not a match outcome; see
 "Quality sources and reconciliation" — plus the disjoint counts
-`matched_aa`, `matched_catalog` and `matched_openrouter` and the provenance
+`matched_aa`, `matched_catalog` and `matched_openrouter`, the depth counts
+`depth_rows`/`matched_depth`/`matched_default`, and the provenance
 meta `catalog_generated_at`/`intelligence_index_version`, `zdr`
 `ok`/`skipped`, `discounts`
 `ok`/`unavailable` — where `unavailable` covers both a failed discount fetch
@@ -321,22 +393,32 @@ OpenRouter model list, deliberately **not** filtered by the candidate pool
 models mostly sit below the 1M context floor, and filtering would shrink the
 deals table from three rows to two. Router aliases (`~` ids) and malformed
 ids are excluded; `:batch` variants are included as distinct deals. Each
-entry carries `id`, `name`, `context`, `quality` (the candidate's, else the
-OpenRouter-published AA index, else `null`), `score` (the balanced overall
+entry carries `id`, `name`, `context`, `quality` (the AA depth record at the
+requested effort — the effective default when `--reasoning-effort default` —
+for a keyed run; a non-reasoning model may use the OpenRouter trio with
+`quality_effort: "none"`, but a reasoning model with no default-depth record
+is `null`, never the trio), `quality_effort`/`quality_as_of`/
+`quality_source` (the winning record's provenance, hydrated verbatim on
+unkeyed runs), `score` (the balanced overall
 for candidates, else `null`), `max_discount` (4-decimal-rounded), `sched_note`,
 `sched_detail`, `peak`/`offpeak` price blocks (per-1M; `offpeak` is the
-cheapest window) and the full `schedule` window list. Downstream
+cheapest window) and the full `schedule` window list. Schedule entries are
+not candidates: they never enter `sources.aa`'s counts or the pool
+invariants, and on an unkeyed run `--reasoning-effort` affects candidates
+only (the entry carries no depth list to re-select from). Downstream
 time-weighted price for a window list: `Σ coverage × price` (per key).
 
 `sources.aa` was reshaped in v4 — the `fallback` and `matched` keys are
 gone, and with them the vocabulary that could report the removed JSON-LD
 page-scrape `scrape` mode. The block now names the run's quality chain, not
 a match outcome; the full semantics — the mode enum, the disjoint bucket
-counts and their sum invariant — are in "Quality sources and
-reconciliation" above. With `AA_API_KEY` set, `web/publish.py`
+counts, the v5 depth counts and their sum invariants — are in "Quality
+sources and reconciliation" above. With `AA_API_KEY` set, `web/publish.py`
 (`check_aa_source`) fails the run unless the block shows live AA data —
-`mode` `aa` with `matched_aa` > 0; a rejected key or an AA-less chain fails
-closed — and it checks right after the `--catalog` step, before any
+`mode` `aa` with positive `matched_aa`, `depth_rows` and `matched_default`;
+a rejected key, an empty per-effort result or an AA-less chain fails
+closed — and it warns, without failing, below 25% default-effort coverage.
+It checks right after the `--catalog` step, before any
 artifact is written.
 
 `rankings` maps each priority (`balanced`, `price`, `quality`) to the full
@@ -352,17 +434,30 @@ Each `models` entry carries: `id` (bare `provider/model`), `name`,
 → `glm`; `null` when there is none), `pricing` — **under v3 the
 baseline endpoint's price structure in full** (see below) — `context`,
 `listed_at`, `age_days`, `tool_calling`, `zdr`, `discount`, `expired`,
-`quality` (AA intelligence index or `null`), `aa` (the OpenRouter-published
+`quality` (the AA intelligence index at the selected/default effort, or
+`null`), `aa` (the OpenRouter-published
 trio `intelligence_index`/`coding_index`/`agentic_index`, each possibly
 `null`), `quality_match` (`aa`/`catalog`/`openrouter` — the winning
 source's label — or `null`) with the v4 additive `quality_as_of` and
-`quality_drift` (the record's fields verbatim; `null` when unmatched),
-`scores` —
+`quality_drift` (the record's fields verbatim; `null` when unmatched), the
+v5 additive `quality_effort` (the effort behind `quality`) and `reasoning`
+block, `scores` —
 the four component scores plus
 `overall` for all three priorities, so downstream consumers never re-run
 the scorer — and the v3 additive per-model blocks `endpoints`,
 `default_precision`, `advertised_pricing`, `annotations` (plus `steering`,
 below).
+
+**The `reasoning` block (v5) is always present**: `default_effort` (the
+effective default, not the raw pre-select value),
+`supported_efforts` (expanded from `null` to the full gateway set, never
+`null`; an omitted field stays empty), `default_enabled`, `mandatory`,
+`supports_max_tokens` (the raw flags, for provenance) and `depths` (the
+per-depth records above; empty only when no source measured an effort). A
+non-reasoning model with an AA or OpenRouter record carries exactly one
+`none` record. `--json` emits the same block, with its own top-level
+`default_effort` duplicated so `data.json` rows keep it after the nested
+block is dropped.
 
 **The `pricing` block describes the baseline endpoint.** The baseline is the
 cheapest live (status-0) baseline-eligible endpoint at the model's default
@@ -439,14 +534,18 @@ tool counts internally:
 
 ```
 malformed id, context, pricing, schedule, free, batch, no discount, not ZDR,
-modality, tool calling, expired, age, no_baseline_eligible_endpoint,
-endpoint_fetch_failed
+modality, tool calling, expired, age, reasoning effort,
+no_baseline_eligible_endpoint, endpoint_fetch_failed
 ```
 
 The `schedule` reason is fail-closed by design: a model whose
 `pricing.overrides` time windows do not tile the week exactly (or whose
 windows fail validation) has no deterministic price, so it is dropped
-entirely rather than ranked at a fetch-time-dependent top level. The two new
+entirely rather than ranked at a fetch-time-dependent top level. The
+`reasoning effort` reason appears only when `--reasoning-effort` names a
+specific effort: models whose `supported_efforts` does not contain it are
+dropped. `default` never filters. It enters the pool-accounting invariant
+but not the site's endpoint drop-rate gate. The two new
 endpoint-stage reasons are snake_case while the older ones are human phrases
 — a deliberate, documented mixed convention: they are machine-readable keys
 for the endpoint-stage drops. That registry sync is load-bearing:
@@ -456,25 +555,33 @@ pool-accounting invariant (`sum(dropped) + candidates == listed`, enforced by
 `web/build_site_data.py`) and the publish drop-rate gate below, which read
 `pool.dropped`, break if a reason is produced but not registered.
 
-Version gates: catalog `schema_version` 4, `data.json` 2, `history.json` 3
+Version gates: catalog `schema_version` 5, `data.json` 3, `history.json` 4
 — each a strict identity check accepting exactly that value and rejecting
-anything else (catalog 3 was the pricing cutover; the quality reconciliation
-bumped it to 4 without touching the other two — `data.json`'s new row keys
-are additive, so no downstream version moved). `web/publish.py` also fails the run when more
+anything else. The v5 cutover moves all three at once: `quality` changes
+meaning (selected/default effort), `data.json` gains the required
+`quality_effort` and `default_effort` row keys, and the max-based history is
+not comparable with the new scores, so it starts fresh.
+`web/build_site_data.py` hosts the catalog, `data.json` and history gates;
+`web/publish.py` pins `data.json`'s version in `check_stamps`. It also fails
+the run when more
 than 5% of the entered pool (`candidates` + the two endpoint-stage drops) is
 dropped for an endpoint-derived reason (`no_baseline_eligible_endpoint` or
 `endpoint_fetch_failed`; constant `MAX_ENDPOINT_DROP_RATE = 0.05`) — a
 transient API outage or a first-party-detection miss must shrink the public
 ranking loudly, never silently. The history bump at the pricing cutover
-resets ALL snapshot
+reset ALL snapshot
 history: prices, rank movement, the AA index and pool ids. Old snapshots
 describe old price semantics (advertised models-API scalars), so mixing them
 with baseline-endpoint prices would fabricate a fake price trend; no
-continuity bridge is built. The site's 7-day movement arrows and the weekly
-highlights diff degrade to their no-baseline state until fresh history
+continuity bridge is built. The v4 cutover resets it again: old snapshots
+carry max-effort quality scores that are not diffable against default-effort
+ones, for the same reason. Each reset leaves the site's 7-day movement
+arrows and the weekly
+highlights diff in their no-baseline state until fresh history
 covers the full week: both look up the snapshot dated exactly seven days
 before today, and history snapshots key on UTC dates, so that takes seven
-days of fresh snapshots to accumulate.
+days of fresh snapshots to accumulate. `highlights.json` keeps schema 1 and
+degrades with the history reset.
 
 `pool.dropped` lists all of the reason strings above zero-filled. `--top`
 and `--priority` are ignored with `--catalog` (the document always covers the
@@ -503,7 +610,8 @@ deployed artifacts' stamps disagree.
 
 A `pytest` suite covers the ranking logic (`test_model_compare.py` — input
 coercion, candidate filtering, scoring math, discount parsing, Artificial
-Analysis matching) and the site tooling (`web/` — the data builder, the
+Analysis matching, effort parsing, reasoning metadata and depth selection)
+and the site tooling (`web/` — the data builder, the
 highlights generator, the preview script and the publish orchestrator), with
 no network access (external calls are stubbed). Run it from the repo root:
 
@@ -511,11 +619,17 @@ no network access (external calls are stubbed). Run it from the repo root:
 $ pytest
 ```
 
+The recorded AA page-set fixture the thinking-depth design requires (spec
+§13) is captured on the first keyed CI run, and the design's §5.1 live
+effort table is re-verified against it then.
+
 ## Release checklist
 
-1. Bump `VERSION` in `model_compare.py`, `web/publish.py` and
-   `web/generate_highlights.py` so `--version` and the user agents match,
-   then update the pinned literal in
+1. Bump `VERSION` in `model_compare.py` so `--version` and the user agent
+   match; it is the only release version — `web/publish.py` and
+   `web/generate_highlights.py` carry no `VERSION` (the latter imports
+   `HISTORY_SCHEMA_VERSION` from `build_site_data`, and
+   `HIGHLIGHTS_SCHEMA_VERSION` stays 1). Then update the pinned literal in
    `test_model_compare.py::test_version_flag` (it exists precisely so a
    forgotten bump fails the suite).
 2. Add a `CHANGELOG.md` entry dated today.
@@ -525,4 +639,8 @@ $ pytest
    download:
    `raw.githubusercontent.com/canonical/model-compare/vX.Y.Z/model_compare.py`.
 6. Never rename the catalog `tool` literal or remove schema fields without
-   bumping `schema_version`.
+   bumping `schema_version`. The version gates live in three files —
+   `model_compare.py` (`CATALOG_SCHEMA_VERSION`),
+   `web/build_site_data.py` (`CATALOG_SCHEMA_VERSION`, `DATA_SCHEMA_VERSION`,
+   `HISTORY_SCHEMA_VERSION`) and `web/publish.py` (`check_stamps`' pinned
+   `data.json` version) — and move together.

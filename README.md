@@ -16,6 +16,7 @@ $ ./model_compare.py --best                   # only "#1 model" as an opencode i
 $ MODEL=$(./model_compare.py --best)          # shell integration
 $ opencode --model $MODEL
 $ ./model_compare.py --priority price --top 3
+$ ./model_compare.py --reasoning-effort max  # re-rank at max reasoning effort
 ```
 
 `--best` prints the pick ready to use: provider-qualified as opencode
@@ -42,6 +43,8 @@ No dependencies beyond Python 3.10+ (stdlib only). Exit codes: `0` success,
 | `--recency-half-life D` | 120 | age decay half-life (days) |
 | `--max-age-days D` | off | drop models listed more than N days ago |
 | `--quality-ref N` | 70 | index counting as full quality score |
+| `--reasoning-effort E` | `default` | reasoning effort used for quality and filtering: `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; a specific effort drops models that cannot run it |
+| `--no-depths` | off | hide the per-model depth detail below the table (the `DEPTH` and `QUAL` columns stay) |
 | `--aa-api-key KEY` | `$AA_API_KEY` | Artificial Analysis API key |
 | `--exclude-free` | off | drop `:free` variants |
 | `--include-batch` | off | keep `:batch` (async completion) variants; no effect without `--no-zdr`, as the ZDR list has no `:batch` ids today |
@@ -69,8 +72,9 @@ plus weekly `history.json` and `highlights.json`. How that pipeline works:
 ## How it works
 
 OpenRouter's public catalog provides prices, context windows and listing
-dates; model quality comes from the Artificial Analysis intelligence index,
-resolved through a three-source hierarchy with visible provenance (see
+dates; model quality comes from the Artificial Analysis intelligence index
+at the model's effective OpenRouter default reasoning effort, resolved
+through a three-source hierarchy with visible provenance (see
 [Model quality](#model-quality) below). Each candidate is scored on quality,
 blended price, context headroom and listing age with weights depending on
 `--priority`, after hard filters (context floor, text-only, tool-calling,
@@ -93,19 +97,42 @@ always wins, even when a lower-ranked one is newer.
    listing, used only for models neither AA path covers.
 
 Every quality value carries its provenance end to end: `--json` rows carry
-`quality_source` and `quality_as_of`, `catalog.json` entries and the site's
-QUAL tooltips show them, and the CLI's footer note lists how many models
-came from each source and when each was checked.
+`quality_source`, `quality_as_of` and `quality_effort`, `catalog.json`
+entries and the site's QUAL tooltips show them, and the CLI's footer note
+lists how many models came from each source and when each was checked.
+
+AA measures a model at several reasoning efforts, and the scores differ. The
+headline `QUAL` is the index at the **effort a default OpenRouter request
+actually runs at** — the model's effective default, marked `*` in the depth
+detail — not AA's primary `max` row. `--reasoning-effort <effort>` re-ranks
+at a chosen effort (`default`, `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`) and, for anything but `default`, drops models that cannot
+run it. A model AA has not measured at the selected effort shows `QUAL -`;
+its score is never borrowed from a different effort.
+
+The `DEPTH` column names the effort behind `QUAL` (`high*` marks OpenRouter's
+default). Below the table, a depth block per top-N model lists every
+supported and measured effort with its AA index, its AA cost per benchmark
+task, the cost ratio against the default depth, and the OpenCode variant
+suffix that selects it (`#max`). `--no-depths` hides the block; the `DEPTH`
+and `QUAL` columns stay. AA `$/task` is AA's measured benchmark cost at AA's
+reference price, not the OpenRouter per-token price, and it never enters the
+score. In OpenCode, append `#<effort>` to the model id
+(`openrouter/anthropic/claude-sonnet-5.5#max`) to select a depth; the
+model-compare OpenCode plugin pins the catalog's effort on its aliases.
 
 **Why our QUAL can differ from openrouter.ai:** OpenRouter republishes a
 **frozen copy** of the intelligence index per dated listing, while the AA
 API is live — a model whose index has moved since OpenRouter's snapshot
-will legitimately show different numbers here. When the winning value and
-OpenRouter's snapshot for the same model differ by 3 or more index points,
-the row is flagged as drift (`quality_drift`, with `quality_or_index` and
-`quality_or_as_of` naming the snapshot it was compared against) — visible as
-a tooltip note on the site and counted in the CLI footer. Prices can differ
-from the website too, for a different reason: this tool ranks at the
+will legitimately show different numbers here. The comparison is only
+like-for-like when both sides are non-reasoning: OpenRouter's snapshot
+reports no effort, so a reasoning model keeps the snapshot as reference
+(`quality_or_index` and `quality_or_as_of` name it) but is not flagged as
+drift. For a non-reasoning model, when the winning value and OpenRouter's
+snapshot differ by 3 or more index points, the row is flagged as drift
+(`quality_drift`) — visible as a tooltip note on the site and counted in the
+CLI footer. Prices can differ from the website too, for a different reason:
+this tool ranks at the
 cheapest eligible endpoint, not the default one (see
 [Tiered pricing](#tiered-pricing)). Provenance — the source plus its as-of —
 makes every such discrepancy explainable instead of mysterious; the

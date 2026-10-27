@@ -228,7 +228,7 @@ def test_simple_view_hidden_columns_and_legend():
     html = SITE_HTML.read_text()
     main_table = re.search(r'<table id="table">.*?</table>', html, re.DOTALL).group(0)
     ths = re.findall(r"<th.*?</th>", main_table, re.DOTALL)
-    for col in ("PREC", "TIER", "CTX", "SCORE", "TASK$"):
+    for col in ("DEPTH", "PREC", "TIER", "CTX", "SCORE", "TASK$"):
         th = next(
             (t for t in ths if re.search(r">\s*" + re.escape(col) + r"\s*<", t)),
             None,
@@ -238,6 +238,7 @@ def test_simple_view_hidden_columns_and_legend():
     # Legend hints for the absent columns are hidden in simple view; the
     # long-session-prices hint stays in both (it explains the IN/OUT
     # columns, which are present in both views).
+    assert '<p class="hint hide-simple">\n      <strong>DEPTH</strong>' in html
     assert '<p class="hint hide-simple">\n      <strong>PREC</strong>' in html
     assert (
         '<p class="hint hide-simple">\n      <strong><span class="tier">TIER</span></strong>'
@@ -245,6 +246,10 @@ def test_simple_view_hidden_columns_and_legend():
     )
     assert '<p class="hint hide-simple">\n      <strong>TASK$</strong>' in html
     assert '<p class="hint">\n      Prices shown are what a long session pays' in html
+    # The plain-language depth paragraph explains QUAL in both views (the
+    # simple cell keeps the effort tag even though the DEPTH column hides).
+    assert "effective OpenRouter default reasoning effort" in html
+    assert "best selectable measured depth" in html
 
 
 def test_opencode_headings_keep_version_text_drop_badge():
@@ -839,7 +844,7 @@ def test_main_table_colspans_pin_header_counts():
 
 
 def test_endpoint_row_colspan_follows_view():
-    # Behavior pin: the disclosure row spans 13 columns in expert view
+    # Behavior pin: the disclosure row spans 14 columns in expert view
     # and 8 in simple view (built-element shape, like the other DOM tests).
     expert = run_js(
         "(function () {"
@@ -848,7 +853,7 @@ def test_endpoint_row_colspan_follows_view():
         "  return tr.children[0].colSpan;"
         "})()"
     )
-    assert expert == 13
+    assert expert == 14
     simple = run_js(
         "(function () {"
         '  view = "simple";'
@@ -859,12 +864,18 @@ def test_endpoint_row_colspan_follows_view():
     assert simple == 8
 
 
-# One ranked row shaped exactly as data.json v2 provides it: every field
-# render() touches is present, with tier/sched/quant annotations unset.
+# One ranked row shaped exactly as data.json v3 provides it: every field
+# render() touches is present, with tier/sched/quant annotations unset. The
+# nested reasoning block is catalog-only (build_data drops it), so the row
+# carries the two top-level effort fields and render() joins the block from
+# catalogData.
 SIMPLE_VIEW_ROW = {
     "model": "m/x",
     "opencode_model": "openrouter/m/x",
     "quality_index": 40.0,
+    "quality_effort": None,
+    "default_effort": None,
+    "supported_efforts": [],
     "input_usd_per_m": 1.0,
     "output_usd_per_m": 2.0,
     "discount_pct": "10",
@@ -881,7 +892,7 @@ SIMPLE_VIEW_ROW = {
 
 
 def test_render_row_shapes_follow_view():
-    # render() must drop exactly the five expert-only columns in simple
+    # render() must drop exactly the six expert-only columns in simple
     # view: the row keeps 8 cells (rank, 7-day, model, quality, in, out,
     # discount, age) and the 8th visible cell is AGE, where the expert
     # row's 8th is PREC. The stub tbody never clears its children, so
@@ -899,15 +910,19 @@ def test_render_row_shapes_follow_view():
         " var simpleTr = els.tbody.children[1];"
         " return {"
         "   expertCells: expertTr.children.length,"
-        "   expertCell7: expertTr.children[7].textContent,"
+        "   expertDepth: expertTr.children[3].textContent,"
+        "   expertQuality: expertTr.children[4].textContent,"
+        "   expertCell8: expertTr.children[8].textContent,"
         "   simpleCells: simpleTr.children.length,"
         "   simpleCell7: simpleTr.children[7].textContent"
         " };"
         "})()"
     )
     assert out == {
-        "expertCells": 13,
-        "expertCell7": "fp8",
+        "expertCells": 14,
+        "expertDepth": "-",
+        "expertQuality": "40.0",
+        "expertCell8": "fp8",
         "simpleCells": 8,
         "simpleCell7": "30d",
     }
@@ -1024,7 +1039,8 @@ def test_quality_tooltip_names_source_and_as_of_per_source():
     # (the column stays visible in simple view as QUALITY). The stub tbody
     # never clears its children, so the expert row lands at index 0 and
     # the simple row at index 1; the movement td sits at children[1], so
-    # the QUAL cell is children[3].
+    # the expert QUAL cell is children[4] (DEPTH precedes it) and the
+    # simple QUAL cell is children[3] (DEPTH is hidden).
     row = dict(SIMPLE_VIEW_ROW)
     row.update(AA_PROVENANCE)
     data_fix = {"priorities": {"balanced": [row]}, "schedules": []}
@@ -1032,7 +1048,7 @@ def test_quality_tooltip_names_source_and_as_of_per_source():
         "(function () {"
         f" data = {json.dumps(data_fix)};"
         ' view = "expert"; render();'
-        " var expertTitle = els.tbody.children[0].children[3].title;"
+        " var expertTitle = els.tbody.children[0].children[4].title;"
         ' view = "simple"; render();'
         " var simpleTitle = els.tbody.children[1].children[3].title;"
         " return { expertTitle: expertTitle, simpleTitle: simpleTitle };"
@@ -1086,7 +1102,7 @@ def test_quality_tooltip_drift_appends_the_row_or_pair():
         "(function () {"
         f" data = {json.dumps(data_fix)};"
         " render();"
-        " return els.tbody.children[0].children[3].title;"
+        " return els.tbody.children[0].children[4].title;"
         "})()"
     )
     assert out == (
@@ -1121,7 +1137,7 @@ def test_quality_tooltip_missing_fields_degrade_silently():
         "(function () {"
         f" data = {json.dumps(data_fix)};"
         " render();"
-        " return els.tbody.children[0].children[3].title;"
+        " return els.tbody.children[0].children[4].title;"
         "})()"
     )
     assert out == ""
@@ -1176,6 +1192,381 @@ def test_quality_tooltip_deals_row_with_provenance():
         "})()"
     )
     assert out == "AA intelligence index - source: catalog, as of 2026-10-17"
+
+
+# ---------------------------------------------------------------------------
+# Task 8: thinking depth — DEPTH column, depth rows/table, effort tooltips
+
+
+def test_depth_rows_union_and_selectability():
+    out = run_js(
+        "depthRows({default_effort:'high', supported_efforts:['max','high','none'],"
+        " reasoning:{depths:[{effort:'max',quality_index:56,cost_per_task_usd:5.46,as_of:'t1'}]}})"
+    )
+    assert [r["effort"] for r in out] == ["max", "high", "none"]
+    assert out[0]["selectable"] is True
+    assert out[1]["default"] is True
+    assert out[2]["cost"] is None
+
+
+def test_depth_rows_ratio_and_selected_flag():
+    out = run_js(
+        "depthRows({quality_effort:'max', default_effort:'high',"
+        " supported_efforts:['max','high'],"
+        " reasoning:{depths:["
+        "  {effort:'max',index:56.0,cost_per_task_usd:5.46},"
+        "  {effort:'high',index:46.8,cost_per_task_usd:0.88}]}})"
+    )
+    assert [r["effort"] for r in out] == ["max", "high"]
+    assert out[0]["selected"] is True
+    assert out[1]["selected"] is False
+    assert out[1]["default"] is True
+    # 5.46 / 0.88: the ratio is against the default-depth record.
+    assert round(out[0]["ratio"], 2) == 6.20
+    assert round(out[1]["ratio"], 2) == 1.0
+
+
+def test_fmt_effort_marks_default_and_missing():
+    assert (
+        run_js("fmtEffort({quality_effort:'high', default_effort:'high'})") == "high*"
+    )
+    assert run_js("fmtEffort({quality_effort:'max', default_effort:'high'})") == "max"
+    assert run_js("fmtEffort({quality_effort:'high'})") == "high"
+    assert run_js("fmtEffort({})") == "-"
+
+
+def test_quality_tooltip_names_effort_and_selectable_alternative():
+    out = run_js(
+        "qualityTooltip({quality_source:'aa',quality_as_of:'t1',quality_index:46.8,"
+        "quality_effort:'high',default_effort:'high',supported_efforts:['max','high'],"
+        "reasoning:{depths:[{effort:'max',quality_index:56,cost_per_task_usd:5.46}]}})"
+    )
+    assert "high" in out and "56.0" in out and "selectable" in out
+
+
+def test_quality_tooltip_deals_row_includes_effort():
+    out = run_js(
+        "qualityTooltip({quality_source:'aa',quality_as_of:'t1',quality_index:44.0,"
+        "quality_effort:'high'})"
+    )
+    assert "high" in out
+
+
+def test_quality_tooltip_non_comparable_or_snapshot_says_not_like_for_like():
+    # A reasoning row's OR snapshot has no effort label: the reference is
+    # shown, but never as a drift claim.
+    out = run_js(
+        "qualityTooltip({quality_source:'aa',quality_as_of:'t1',quality_index:46.8,"
+        "quality_effort:'high',default_effort:'high',quality_drift:null,"
+        "quality_or_index:56.0,quality_or_as_of:'20261017'})"
+    )
+    assert "not like-for-like" in out
+    assert "reasoning effort is not reported" in out
+    assert "differs from OpenRouter snapshot" not in out
+    # A reasoning model at effort "none" is still not like-for-like: its OR
+    # snapshot is measured at the reasoning state.
+    out = run_js(
+        "qualityTooltip({quality_source:'aa',quality_as_of:'t1',quality_index:45.1,"
+        "quality_effort:'none',default_effort:'none',quality_drift:null,"
+        "quality_or_index:39.5,quality_or_as_of:'20261017'})"
+    )
+    assert "not like-for-like" in out
+    # A non-reasoning (none) snapshot is comparable: no note.
+    out = run_js(
+        "qualityTooltip({quality_source:'aa',quality_as_of:'t1',quality_index:46.8,"
+        "quality_effort:'none',default_effort:'none',quality_drift:false,"
+        "quality_or_index:46.8,quality_or_as_of:'20261017'})"
+    )
+    assert "not like-for-like" not in out
+    # A Deals row carries only the provenance triple (no OR reference): the
+    # effort tag renders and no drift claim is made.
+    out = run_js(
+        "qualityTooltip({quality_source:'aa',quality_as_of:'20261017',"
+        "quality_index:44.0,quality_effort:'high'})"
+    )
+    assert "high" in out
+    assert "not like-for-like" not in out
+
+
+def test_depth_table_lists_union_marks_default_and_copies_variant():
+    entry = """
+    {
+      id: 'a/m',
+      quality_effort: 'high',
+      reasoning: {
+        default_effort: 'high',
+        supported_efforts: ['max', 'high'],
+        depths: [
+          {effort: 'max', index: 56.0, cost_per_task_usd: 5.46, source: 'aa', as_of: 't1'},
+          {effort: 'high', index: 46.8, cost_per_task_usd: 0.88, source: 'aa', as_of: 't1'}
+        ]
+      }
+    }
+    """
+    out = run_js(
+        "(function () {"
+        f" var table = depthTable({entry});"
+        " var rows = table.children[1].children;"
+        " var copied = null;"
+        " copyText = function (text) { copied = text; return Promise.resolve(true); };"
+        " var select = rows[0].children[4];"
+        " var button = select.children[0];"
+        " button.dispatchEvent('click');"
+        " return {"
+        "   max: [rows[0].children[0].textContent, rows[0].children[1].textContent,"
+        "         rows[0].children[2].textContent, rows[0].children[3].textContent],"
+        "   high: [rows[1].children[0].textContent, rows[1].children[1].textContent,"
+        "          rows[1].children[2].textContent, rows[1].children[3].textContent],"
+        "   button: button.textContent,"
+        "   copied: copied"
+        " };"
+        "})()"
+    )
+    assert out["max"] == ["max", "56.0", "5.46", "6.2x"]
+    assert out["high"] == ["high*", "46.8", "0.88", "1.0x"]
+    assert out["button"] == "#max"
+    assert out["copied"] == "openrouter/a/m#max"
+
+
+def test_depth_table_marks_measured_but_unsupported_effort():
+    entry = """
+    {
+      id: 'a/m',
+      quality_effort: 'high',
+      reasoning: {
+        default_effort: 'high',
+        supported_efforts: ['high'],
+        depths: [
+          {effort: 'max', index: 56.0, cost_per_task_usd: 5.46, source: 'aa', as_of: 't1'}
+        ]
+      }
+    }
+    """
+    out = run_js(
+        "(function () {"
+        f" var table = depthTable({entry});"
+        " var rows = table.children[1].children;"
+        " return {"
+        "   maxText: rows[0].children[4].textContent,"
+        "   maxButtons: rows[0].children[4].children.length,"
+        "   highText: rows[1].children[4].children[0].textContent,"
+        "   highButtons: rows[1].children[4].children.length"
+        " };"
+        "})()"
+    )
+    assert out == {
+        "maxText": "not selectable",
+        "maxButtons": 0,
+        "highText": "#high",
+        "highButtons": 1,
+    }
+
+
+def test_depth_table_sentinel_rows_have_no_copy_button():
+    # Single-state "reasoning" and a non-reasoning model's "none" are bare
+    # ids: no variant suffix exists to copy.
+    reasoning_entry = """
+    {
+      id: 'a/r',
+      quality_effort: 'reasoning',
+      reasoning: {
+        default_effort: 'reasoning',
+        supported_efforts: [],
+        depths: [
+          {effort: 'reasoning', index: 40.0, cost_per_task_usd: 0.5, source: 'aa', as_of: 't1'}
+        ]
+      }
+    }
+    """
+    plain_entry = """
+    {
+      id: 'a/p',
+      quality_effort: 'none',
+      reasoning: {
+        default_effort: 'none',
+        supported_efforts: [],
+        default_enabled: null,
+        mandatory: null,
+        supports_max_tokens: null,
+        depths: [
+          {effort: 'none', index: 30.0, cost_per_task_usd: null, source: 'aa', as_of: 't1'}
+        ]
+      }
+    }
+    """
+    out = run_js(
+        "(function () {"
+        f" var reasoningRows = depthTable({reasoning_entry}).children[1].children;"
+        f" var plainRows = depthTable({plain_entry}).children[1].children;"
+        " return {"
+        "   reasoningText: reasoningRows[0].children[4].textContent,"
+        "   reasoningButtons: reasoningRows[0].children[4].children.length,"
+        "   plainText: plainRows[0].children[4].textContent,"
+        "   plainButtons: plainRows[0].children[4].children.length"
+        " };"
+        "})()"
+    )
+    assert out == {
+        "reasoningText": "-",
+        "reasoningButtons": 0,
+        "plainText": "-",
+        "plainButtons": 0,
+    }
+
+
+def test_depth_detail_row_messages():
+    assert (
+        run_js("depthDetailRow(null, false).children[0].textContent")
+        == "depth details unavailable - catalog fetch failed"
+    )
+    assert (
+        run_js("depthDetailRow(null, true).children[0].textContent")
+        == "no depth data for this model."
+    )
+
+
+def test_render_expanded_row_shows_depth_before_endpoints():
+    row = dict(SIMPLE_VIEW_ROW)
+    row.update(
+        {
+            "quality_index": 46.8,
+            "quality_source": "aa",
+            "quality_as_of": "t1",
+            "quality_effort": "high",
+            "default_effort": "high",
+            "supported_efforts": ["max", "high"],
+        }
+    )
+    data_fix = {"priorities": {"balanced": [row]}, "schedules": []}
+    catalog_fix = {
+        "models": [
+            {
+                "id": "m/x",
+                "reasoning": {
+                    "default_effort": "high",
+                    "supported_efforts": ["max", "high"],
+                    "depths": [
+                        {
+                            "effort": "max",
+                            "index": 56.0,
+                            "cost_per_task_usd": 5.46,
+                            "source": "aa",
+                            "as_of": "t1",
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(data_fix)};"
+        f" catalogData = {json.dumps(catalog_fix)};"
+        " endpointExpanded['m/x'] = true;"
+        " render();"
+        " var kids = els.tbody.children;"
+        " return {"
+        "   depthClass: kids[1].className,"
+        "   endpointClass: kids[2].className,"
+        "   depthHeading: kids[1].children[0].children[0].textContent,"
+        "   depthTableClass: kids[1].children[0].children[2].className,"
+        "   aria: kids[0].getAttribute('aria-expanded')"
+        " };"
+        "})()"
+    )
+    assert out["depthClass"] == "endpoint-row depth-row"
+    assert out["endpointClass"] == "endpoint-row"
+    assert out["depthHeading"] == "Depth"
+    assert out["depthTableClass"] == "depth-table"
+    assert out["aria"] == "true"
+
+
+def test_render_quality_cell_shows_effort_and_best_alternative():
+    row = dict(SIMPLE_VIEW_ROW)
+    row.update(
+        {
+            "quality_index": 46.8,
+            "quality_source": "aa",
+            "quality_as_of": "t1",
+            "quality_effort": "high",
+            "default_effort": "high",
+            "supported_efforts": ["max", "high"],
+        }
+    )
+    data_fix = {"priorities": {"balanced": [row]}, "schedules": []}
+    catalog_fix = {
+        "models": [
+            {
+                "id": "m/x",
+                "reasoning": {
+                    "default_effort": "high",
+                    "supported_efforts": ["max", "high"],
+                    "depths": [
+                        {
+                            "effort": "max",
+                            "index": 56.0,
+                            "cost_per_task_usd": 5.46,
+                            "source": "aa",
+                            "as_of": "t1",
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(data_fix)};"
+        f" catalogData = {json.dumps(catalog_fix)};"
+        ' view = "expert"; render();'
+        " var expert = els.tbody.children[0];"
+        " var quality = expert.children[4];"
+        " var alt = quality.children[0];"
+        ' view = "simple"; render();'
+        " var simple = els.tbody.children[1];"
+        " return {"
+        "   depth: expert.children[3].textContent,"
+        "   quality: quality.textContent,"
+        "   alt: alt.textContent,"
+        "   altClass: alt.className,"
+        "   title: quality.title,"
+        "   simpleQuality: simple.children[3].textContent"
+        " };"
+        "})()"
+    )
+    assert out["depth"] == "high*"
+    assert out["quality"] == "46.8"
+    assert out["alt"] == "max 56.0"
+    assert out["altClass"] == "depth-alt"
+    assert "measured at high" in out["title"]
+    assert "Best selectable alternative: max 56.0 at $5.46/task" in out["title"]
+    assert out["simpleQuality"] == "46.8 · high"
+
+
+def test_render_deals_quality_cell_carries_effort_tag():
+    deal = dict(DEALS_ROW)
+    deal["quality_effort"] = "high"
+    deal["quality_source"] = "aa"
+    deal["quality_as_of"] = "t1"
+    deals_fix = {"priorities": {"balanced": []}, "schedules": [deal]}
+    out = run_js(
+        "(function () {"
+        f" data = {json.dumps(deals_fix)};"
+        " var captured = null;"
+        " var realGet = document.getElementById;"
+        " document.getElementById = function (id) {"
+        "   var e = realGet(id);"
+        '   if (id === "deals-tbody") captured = e;'
+        "   return e;"
+        " };"
+        " renderDeals();"
+        " document.getElementById = realGet;"
+        " var quality = captured.children[0].children[3];"
+        " return { text: quality.textContent, title: quality.title };"
+        "})()"
+    )
+    assert out["text"] == "50.0 · high"
+    assert "measured at high" in out["title"]
 
 
 # ---------------------------------------------------------------------------

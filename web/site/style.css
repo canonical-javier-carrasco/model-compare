@@ -88,7 +88,7 @@
         font-size: 0.85rem;
         color: var(--muted);
       }
-      /* Simple/Expert view toggle. Expert is the default (all 13
+      /* Simple/Expert view toggle. Expert is the default (all 14
          columns); simple shows rank, 7-day, model, quality, in, out,
          discount, age and hides the legend for the absent columns. The
          body class is flipped by app.js (setView/applyView). */
@@ -183,13 +183,47 @@
         color: var(--muted);
         font-size: 0.8rem;
       }
+      #table .depth-alt {
+        display: block;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
       #table tr.endpoint-row td {
         padding: 0.5rem 0.75rem 1rem;
         background: var(--row-alt, transparent);
       }
+      #table tr.depth-row td {
+        padding-bottom: 0;
+      }
+      #table .detail-heading {
+        margin: 0 0 0.25rem;
+        font-weight: 600;
+      }
       #table tr.endpoint-row table {
         width: 100%;
         font-size: 0.8rem;
+      }
+      #table .depth-table th:first-child,
+      #table .depth-table td:first-child {
+        text-align: left;
+      }
+      /* The main table's nth-child(3) MODEL alignment also matches the
+         nested table's third column; keep the depth numbers right-aligned. */
+      #table .depth-table th:nth-child(n + 2),
+      #table .depth-table td:nth-child(n + 2) {
+        text-align: right;
+      }
+      #table .depth-table .not-selectable {
+        color: var(--muted);
+      }
+      #table .depth-table button {
+        border: 1px solid var(--btn-border);
+        background: var(--btn-bg);
+        color: var(--text);
+        padding: 0.1rem 0.4rem;
+        border-radius: 4px;
+        cursor: pointer;
+        font: inherit;
       }
       #table [title],
       #deals [title] {
