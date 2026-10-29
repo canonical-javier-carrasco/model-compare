@@ -6,8 +6,13 @@
         --muted: #988f81;
         --btn-bg: #262a2b;
         --btn-border: var(--muted);
-        --thead-border: var(--text);
-        --row-border: var(--muted);
+        --thead-border: var(--muted);
+        /* Row borders sit well below --muted: a quiet separator line,
+           not a second text color. */
+        --row-border: #423e39;
+        /* Hover and the expanded detail rows share one color, so a
+           clicked row and its dropdown read as one block. */
+        --row-hover: var(--btn-bg);
         --status: #e06c60;
         --up: #7bb98c;
         --down: #de8482;
@@ -19,6 +24,7 @@
           --text: #33302b;
           --muted: #8a8175;
           --btn-bg: #e9e4d8;
+          --row-border: #d5cfc3;
           --status: #b03a2a;
           --up: #2e7d4f;
           --down: #b0392b;
@@ -179,6 +185,18 @@
         outline: 1px solid var(--flat);
         outline-offset: -2px;
       }
+      /* Clickable rows lift on hover; while a row's dropdown is open the
+         row keeps that color too (aria-expanded), so the clicked row and
+         its detail rows read as one highlighted block. */
+      #table tbody tr[role="button"]:hover td,
+      #table tbody tr[role="button"][aria-expanded="true"] td {
+        background: var(--row-hover);
+      }
+      /* The deals table is not clickable, but its rows hover like the
+         main table's so both tables read the same way. */
+      #deals tbody tr:hover td {
+        background: var(--row-hover);
+      }
       #table .endpoint-note {
         color: var(--muted);
         margin: 0.1rem 0;
@@ -186,7 +204,10 @@
       }
       #table tr.endpoint-row td {
         padding: 0.15rem 0.6rem 0.3rem;
-        background: var(--row-alt, transparent);
+        /* The expanded dropdown area wears the row hover color (see
+           --row-hover); --row-alt was never defined, so this used to
+           fall back to transparent. */
+        background: var(--row-hover);
       }
       #table tr.depth-row td {
         padding-top: 0.15rem;
@@ -195,6 +216,9 @@
       #table .detail-heading {
         margin: 0.1rem 0;
         font-weight: 600;
+        /* The td is right-aligned like every data cell; the section
+           headings read better flush with the dropdown's left edge. */
+        text-align: left;
       }
       #table tr.endpoint-row table {
         width: 100%;

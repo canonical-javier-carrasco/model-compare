@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-10-29
+
+### Changed
+
+- Tool version is `model-compare 0.7.1`.
+- The site's help is tooltip-first: every column header in all four tables
+  (ranked, depth, providers, off-peak deals) carries a tooltip, and the
+  ranked table's legend paragraphs and the deals legend paragraph are gone.
+  The facts that only the legends carried (the precision ladder, the SCHED
+  marker, the deals clipping note) moved into the matching header tooltips;
+  one primer sentence in the subtitle keeps the tooltips discoverable. The
+  priority tabs, the view toggle and the refresh stamp gained tooltips too.
+- Table styling: ranked-table rows highlight on hover and keep the hover
+  background while their dropdown is open; the off-peak deals table hovers
+  the same way; row borders and the line below the table headers use muted
+  colors. The dropdown's Depth and Providers headings are left-aligned, and
+  the dropdown tables use sentence-case, unabbreviated headers
+  (Precision, Context, In $/M instead of PREC, CTX, $IN/M).
+
 ## [0.7.0] - 2026-10-28
 
 ### Changed

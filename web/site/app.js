@@ -726,21 +726,33 @@
           tr.appendChild(td);
           return tr;
         }
+        // Section heading, parallel to the Depth block's heading above.
+        var heading = document.createElement("p");
+        heading.className = "detail-heading";
+        heading.textContent = "Providers";
+        td.appendChild(heading);
         var table = document.createElement("table");
         var thead = document.createElement("thead");
         var headTr = document.createElement("tr");
+        // Sentence-case headers (unabbreviated) with per-column tooltips,
+        // the main tables' header pattern.
         [
-          "Provider",
-          "PREC",
-          "$IN/M",
-          "$OUT/M",
-          "Status",
-          "CTX",
-          "Tier",
-          "Baseline",
-        ].forEach(function (label) {
+          ["Provider", "Endpoint provider (gateway) serving this model."],
+          ["Precision", "Quantization the endpoint's price is quoted at."],
+          ["In $/M", "Input price at this endpoint, USD per 1M tokens."],
+          ["Out $/M", "Output price at this endpoint, USD per 1M tokens."],
+          ["Status", "Endpoint availability."],
+          ["Context", "Context window at this endpoint, in tokens."],
+          [
+            "Tier",
+            "How this endpoint's pricing varies: a token threshold means a " +
+              "higher rate above it; a percentage means cheaper off-peak hours.",
+          ],
+          ["Baseline", "✓ marks the endpoint this model's ranked price comes from."],
+        ].forEach(function (cell) {
           var th = document.createElement("th");
-          th.textContent = label;
+          th.textContent = cell[0];
+          th.title = cell[1];
           headTr.appendChild(th);
         });
         thead.appendChild(headTr);
@@ -813,13 +825,34 @@
         table.className = "depth-table";
         var thead = document.createElement("thead");
         var headTr = document.createElement("tr");
-        ["effort", "AA idx", "AA $/task", "vs default", "select"].forEach(
-          function (label) {
-            var th = document.createElement("th");
-            th.textContent = label;
-            headTr.appendChild(th);
-          },
-        );
+        // Sentence-case headers with the explanatory note moved into
+        // per-column tooltips (the main tables' header pattern).
+        [
+          [
+            "Effort",
+            "Reasoning effort this row scores; * = OpenRouter's default. " +
+              "OpenRouter's $/M prices are the same at every depth - only " +
+              "AA's measurements differ.",
+          ],
+          ["AA index", "AA intelligence index measured at this effort; - = not measured."],
+          [
+            "AA $ per task",
+            "AA's measured benchmark cost at this effort (AA's reference " +
+              "price, not your session cost).",
+          ],
+          ["Vs default", "This depth's AA $ per task divided by the default depth's."],
+          [
+            "Select",
+            "Copy the OpenCode model id that pins this depth (#effort). " +
+              "'not selectable' = AA measured this effort but OpenRouter " +
+              "cannot run it.",
+          ],
+        ].forEach(function (cell) {
+          var th = document.createElement("th");
+          th.textContent = cell[0];
+          th.title = cell[1];
+          headTr.appendChild(th);
+        });
         thead.appendChild(headTr);
         table.appendChild(thead);
         var tbody = document.createElement("tbody");
@@ -879,11 +912,6 @@
         heading.className = "detail-heading";
         heading.textContent = "Depth";
         td.appendChild(heading);
-        var note = document.createElement("p");
-        note.className = "endpoint-note";
-        note.textContent =
-          "AA index / AA $ per task; OR $/M is constant across depths.";
-        td.appendChild(note);
         var table = depthTable(entry);
         if (!table) {
           var empty = document.createElement("p");
@@ -892,12 +920,6 @@
           td.appendChild(empty);
         } else {
           td.appendChild(table);
-          var legend = document.createElement("p");
-          legend.className = "endpoint-note";
-          legend.textContent =
-            "* = OpenRouter default; #effort selects that depth in OpenCode; " +
-            "not selectable = AA measured it but OpenRouter cannot run it.";
-          td.appendChild(legend);
         }
         tr.appendChild(td);
         return tr;
@@ -1056,13 +1078,11 @@
         var empty = document.getElementById("deals-empty");
         var intro = document.getElementById("deals-intro");
         var table = document.getElementById("deals");
-        var legend = document.getElementById("deals-legend");
         var button = document.getElementById("expand-deals");
         var tbody = document.getElementById("deals-tbody");
         if (!deals.length) {
           intro.hidden = true;
           table.hidden = true;
-          legend.hidden = true;
           button.hidden = true;
           empty.hidden = false;
           return;
@@ -1070,7 +1090,6 @@
         empty.hidden = true;
         intro.hidden = false;
         table.hidden = false;
-        legend.hidden = false;
         var shown = dealsExpanded
           ? deals.slice(0, FULL_DEAL_ROWS)
           : deals.slice(0, DEFAULT_DEAL_ROWS);

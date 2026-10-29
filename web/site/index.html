@@ -20,21 +20,49 @@
       Best value-for-money LLM on OpenRouter, refreshed every 3 hrs by
       <a href="https://github.com/canonical/model-compare"
         >canonical/model-compare</a
-      >.
+      >. Hover any column header or dotted-underlined cell for details.
     </p>
 
     <h2>Ranked picks</h2>
     <div class="tabs" id="tabs">
-      <button type="button" data-priority="balanced" class="active">
+      <button
+        type="button"
+        data-priority="balanced"
+        class="active"
+        title="Rank by value for money. Weights: quality 40%, price 40%, context 10%, age 10%."
+      >
         balanced
       </button>
-      <button type="button" data-priority="price">price</button>
-      <button type="button" data-priority="quality">quality</button>
-      <span id="generated-top" class="stamp"></span>
-      <button type="button" id="view-simple" aria-pressed="false">
+      <button
+        type="button"
+        data-priority="price"
+        title="Rank by the cheapest sensible pick. Weights: quality 20%, price 60%, context 10%, age 10%."
+      >
+        price
+      </button>
+      <button
+        type="button"
+        data-priority="quality"
+        title="Rank by capability first. Weights: quality 60%, price 20%, context 10%, age 10%."
+      >
+        quality
+      </button>
+      <span id="generated-top" class="stamp" title="When this data was fetched (UTC)."></span>
+      <button
+        type="button"
+        id="view-simple"
+        aria-pressed="false"
+        title="Fewer columns: rank, 7-day movement, model, quality, prices, discount and age."
+      >
         Simple
       </button>
-      <button type="button" id="view-expert" class="active" aria-pressed="true">
+      <button
+        type="button"
+        id="view-expert"
+        class="active"
+        aria-pressed="true"
+        title="All columns, including depth, precision, tier, context, score and task cost."
+      >
         Expert
       </button>
     </div>
@@ -48,12 +76,12 @@
           <th title="Provider-qualified model id">MODEL</th>
           <th
             class="hide-simple"
-            title="Reasoning effort the QUAL score was measured at; * = OpenRouter's default. - = no known effort."
+            title="Reasoning effort the QUAL score was measured at; * = OpenRouter's default. - = AA has not measured the model at any selectable effort. Append #effort to the OpenCode model id to pin a depth."
           >
             DEPTH
           </th>
           <th
-            title="Intelligence index (Artificial Analysis) — hover a cell for its source and as-of date"
+            title="AA intelligence index at the model's best measured selectable depth — hover a cell for its source, as-of date, and drift notes. - = not measured."
           >
             <span class="lbl-expert">QUAL</span>
             <span class="lbl-simple">QUALITY</span>
@@ -72,12 +100,12 @@
           </th>
           <th
             class="hide-simple"
-            title="Quantization the ranked price is quoted at (the maker's default precision when disclosed; best available otherwise). ! = default OpenRouter routing favors cheaper sub-default-quantization endpoints."
+            title="Quantization the ranked price is quoted at (the maker's default precision when disclosed; best available otherwise): how many bits store the model's parameters. Lower precision is faster and cheaper but can slightly reduce answer quality. Best-to-cheapest levels: FP32, BF16/FP16, FP8, FP6, INT8, FP4, INT4. ! = default OpenRouter routing favors cheaper sub-default-quantization endpoints."
           >
             PREC
           </th>
           <th
-            title="How this model's pricing varies: a token threshold means a higher rate above it; a percentage means cheaper off-peak hours. Hover a cell for details."
+            title="How this model's pricing varies: a token threshold means a higher rate above it (a long session pays more once the prompt outgrows the cheap short-context tier); a percentage means cheaper off-peak hours (the price column shows the standard rate). SCHED = a schedule whose discount is under 1%. Hover a cell for details."
             class="tier hide-simple"
           >
             TIER
@@ -87,7 +115,7 @@
           <th title="Composite score for the selected priority" class="hide-simple">SCORE</th>
           <th
             class="hide-simple"
-            title="Median cost per task session (OpenRouter session-cost dataset, 10-49-turn sessions; CC BY 4.0). — = not available this refresh."
+            title="Median cost of a typical task session, USD (OpenRouter session-cost dataset, 10-49-turn sessions; CC BY 4.0) — not AA's benchmark $/task. — = not available this refresh."
           >
             TASK$
           </th>
@@ -100,45 +128,6 @@
       <button type="button" id="expand-main" hidden>Show more</button>
     </div>
 
-    <p class="hint">
-      Prices shown are what a long session pays: several models bill at a higher
-      rate once the prompt outgrows their cheap short-context tier.
-    </p>
-    <p class="hint">
-      <strong>QUAL</strong> is the AA intelligence index at the model's best
-      measured selectable depth.
-      Hover a cell for source, as-of date, and drift
-      notes. Append <code>#effort</code> to the model id in OpenCode to select a
-      depth; AA <code>$/task</code> is AA's measured benchmark cost at AA's
-      reference price, not the <strong>TASK$</strong> session cost.
-    </p>
-    <p class="hint hide-simple">
-      <strong>DEPTH</strong> is the reasoning effort the QUAL score was
-      measured at; <strong>*</strong> = OpenRouter's default.
-      <strong>QUAL -</strong> means AA has not measured the model at any
-      selectable effort.
-    </p>
-    <p class="hint hide-simple">
-      <strong><span class="tier">TIER</span></strong> marks how prices vary: a
-      token threshold is the prompt size above which the higher rate applies; a
-      percentage is a scheduled off-peak discount (price shown: the standard
-      rate); <strong>SCHED</strong> marks a schedule whose discount is under
-      1%. Hover a cell for details.
-    </p>
-    <p class="hint hide-simple">
-      <strong>PREC</strong> (precision) is how many bits the model uses to store
-      its parameters — a technique called quantization. Lower precision makes a
-      model faster and smaller to run, but can slightly reduce answer quality.
-      Best-to-cheapest precision levels: <strong>FP32</strong>,
-      <strong>BF16/FP16</strong>, <strong>FP8</strong>, <strong>FP6</strong>,
-      <strong>INT8</strong>, <strong>FP4</strong>, <strong>INT4</strong>
-      (highest to lowest quality).
-    </p>
-    <p class="hint hide-simple">
-      <strong>TASK$</strong> is the estimated median cost (in USD) of running a
-      typical task with this model, helping you budget for the operation.
-    </p>
-
     <div id="deals-section">
       <h2>Off-peak deals</h2>
       <p class="hint" id="deals-intro" hidden>
@@ -150,14 +139,18 @@
           <tr>
             <th title="Provider-qualified model id">MODEL</th>
             <th
-              title="Largest scheduled off-peak discount vs the standard rate"
+              title="Largest scheduled off-peak discount vs the standard rate; the standard rate applies outside the listed windows"
               class="offpeak"
             >
               OFF-PEAK
             </th>
-            <th title="When the discounted rate applies (UTC)">SCHEDULE</th>
             <th
-              title="Intelligence index (Artificial Analysis) — hover a cell for its source and as-of date"
+              title="When the discounted rate applies (UTC). Long windows are clipped; hover a cell for the full text."
+            >
+              SCHEDULE
+            </th>
+            <th
+              title="AA intelligence index — hover a cell for its source and as-of date. Shown at the reasoning effort noted after the value."
             >
               QUAL
             </th>
@@ -180,13 +173,6 @@
       <div class="actions deals-actions">
         <button type="button" id="expand-deals" hidden>Show more</button>
       </div>
-      <p class="hint" id="deals-legend" hidden>
-        <span class="offpeak">SCHEDULE</span> shows when the discounted rate
-        applies — long windows are clipped, hover for the full text. $IN/$OUT
-        are the discounted prices during those windows; the standard rate
-        applies at all other times. QUAL is the AA index at the reasoning
-        effort shown after it; hover for its source and as-of date.
-      </p>
       <p class="hint" id="deals-empty" hidden>
         No scheduled off-peak discounts in the current data.
       </p>

@@ -259,7 +259,7 @@ def test_simple_view_headers():
         assert f'<span class="lbl-simple">{simple_label}</span>' in main_table
 
 
-def test_simple_view_hidden_columns_and_legend():
+def test_simple_view_hidden_columns_and_header_tooltips():
     html = SITE_HTML.read_text()
     main_table = re.search(r'<table id="table">.*?</table>', html, re.DOTALL).group(0)
     ths = re.findall(r"<th.*?</th>", main_table, re.DOTALL)
@@ -270,29 +270,36 @@ def test_simple_view_hidden_columns_and_legend():
         )
         assert th is not None, f"no <th> for {col}"
         assert "hide-simple" in th, f"{col} th missing hide-simple"
-    # Legend hints for the absent columns are hidden in simple view; the
-    # long-session-prices hint stays in both (it explains the IN/OUT
-    # columns, which are present in both views).
-    assert '<p class="hint hide-simple">\n      <strong>DEPTH</strong>' in html
-    assert '<p class="hint hide-simple">\n      <strong>PREC</strong>' in html
-    assert (
-        '<p class="hint hide-simple">\n      <strong><span class="tier">TIER</span></strong>'
-        in html
-    )
-    assert '<p class="hint hide-simple">\n      <strong>TASK$</strong>' in html
-    assert '<p class="hint">\n      Prices shown are what a long session pays' in html
-    # QUAL has one legend entry that explains the best measured selectable
-    # depth and how to interpret its source and benchmark cost.
-    hints = re.findall(r'<p class="hint[^\"]*">(.*?)</p>', html, re.DOTALL)
-    qual_hints = [hint for hint in hints if "<strong>QUAL</strong>" in hint]
-    assert len(qual_hints) == 1
-    qual_hint = re.sub(r"\s+", " ", qual_hints[0])
-    assert "best measured selectable depth" in qual_hint
-    assert "Hover a cell for source, as-of date, and drift notes" in qual_hint
-    assert "<code>#effort</code>" in qual_hint
-    assert "AA <code>$/task</code>" in qual_hint
-    assert "<strong>TASK$</strong> session cost" in qual_hint
-    assert "any selectable effort." in re.sub(r"\s+", " ", html)
+    # The column glossary moved into the header tooltips: every th carries
+    # a title, and the former legend paragraphs are gone. The facts that
+    # only the legends carried live in the tooltips now.
+    for th in ths:
+        assert "title=" in th, f"th without tooltip: {th[:60]}"
+    flat_html = re.sub(r"\s+", " ", html)
+    assert "Prices shown are what a long session pays" not in flat_html
+    assert "Best-to-cheapest precision levels" not in flat_html
+    qual_th = next(t for t in ths if re.search(r">\s*QUAL\s*<", t))
+    qual_tip = re.sub(r"\s+", " ", qual_th)
+    assert "best measured selectable depth" in qual_tip
+    assert "drift notes" in qual_tip
+    assert "- = not measured" in qual_tip
+    depth_tip = re.sub(r"\s+", " ", next(t for t in ths if "DEPTH" in t))
+    assert "#effort" in depth_tip
+    assert "any selectable effort" in depth_tip
+    tier_tip = re.sub(r"\s+", " ", next(t for t in ths if "TIER" in t))
+    assert "long session pays more" in tier_tip
+    assert "SCHED" in tier_tip
+    prec_tip = re.sub(r"\s+", " ", next(t for t in ths if "PREC" in t))
+    assert "FP32, BF16/FP16, FP8, FP6, INT8, FP4, INT4" in prec_tip
+    task_tip = re.sub(r"\s+", " ", next(t for t in ths if "TASK$" in t))
+    assert "not AA's benchmark $/task" in task_tip
+    # One visible primer sentence keeps the tooltips discoverable; the
+    # deals legend paragraph is gone with the main-table ones.
+    assert "Hover any column header or dotted-underlined cell for details" in flat_html
+    assert 'id="deals-legend"' not in html
+    # ...and the script must not reference the removed node (a live-DOM
+    # null deref the stubbed JS driver cannot catch).
+    assert "deals-legend" not in SCRIPT_JS.read_text()
 
 
 def test_opencode_headings_keep_version_text_drop_badge():
@@ -1106,10 +1113,17 @@ def test_quality_tooltip_names_source_and_as_of_per_source():
     html = SITE_HTML.read_text()
     assert (
         html.count(
-            "Intelligence index (Artificial Analysis) — hover a cell for its"
-            " source and as-of date"
+            "AA intelligence index at the model's best measured selectable"
+            " depth — hover a cell for its source, as-of date, and drift notes"
         )
-        == 2
+        == 1
+    )
+    assert (
+        html.count(
+            "AA intelligence index — hover a cell for its source and as-of"
+            " date. Shown at the reasoning effort noted after the value."
+        )
+        == 1
     )
 
 
@@ -1503,7 +1517,11 @@ def test_render_expanded_row_shows_depth_before_endpoints():
         "   depthClass: kids[1].className,"
         "   endpointClass: kids[2].className,"
         "   depthHeading: kids[1].children[0].children[0].textContent,"
-        "   depthTableClass: kids[1].children[0].children[2].className,"
+        # The explanatory notes moved into header tooltips, so the table
+        # directly follows the heading (children[1]) and nothing follows
+        # the table.
+        "   depthTableClass: kids[1].children[0].children[1].className,"
+        "   depthChildren: kids[1].children[0].children.length,"
         "   aria: kids[0].getAttribute('aria-expanded')"
         " };"
         "})()"
@@ -1512,6 +1530,7 @@ def test_render_expanded_row_shows_depth_before_endpoints():
     assert out["endpointClass"] == "endpoint-row"
     assert out["depthHeading"] == "Depth"
     assert out["depthTableClass"] == "depth-table"
+    assert out["depthChildren"] == 2
     assert out["aria"] == "true"
 
 
@@ -1648,8 +1667,9 @@ def test_deals_table_immune_to_view_toggle():
         None,
     )
     assert qual_th is not None, "no <th> for QUAL"
-    assert "Intelligence index (Artificial Analysis)" in qual_th
+    assert "AA intelligence index" in qual_th
     assert "hover a cell for its source and as-of date" in qual_th
+    assert "reasoning effort noted after the value" in qual_th
     assert '<th title="Context window in tokens">CTX</th>' in deals
 
 
