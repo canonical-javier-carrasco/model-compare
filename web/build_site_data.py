@@ -74,7 +74,7 @@ MODEL_ID_RE = re.compile(
 # arbitrary text that would ship a dead footer link.
 REVISION_RE = re.compile(r"[0-9a-f]{7,40}")
 
-CATALOG_SCHEMA_VERSION = 5
+CATALOG_SCHEMA_VERSION = 6
 
 # Duplicated from model_compare.py: build_site_data is subprocess-isolated
 # from the CLI, and the catalog constants are duplicated here by convention
@@ -965,7 +965,7 @@ def validate_catalog(document) -> None:
         _validate_catalog_session_cost(document["session_cost"])
 
 
-HISTORY_SCHEMA_VERSION = 4
+HISTORY_SCHEMA_VERSION = 5
 HISTORY_RETENTION = 10
 HISTORY_TOP_N = 20
 

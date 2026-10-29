@@ -388,7 +388,7 @@ def make_catalog_entry(**overrides):
 
 def make_catalog():
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "tool": "model-compare",
         "generated_at": "2026-09-02T09:15:00+00:00",
         "parameters": {
@@ -409,7 +409,7 @@ def make_catalog():
         },
         "sources": {
             "openrouter": "ok",
-            # Catalog v5: the keyed CI producer's normal chain, its three
+            # Catalog v6: the keyed CI producer's normal chain, its three
             # disjoint label buckets (the one matched entry is OR-labeled)
             # and the provenance meta (no hydration, AA index v4.3).
             "aa": {
@@ -758,7 +758,7 @@ def test_main_writes_catalog_next_to_data_json(tmp_path):
     assert bsd.main(argv) == 0
     catalog_path = out.parent / "catalog.json"
     written = json.loads(catalog_path.read_text())
-    assert written["schema_version"] == 5
+    assert written["schema_version"] == 6
     assert written["models"][0]["id"] == "acme/model-a"
     assert out.exists()  # data.json still written
 
@@ -821,7 +821,7 @@ def make_history_snapshot(date, generated_at, **overrides):
 
 def make_history(**overrides):
     doc = {
-        "schema_version": 4,
+        "schema_version": 5,
         "updated_at": "2026-08-26T09:15:00+00:00",
         "snapshots": {
             "2026-08-26": make_history_snapshot(
@@ -955,7 +955,7 @@ def test_merge_history_upserts_and_prunes():
     assert len(merged["snapshots"]) == 10
     assert merged["snapshots"][today] == snap
     assert merged["updated_at"] == "2026-09-02T09:15:00+00:00"
-    assert merged["schema_version"] == 4
+    assert merged["schema_version"] == 5
 
 
 def test_merge_history_same_day_last_write_wins():
@@ -1022,12 +1022,12 @@ def test_merge_history_drops_prev_snapshot_with_corrupt_ranks():
 
 def test_merge_history_rejects_unknown_schema_version():
     prev = make_history()
-    prev["schema_version"] = 5
+    prev["schema_version"] = 6
     merged = bsd.merge_history(
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 4
+    assert merged["schema_version"] == 5
 
 
 def test_merge_history_tolerates_prev_without_schema_version():
@@ -1123,7 +1123,7 @@ def test_validate_history_happy_and_rejections():
     doc["updated_at"] = "2026-09-02T09:15:00+00:00"
     bsd.validate_history(doc)  # must not raise
     with pytest.raises(ValueError):
-        bsd.validate_history({"schema_version": 5})
+        bsd.validate_history({"schema_version": 4})
     bad = make_history()
     bad["snapshots"]["2026-08-26"]["tabs"]["balanced"][0]["rank"] = 5
     with pytest.raises(ValueError):
@@ -1864,11 +1864,11 @@ def test_merge_history_resets_v1():
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 4
+    assert merged["schema_version"] == 5
 
 
 # ---------------------------------------------------------------------------
-# Catalog v3: provider-aware blocks, data.json v3 rows, history v4 reset
+# Catalog v3: provider-aware blocks, data.json v3 rows, history v5 reset
 # ---------------------------------------------------------------------------
 
 
@@ -2150,24 +2150,24 @@ def test_rows_carry_new_keys_ordered_by_ranking():
                 assert row[key] == value, (priority, model_id, key)
 
 
-def test_merge_history_resets_on_v3_history():
-    # The live site's pre-bump history (v3) must not be merged into a v4
+def test_merge_history_resets_on_v4_history():
+    # The live site's previous history (v4) must not be merged into a v5
     # document: any explicit version but the current one starts fresh.
-    prev = make_history(schema_version=3)
+    prev = make_history(schema_version=4)
     merged = bsd.merge_history(
         prev, make_history_snapshot("2026-09-02", "2026-09-02T09:15:00+00:00")
     )
     assert list(merged["snapshots"]) == ["2026-09-02"]
-    assert merged["schema_version"] == 4
+    assert merged["schema_version"] == 5
 
 
 # ---------------------------------------------------------------------------
-# Catalog v5 / data.json v3 / history v4 (thinking-depth)
+# Catalog v6 / data.json v3 / history v5 (best selectable depth)
 # ---------------------------------------------------------------------------
 
 
 def _reasoning_block(**overrides):
-    """A well-formed schema-v5 reasoning block (producer shape)."""
+    """A well-formed schema-v6 reasoning block (producer shape)."""
     block = {
         "default_effort": "high",
         "supported_efforts": ["max", "high", "low"],
@@ -2195,10 +2195,11 @@ def _reasoning_block(**overrides):
     return block
 
 
-def test_catalog_v5_is_accepted_and_v4_rejected():
+def test_catalog_v6_is_accepted_and_old_schemas_rejected():
     bsd.validate_catalog(make_catalog())
-    with pytest.raises(ValueError, match="unknown catalog schema_version"):
-        bsd.validate_catalog({**make_catalog(), "schema_version": 4})
+    for schema_version in (4, 5):
+        with pytest.raises(ValueError, match="unknown catalog schema_version"):
+            bsd.validate_catalog({**make_catalog(), "schema_version": schema_version})
 
 
 def test_data_v3_rows_require_depth_fields_and_drop_reasoning():
@@ -2218,11 +2219,11 @@ def test_data_v3_rows_require_depth_fields_and_drop_reasoning():
             bsd.build_data("acme/model-a", priorities)
 
 
-def test_history_v4_discards_v3_and_keeps_highlights_v1():
-    assert bsd.HISTORY_SCHEMA_VERSION == 4
+def test_history_v5_discards_v4_and_keeps_highlights_v1():
+    assert bsd.HISTORY_SCHEMA_VERSION == 5
     assert bsd.HIGHLIGHTS_SCHEMA_VERSION == 1
     prev = {
-        "schema_version": 3,
+        "schema_version": 4,
         "snapshots": {
             "2026-10-20": make_history_snapshot(
                 "2026-10-20", "2026-10-20T00:00:00+00:00"
@@ -2232,7 +2233,7 @@ def test_history_v4_discards_v3_and_keeps_highlights_v1():
     merged = bsd.merge_history(
         prev, make_history_snapshot("2026-10-26", "2026-10-26T00:00:00+00:00")
     )
-    assert merged["schema_version"] == 4
+    assert merged["schema_version"] == 5
     assert list(merged["snapshots"]) == ["2026-10-26"]
 
 

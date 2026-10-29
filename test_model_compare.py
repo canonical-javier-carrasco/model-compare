@@ -1910,10 +1910,19 @@ def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
     # The fetch succeeded, so the cache written moments ago backs the
     # display annotations, marked stale (the model is not ranked on them).
     assert entry["annotations"]["stale"] is True
-    # Task 7 moves the site validator to v5; until the two schema pins
-    # agree it rejects this v5 document, so exercise it only then.
+    # The producer and site validator must always agree on the contract.
     if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
         bsd.validate_catalog(doc)
+
+
+def test_catalog_schema_versions_are_in_lockstep():
+    assert mc.VERSION == "0.7.0"
+    assert mc.CATALOG_QUALITY_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION == 6
+    assert (
+        mc.CATALOG_QUALITY_SCHEMA_VERSION
+        == mc.CATALOG_SCHEMA_VERSION
+        == bsd.CATALOG_SCHEMA_VERSION
+    )
 
 
 def test_empty_pool_after_endpoint_drops_warns_with_drop_counts(monkeypatch, capsys):
@@ -2384,6 +2393,19 @@ def test_table_has_tier_column(capsys):
     assert ">100k" in tiered_row
     plain_row = next(line for line in lines if "acme/plain" in line)
     assert ">100k" not in plain_row
+
+
+@pytest.mark.parametrize("detail", ["expert", "simple"])
+def test_print_table_legend_describes_best_selectable_depth(detail, capsys):
+    mc.print_table(
+        _scored_candidates(), mc.PRIORITY_WEIGHTS["balanced"], None, detail=detail
+    )
+    out = capsys.readouterr().out
+    assert "best measured selectable depth" in out
+    if detail == "expert":
+        assert "OpenRouter's default (informational)" in out
+    else:
+        assert "suffix after · names the effort used for QUAL" in out
 
 
 def test_print_table_expert_columns_and_legend(capsys):
@@ -5395,7 +5417,158 @@ def test_resolve_quality_unmatched_is_none():
     assert source == {}
 
 
-def test_resolve_quality_depth_uses_effective_default():
+def test_select_default_depth_skips_huge_integer_index():
+    assert (
+        mc.select_default_depth(
+            {},
+            {
+                "max": {"effort": "max", "index": 10**400},
+                "high": {"effort": "high", "index": 42.0},
+            },
+        )
+        == "high"
+    )
+    assert (
+        mc.select_default_depth({}, {"max": {"effort": "max", "index": 10**400}})
+        is None
+    )
+
+
+def test_resolve_quality_depth_best_selectable_beats_default():
+    # Default `high` measured at 46.8 but selectable max measures 56.0:
+    # the score uses the best selectable depth.
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "supported_efforts": ["max", "high", "low"],
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, source = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
+    )
+    assert quality["acme/model-a"]["index"] == 56.0
+    assert quality["acme/model-a"]["effort"] == "max"
+
+
+def test_resolve_quality_depth_unselectable_deeper_record_ignored():
+    # AA measured max 56.0 but OpenRouter cannot run max: high 46.8 wins.
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "supported_efforts": ["high", "low"],
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, _ = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
+    )
+    assert quality["acme/model-a"]["index"] == 46.8
+    assert quality["acme/model-a"]["effort"] == "high"
+
+
+def test_resolve_quality_depth_tie_goes_to_deeper_effort():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "medium",
+        "supported_efforts": ["max", "high", "medium"],
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 50.0,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 50.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, _ = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
+    )
+    assert quality["acme/model-a"]["effort"] == "max"
+
+
+def test_resolve_quality_depth_missing_supported_efforts_uses_all_measured():
+    # No supported_efforts metadata (older unit-style candidate): never zero
+    # a measured model -- all measured records are eligible.
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "high",
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (High)",
+                "slug": "model-a-high",
+                "index": 46.8,
+                "as_of": "t1",
+            },
+            {
+                "id": "2",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, _ = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
+    )
+    assert quality["acme/model-a"]["index"] == 56.0
+
+
+def test_resolve_quality_depth_scored_at_best_selectable():
     cand = {
         "id": "acme/model-a",
         "name": "Acme: Model A",
@@ -5423,12 +5596,12 @@ def test_resolve_quality_depth_uses_effective_default():
     quality, source = mc.resolve_quality(
         [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
     )
-    assert quality["acme/model-a"]["index"] == 46.8
-    assert quality["acme/model-a"]["effort"] == "high"
+    assert quality["acme/model-a"]["index"] == 56.0
+    assert quality["acme/model-a"]["effort"] == "max"
     assert source == {"acme/model-a": "aa"}
 
 
-def test_resolve_quality_depth_missing_default_is_unmatched():
+def test_resolve_quality_depth_default_unmeasured_uses_best_measured():
     cand = {
         "id": "acme/model-a",
         "name": "Acme: Model A",
@@ -5449,10 +5622,12 @@ def test_resolve_quality_depth_missing_default_is_unmatched():
     quality, source = mc.resolve_quality(
         [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="default"
     )
-    assert quality == {} and source == {}
+    assert quality["acme/model-a"]["index"] == 56.0
+    assert quality["acme/model-a"]["effort"] == "max"
+    assert source == {"acme/model-a": "aa"}
 
 
-def test_resolve_quality_depth_catalog_reselects_live_default():
+def test_resolve_quality_depth_catalog_best_selectable():
     cand = {
         "id": "acme/model-a",
         "name": "Acme: Model A",
@@ -5487,8 +5662,10 @@ def test_resolve_quality_depth_catalog_reselects_live_default():
         catalog_depths=catalog_depths,
         requested_effort="default",
     )
-    assert quality["acme/model-a"]["index"] == 46.8
+    assert quality["acme/model-a"]["index"] == 56.0
+    assert quality["acme/model-a"]["effort"] == "max"
     assert quality["acme/model-a"]["source"] == "catalog"
+    assert source == {"acme/model-a": "catalog"}
 
 
 def test_resolve_quality_single_state_reasoning_uses_reasoning_row():
@@ -5514,6 +5691,32 @@ def test_resolve_quality_single_state_reasoning_uses_reasoning_row():
     )
     assert quality["acme/model-a"]["index"] == 44.0
     assert quality["acme/model-a"]["effort"] == "reasoning"
+
+
+def test_resolve_quality_depth_explicit_effort_does_not_borrow_other_depth():
+    cand = {
+        "id": "acme/model-a",
+        "name": "Acme: Model A",
+        "default_effort": "max",
+        "supported_efforts": ["max", "high"],
+        "reasoning": {"is_reasoning": True},
+    }
+    lookup = mc.build_aa_depth_lookup(
+        [
+            {
+                "id": "1",
+                "name": "Model A (Max)",
+                "slug": "model-a",
+                "index": 56.0,
+                "as_of": "t1",
+            },
+        ]
+    )
+    quality, source = mc.resolve_quality(
+        [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup, requested_effort="high"
+    )
+    assert quality == {}
+    assert source == {}
 
 
 def test_resolve_quality_depth_explicit_effort_selects_that_depth():
@@ -5758,7 +5961,8 @@ def test_resolve_quality_depth_attaches_full_measured_depth_list():
     quality, _source = mc.resolve_quality(
         [cand], {}, {}, {}, "AA API v2", depth_lookup=lookup
     )
-    assert quality["acme/model-a"]["effort"] == "high"
+    assert quality["acme/model-a"]["index"] == 56.0
+    assert quality["acme/model-a"]["effort"] == "max"
     assert cand["reasoning_depths"] == [
         {
             "effort": "max",
@@ -5777,7 +5981,7 @@ def test_resolve_quality_depth_attaches_full_measured_depth_list():
     ]
 
 
-def test_resolve_quality_catalog_missing_requested_effort_is_unmatched():
+def test_resolve_quality_catalog_default_uses_best_measured():
     cand = {
         "id": "acme/model-a",
         "name": "Acme: Model A",
@@ -5806,7 +6010,9 @@ def test_resolve_quality_catalog_missing_requested_effort_is_unmatched():
         catalog_depths=catalog_depths,
         requested_effort="default",
     )
-    assert quality == {} and source == {}
+    assert quality["acme/model-a"]["index"] == 56.0
+    assert quality["acme/model-a"]["effort"] == "max"
+    assert source == {"acme/model-a": "catalog"}
     assert cand["reasoning_depths"] == [
         {
             "effort": "max",
@@ -5939,19 +6145,50 @@ def test_build_schedules_non_reasoning_keeps_or_trio():
     assert entries[0]["quality_source"] == "openrouter"
 
 
+def test_build_schedules_explicit_effort_does_not_use_or_trio():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        {"acme/sched": {"intelligence_index": 30.0, "as_of": "20261001"}},
+        {},
+        depth_lookup={},
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": False,
+                "default_effort": "none",
+                "supported_efforts": [],
+            }
+        },
+        requested_effort="low",
+    )
+    assert entries[0]["quality"] is None
+    assert entries[0]["quality_effort"] is None
+
+
 def test_build_schedules_keyed_uses_default_depth_record():
     model = make_model(
         id="acme/sched", pricing=deepseek_pricing(), context_length=500000
     )
     depth_lookup = {
         "sched": {
+            "max": {
+                "effort": "max",
+                "index": 56.0,
+                "cost_per_task_usd": 5.0,
+                "source": "aa",
+                "as_of": "t-max",
+            },
             "high": {
                 "effort": "high",
                 "index": 44.0,
                 "cost_per_task_usd": 0.5,
                 "source": "aa",
                 "as_of": "t1",
-            }
+            },
         }
     }
     entries = mc.build_schedules(
@@ -5965,14 +6202,14 @@ def test_build_schedules_keyed_uses_default_depth_record():
             "acme/sched": {
                 "is_reasoning": True,
                 "default_effort": "high",
-                "supported_efforts": ["high"],
+                "supported_efforts": ["max", "high"],
             }
         },
     )
-    assert entries[0]["quality"] == 44.0
-    assert entries[0]["quality_effort"] == "high"
+    assert entries[0]["quality"] == 56.0
+    assert entries[0]["quality_effort"] == "max"
     assert entries[0]["quality_source"] == "aa"
-    assert entries[0]["quality_as_of"] == "t1"
+    assert entries[0]["quality_as_of"] == "t-max"
 
 
 def test_build_schedules_unkeyed_carries_catalog_effort():
@@ -5983,12 +6220,18 @@ def test_build_schedules_unkeyed_carries_catalog_effort():
         "acme/sched": {
             "default_effort": "high",
             "depths": {
+                "max": {
+                    "effort": "max",
+                    "index": 56.0,
+                    "as_of": "t-max",
+                    "source": "catalog",
+                },
                 "high": {
                     "effort": "high",
                     "index": 44.0,
                     "as_of": "t1",
                     "source": "catalog",
-                }
+                },
             },
         }
     }
@@ -6003,11 +6246,71 @@ def test_build_schedules_unkeyed_carries_catalog_effort():
             "acme/sched": {
                 "is_reasoning": True,
                 "default_effort": "high",
-                "supported_efforts": ["high"],
+                "supported_efforts": ["max", "high"],
             }
         },
     )
+    assert entries[0]["quality"] == 56.0
+    assert entries[0]["quality_effort"] == "max"
+    assert entries[0]["quality_source"] == "catalog"
+    assert entries[0]["quality_as_of"] == "t-max"
+
+
+def test_build_schedules_unkeyed_catalog_honors_requested_effort():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    catalog_depths = {
+        "acme/sched": {
+            "depths": {
+                "max": {"effort": "max", "index": 56.0},
+                "high": {"effort": "high", "index": 44.0},
+            }
+        }
+    }
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        {},
+        {},
+        catalog_depths=catalog_depths,
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": True,
+                "default_effort": "high",
+                "supported_efforts": ["max", "high"],
+            }
+        },
+        requested_effort="high",
+    )
     assert entries[0]["quality"] == 44.0
+    assert entries[0]["quality_effort"] == "high"
+
+
+def test_build_schedules_unkeyed_malformed_catalog_depths_falls_through():
+    model = make_model(
+        id="acme/sched", pricing=deepseek_pricing(), context_length=500000
+    )
+    entries = mc.build_schedules(
+        [model],
+        make_args(),
+        {},
+        {},
+        {},
+        catalog_quality={
+            "acme/sched": {"index": 42.0, "effort": "high", "as_of": "t1"}
+        },
+        catalog_depths={"acme/sched": {"depths": "malformed"}},
+        reasoning_by_id={
+            "acme/sched": {
+                "is_reasoning": True,
+                "default_effort": "high",
+                "supported_efforts": ["max", "high"],
+            }
+        },
+    )
+    assert entries[0]["quality"] == 42.0
     assert entries[0]["quality_effort"] == "high"
     assert entries[0]["quality_source"] == "catalog"
 
@@ -6154,6 +6457,31 @@ def test_print_json_rows_carry_quality_source_and_as_of(capsys):
     assert row["quality_or_as_of"] == "20260915"
 
 
+def test_print_json_pins_quality_to_best_selectable_depth(capsys):
+    # The default is high but unmeasured; the best measured selectable depth
+    # is max, and JSON must expose the same record and its index.
+    cand = _cand("acme/model-a", 50.0)
+    cand["quality"] = 56.0
+    cand["quality_record"] = {
+        "index": 56.0,
+        "source": "aa",
+        "as_of": "t-max",
+        "effort": "max",
+    }
+    cand["reasoning"] = {
+        "default_effort": "high",
+        "supported_efforts": ["max", "high"],
+        "is_reasoning": True,
+    }
+    cand["reasoning_depths"] = [
+        {"effort": "max", "index": 56.0, "source": "aa", "as_of": "t-max"}
+    ]
+    mc.print_json([cand])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["quality_effort"] == "max"
+    assert row["quality_index"] == 56.0
+
+
 def test_print_json_carries_depth_fields(capsys):
     cand = _cand("acme/model-a", 50.0)
     cand["quality"] = 46.8
@@ -6230,7 +6558,7 @@ def test_print_json_unmatched_effort_is_null(capsys):
 # ---------------------------------------------------------------------------
 
 
-def _catalog_doc(models, schema_version=5, generated_at="2026-10-23T13:15:07+00:00"):
+def _catalog_doc(models, schema_version=6, generated_at="2026-10-23T13:15:07+00:00"):
     """Minimal published catalog.json: only the fields hydration reads."""
     return {
         "schema_version": schema_version,
@@ -6239,8 +6567,8 @@ def _catalog_doc(models, schema_version=5, generated_at="2026-10-23T13:15:07+00:
     }
 
 
-def test_catalog_quality_by_id_v5_passthrough(capsys):
-    """v5 rows keep their recorded quality_as_of, source label and effort
+def test_catalog_quality_by_id_v6_passthrough(capsys):
+    """v6 rows keep their recorded quality_as_of, source label and effort
     verbatim; unmatched rows (no value, no label) are skipped without a
     warning.
 
@@ -6266,7 +6594,7 @@ def test_catalog_quality_by_id_v5_passthrough(capsys):
             },
             {"id": "acme/model-c", "quality": None, "quality_match": None},
         ],
-        schema_version=5,
+        schema_version=6,
     )
     assert mc.catalog_quality_by_id(doc) == {
         "acme/model-a": {
@@ -6285,10 +6613,10 @@ def test_catalog_quality_by_id_v5_passthrough(capsys):
     assert capsys.readouterr().err == ""
 
 
-@pytest.mark.parametrize("schema_version", [3, 4])
+@pytest.mark.parametrize("schema_version", [3, 4, 5])
 def test_catalog_quality_by_id_old_schema_skipped(schema_version, capsys):
-    """Only v5 hydrates: the v3/v4 normalization branches are retired, and
-    mixing old semantics into a depth-aware run is never allowed."""
+    """Only v6 hydrates: older normalization branches are retired, and
+    mixing old semantics into a best-selectable-depth run is never allowed."""
     doc = _catalog_doc(
         [
             {
@@ -6303,19 +6631,19 @@ def test_catalog_quality_by_id_old_schema_skipped(schema_version, capsys):
     )
     assert mc.catalog_quality_by_id(doc) == {}
     err = capsys.readouterr().err
-    assert f"published catalog schema v{schema_version}, expected 5" in err
+    assert f"published catalog schema v{schema_version}, expected 6" in err
     assert "skipping hydration" in err
 
 
-def test_catalog_quality_by_id_schema_mismatch_skipped(capsys):
-    """schema_version < 5: warn + skip the whole artifact (empty by_id)."""
+def test_catalog_quality_by_id_v2_schema_skipped(capsys):
+    """An old schema: warn + skip the whole artifact (empty by_id)."""
     doc = _catalog_doc(
         [{"id": "acme/model-a", "quality": 45.1, "quality_match": "api"}],
         schema_version=2,
     )
     assert mc.catalog_quality_by_id(doc) == {}
     err = capsys.readouterr().err
-    assert "published catalog schema v2, expected 5" in err
+    assert "published catalog schema v2, expected 6" in err
     assert "skipping hydration" in err
 
 
@@ -6356,7 +6684,7 @@ def test_catalog_quality_by_id_out_of_range_quality_degrades(capsys):
                 {"id": "acme/model-a", "quality": 45.1, "quality_match": "aa"},
                 {"id": "acme/model-b", "quality": bad, "quality_match": "openrouter"},
             ],
-            schema_version=5,
+            schema_version=6,
         )
         assert mc.catalog_quality_by_id(doc) == {}
         assert "unexpected response shape" in capsys.readouterr().err
@@ -6408,13 +6736,13 @@ def test_catalog_quality_by_id_malformed_depths_degrade(capsys):
                     "reasoning": reasoning,
                 }
             ],
-            schema_version=5,
+            schema_version=6,
         )
         assert mc.catalog_quality_by_id(doc) == {}
         assert "unexpected response shape" in capsys.readouterr().err
 
 
-def test_fetch_quality_catalog_parses_v5_depth_without_main_quality(monkeypatch):
+def test_fetch_quality_catalog_parses_v6_depth_without_main_quality(monkeypatch):
     """A model can have measured depths without a main score: by_id skips it
     but depths_by_id still hydrates its depth map."""
     doc = _catalog_doc(
@@ -6437,7 +6765,7 @@ def test_fetch_quality_catalog_parses_v5_depth_without_main_quality(monkeypatch)
                 },
             }
         ],
-        schema_version=5,
+        schema_version=6,
     )
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
     result = mc.fetch_quality_catalog(make_args())
@@ -6445,8 +6773,8 @@ def test_fetch_quality_catalog_parses_v5_depth_without_main_quality(monkeypatch)
     assert result["depths_by_id"]["acme/model-a"]["depths"]["high"]["index"] == 46.8
 
 
-def test_fetch_quality_catalog_parses_v5_depths(monkeypatch):
-    """The v5 per-model reasoning.depths list becomes an effort-keyed map;
+def test_fetch_quality_catalog_parses_v6_depths(monkeypatch):
+    """The v6 per-model reasoning.depths list becomes an effort-keyed map;
     each depth record reuses the quality record's shape (`index`)."""
     stamp = "2026-10-23T13:15:07+00:00"
     doc = _catalog_doc(
@@ -6480,7 +6808,7 @@ def test_fetch_quality_catalog_parses_v5_depths(monkeypatch):
             },
             {"id": "acme/model-b", "quality": None, "quality_match": None},
         ],
-        schema_version=5,
+        schema_version=6,
     )
     monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
     result = mc.fetch_quality_catalog(make_args())
@@ -6577,6 +6905,51 @@ def test_fetch_quality_catalog_parses_schedule_entries(monkeypatch):
     }
 
 
+def test_fetch_quality_catalog_hydrates_v6_and_rejects_v5(monkeypatch, capsys):
+    entry = {
+        "id": "acme/model-a",
+        "quality": 56.0,
+        "quality_match": "aa",
+        "quality_as_of": "t-max",
+        "quality_effort": "max",
+        "reasoning": {
+            "default_effort": "high",
+            "depths": [
+                {
+                    "effort": "max",
+                    "index": 56.0,
+                    "cost_per_task_usd": 5.46,
+                    "source": "aa",
+                    "as_of": "t-max",
+                }
+            ],
+        },
+    }
+    schedule = {
+        "id": "acme/model-a",
+        "quality": 56.0,
+        "quality_effort": "max",
+        "quality_as_of": "t-max",
+        "quality_source": "aa",
+    }
+    doc = _catalog_doc([entry])
+    doc["schedules"] = [schedule]
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: doc)
+
+    hydrated = mc.fetch_quality_catalog(make_args())
+    assert hydrated["by_id"]["acme/model-a"]["index"] == 56.0
+    assert hydrated["depths_by_id"]["acme/model-a"]["depths"]["max"]["index"] == 56.0
+    assert hydrated["schedules_by_id"]["acme/model-a"]["quality_effort"] == "max"
+
+    legacy = {**doc, "schema_version": 5}
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: legacy)
+    rejected = mc.fetch_quality_catalog(make_args())
+    assert rejected["by_id"] == {}
+    assert rejected["depths_by_id"] == {}
+    assert rejected["schedules_by_id"] == {}
+    assert "published catalog schema v5, expected 6" in capsys.readouterr().err
+
+
 def test_fetch_quality_catalog_stale_generated_at_warns_but_uses(monkeypatch, capsys):
     """>14 days old: warn but use -- staleness stays visible via as_of, and
     the hydration is not thrown away over display-only provenance."""
@@ -6654,6 +7027,60 @@ def test_fetch_quality_catalog_fetch_failure_returns_none(monkeypatch, capsys):
     }
 
 
+def test_fetch_quality_catalog_serves_schema_stamped_cache_without_refetch(monkeypatch):
+    cached = {
+        "schema_version": mc.CATALOG_QUALITY_SCHEMA_VERSION,
+        "by_id": {"acme/cached": {"index": 42.0}},
+        "depths_by_id": {},
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schedules_by_id": {},
+    }
+    monkeypatch.setattr(mc, "load_cache", lambda *a, **k: cached)
+    monkeypatch.setattr(
+        mc,
+        "fetch_json",
+        lambda *a, **k: pytest.fail("schema-current cache should avoid refetch"),
+    )
+    assert mc.fetch_quality_catalog(make_args(no_cache=False)) == cached
+
+
+@pytest.mark.parametrize("cached_schema", [None, 5], ids=["unstamped", "stale-version"])
+def test_fetch_quality_catalog_refetches_unstamped_or_stale_cache(
+    monkeypatch, cached_schema
+):
+    cached = {
+        "by_id": {"acme/old": {"index": 40.0}},
+        "depths_by_id": {},
+        "generated_at": "2026-10-23T13:15:07+00:00",
+        "schedules_by_id": {},
+    }
+    if cached_schema is not None:
+        cached["schema_version"] = cached_schema
+    doc = _catalog_doc(
+        [
+            {
+                "id": "acme/fresh",
+                "quality": 45.1,
+                "quality_match": "aa",
+                "quality_effort": "high",
+            }
+        ],
+        schema_version=mc.CATALOG_SCHEMA_VERSION,
+    )
+    calls = []
+    saved = []
+    monkeypatch.setattr(mc, "load_cache", lambda *a, **k: cached)
+    monkeypatch.setattr(mc, "fetch_json", lambda *a, **k: calls.append(a[0]) or doc)
+    monkeypatch.setattr(mc, "save_cache", lambda *a, **k: saved.append(a[1]))
+
+    result = mc.fetch_quality_catalog(make_args(no_cache=False))
+
+    assert calls == [mc.QUALITY_CATALOG_URL]
+    assert result["by_id"]["acme/fresh"]["index"] == 45.1
+    assert result["schema_version"] == mc.CATALOG_QUALITY_SCHEMA_VERSION
+    assert saved == [result]
+
+
 def test_fetch_quality_catalog_respects_no_cache_and_ttl(monkeypatch, tmp_path):
     """Cache write/read roundtrip under QUALITY_CATALOG_CACHE; --no-cache
     neither reads nor writes; an expired entry is fetched again; only a
@@ -6716,10 +7143,10 @@ def test_fetch_quality_catalog_respects_no_cache_and_ttl(monkeypatch, tmp_path):
     assert result["depths_by_id"] == {}
 
 
-def test_run_unkeyed_v4_catalog_cache_prevents_refetch(monkeypatch, capsys):
-    # A still-live v4 catalog is a stable version-skew state, not a
+def test_run_unkeyed_v5_catalog_cache_prevents_refetch(monkeypatch, capsys):
+    # A still-live v5 catalog is a stable version-skew state, not a
     # transient malformed payload: its degraded (empty) envelope is cached
-    # so a second unkeyed run does not re-fetch it. v2/v3 remain
+    # so a second unkeyed run does not re-fetch it. Older schemas remain
     # uncached/self-healing (pinned by the test above).
     models = [
         make_model(id="acme/candidate", name="Acme: Candidate"),
@@ -6731,8 +7158,8 @@ def test_run_unkeyed_v4_catalog_cache_prevents_refetch(monkeypatch, capsys):
             reasoning={"default_effort": "high", "supported_efforts": ["high"]},
         ),
     ]
-    v4_doc = _catalog_doc([], schema_version=4)
-    v4_doc["schedules"] = [
+    v5_doc = _catalog_doc([], schema_version=5)
+    v5_doc["schedules"] = [
         {
             "id": "acme/sched-only",
             "quality": 30.0,
@@ -6744,7 +7171,7 @@ def test_run_unkeyed_v4_catalog_cache_prevents_refetch(monkeypatch, capsys):
 
     def fake_fetch(*a, **k):
         calls.append(1)
-        return v4_doc
+        return v5_doc
 
     monkeypatch.setattr(mc, "fetch_json", fake_fetch)
     zdr = {model["id"] for model in models}
@@ -6836,8 +7263,8 @@ def test_parse_iso_datetime_bad():
 # Test-file mirror of the producer/validator contract so the key set lives
 # in exactly two places: the producer (build_catalog) and the validator it
 # feeds. bsd.CATALOG_ENTRY_KEYS carries the "aa" trio plus Task 9's four
-# schema-v3 additive blocks. Schema v5's quality_effort/reasoning keys are
-# added here until Task 7 moves the site validator to v5.
+# schema-v3 additive blocks. Catalog v5 added quality_effort/reasoning;
+# the current v6 producer and validator share those keys.
 CATALOG_ENTRY_KEYS = set(bsd.CATALOG_ENTRY_KEYS) | {"quality_effort", "reasoning"}
 
 
@@ -6928,7 +7355,7 @@ def build_doc(**overrides):
 
 def test_catalog_envelope():
     doc = build_doc()
-    assert doc["schema_version"] == 5
+    assert doc["schema_version"] == 6
     assert doc["tool"] == "model-compare"
     datetime.fromisoformat(doc["generated_at"])  # ISO with offset, raises if not
     p = doc["parameters"]
@@ -7037,7 +7464,7 @@ def test_catalog_entry_shape():
     assert b["discount"] is None
 
 
-def test_build_catalog_v5_carries_reasoning_block():
+def test_build_catalog_v6_carries_reasoning_block():
     cand = _cand("acme/model-a", 50.0)
     cand.update(created=0.0, tool_calling=True, zdr=True, expired=False)
     cand["quality_record"] = {
@@ -7079,7 +7506,7 @@ def test_build_catalog_v5_carries_reasoning_block():
         {"acme/model-a": "aa"},
     )
     entry = doc["models"][0]
-    assert doc["schema_version"] == 5
+    assert doc["schema_version"] == 6
     assert doc["parameters"]["reasoning_effort"] == "default"
     assert entry["quality_effort"] == "high"
     assert entry["reasoning"]["default_effort"] == "high"
@@ -7446,8 +7873,8 @@ def test_cli_json_rows_project_cleanly_onto_catalog_rankings(capsys):
     # Cross-program check: real --json rows (top 2) per priority and the real
     # catalog pass the site's order_rows / build_snapshot.
     doc = _inverting_catalog()
-    # Task 7 moves the site validator to v5; until the two schema pins
-    # agree it rejects this v5 document, so exercise it only then.
+    # The site validator must use the producer's catalog contract; the
+    # unconditional lockstep test pins that requirement.
     if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
         bsd.validate_catalog(doc)
     priorities = {}
@@ -7478,8 +7905,8 @@ def test_catalog_deterministic_modulo_generated_at():
 
 def test_catalog_document_passes_site_validator():
     # Drift between the producer and the site validator must fail the suite
-    # here, not the publish. The site validator moves to v5 in Task 7, so
-    # this task only pins the producer-side shape and counts.
+    # here, not the publish; the unconditional schema lockstep test pins the
+    # version contract too.
     # mixed provenance (OR benchmarks + AA api fallback) must survive too
     args, models, candidates, dropped, filtered, discounts, _, _, aa_by_id = (
         catalog_pool()
@@ -7514,8 +7941,8 @@ def test_catalog_document_passes_site_validator():
         "catalog_generated_at": None,
         "intelligence_index_version": None,
     }
-    # Task 7 moves the site validator to v5; until the two schema pins
-    # agree it rejects this v5 document, so exercise it only then.
+    # The site validator must use the producer's catalog contract; the
+    # unconditional lockstep test pins that requirement.
     if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
         bsd.validate_catalog(doc)
 
@@ -7823,8 +8250,8 @@ def test_catalog_sources_aa_block_reshaped_with_counts_version_and_meta():
         "catalog_generated_at": "2026-10-23T13:15:07+00:00",
         "intelligence_index_version": None,
     }
-    # Task 7 moves the site validator to v5; until the two schema pins
-    # agree it rejects this v5 document, so exercise it only then.
+    # The site validator must use the producer's catalog contract; the
+    # unconditional lockstep test pins that requirement.
     if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
         bsd.validate_catalog(doc)
 
@@ -7910,7 +8337,7 @@ def test_version_flag():
         check=True,
     )
     # Literal pin: a release that forgets to bump VERSION fails here.
-    assert proc.stdout.strip() == "model-compare 0.6.0"
+    assert proc.stdout.strip() == "model-compare 0.7.0"
 
 
 # ---------------------------------------------------------------------------
@@ -8169,8 +8596,8 @@ def test_catalog_mode_not_masked_by_openrouter_matches():
     doc = build_doc(aa_source=None)
     assert doc["sources"]["aa"]["matched_openrouter"] > 0
     assert doc["sources"]["aa"]["mode"] == "none"
-    # Task 7 moves the site validator to v5; until the two schema pins
-    # agree it rejects this v5 document, so exercise it only then.
+    # The site validator must use the producer's catalog contract; the
+    # unconditional lockstep test pins that requirement.
     if bsd.CATALOG_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION:
         bsd.validate_catalog(doc)
 
@@ -8371,7 +8798,7 @@ def test_session_cost_drops_unknown_turn_ranges(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Provider-aware eval: catalog v3 (schema bump + additive blocks)
+# Provider-aware eval: catalog v6 (schema bump + additive blocks)
 # ---------------------------------------------------------------------------
 
 
@@ -8396,12 +8823,12 @@ def _offline_catalog_doc(
     return json.loads(capsys.readouterr().out)
 
 
-def test_catalog_schema_version_is_5(monkeypatch, capsys):
+def test_catalog_schema_version_is_6(monkeypatch, capsys):
     models = [make_model(id="z-ai/glm", name="Z.AI: GLM")]
     doc = _offline_catalog_doc(
         monkeypatch, capsys, models, {"z-ai/glm": _endpoint_stage_eps()}
     )
-    assert doc["schema_version"] == 5
+    assert doc["schema_version"] == 6
     # run()'s unkeyed wiring, end to end: no AA key (no index version) and
     # the published catalog unavailable (no hydration meta) -- the chain is
     # "none" and every bucket is empty.
@@ -8993,7 +9420,7 @@ def test_run_footer_mixed_catalog_stamp_shapes(monkeypatch, capsys):
                     },
                 },
             ],
-            schema_version=5,
+            schema_version=6,
         )
         return {
             "by_id": mc.catalog_quality_by_id(doc),
@@ -9110,7 +9537,7 @@ def test_run_unkeyed_catalog_schedules_quality_for_non_candidates(monkeypatch, c
                 "quality_effort": "none",
             },
         ],
-        schema_version=5,
+        schema_version=6,
     )
     catalog = {
         "by_id": mc.catalog_quality_by_id(catalog_doc),
@@ -9225,10 +9652,9 @@ def test_run_unkeyed_catalog_schedule_null_quality_reasoning_stays_null(
 
 
 def test_run_unkeyed_v4_catalog_never_hydrates_schedules(monkeypatch, capsys):
-    # Spec 9.1: a v4 catalog hydrates no quality rather than mixing
-    # semantics. Its schedules carry no quality_effort, so the schedule
-    # parser must stay behind the v5 gate -- otherwise a max-effort OR row
-    # would be republished as a default-effort deal.
+    # An older catalog hydrates no quality rather than mixing old quality
+    # semantics into a best-selectable-depth run. Its schedules carry no
+    # quality_effort, so the parser stays behind the v6 gate.
     models = [
         make_model(id="acme/candidate", name="Acme: Candidate"),
         make_model(
@@ -9509,7 +9935,7 @@ def test_run_prints_depth_detail_before_table_legend(monkeypatch, capsys):
     assert mc.run(make_args(), models, False) == 0
     out = capsys.readouterr().out
     depth_at = out.index("depth detail  (AA index")
-    legend_at = out.index("Artificial Analysis intelligence index")
+    legend_at = out.index("best measured selectable depth")
     assert depth_at < legend_at
 
 
@@ -9924,7 +10350,7 @@ def test_run_off_peak_non_candidate_deal_keeps_resolved_quality(monkeypatch, cap
             }
         },
         "generated_at": "2026-10-23T13:15:07+00:00",
-        "schema_version": 5,
+        "schema_version": 6,
     }
     _stub_quality_run(
         monkeypatch,
@@ -9981,7 +10407,7 @@ def test_run_balanced_score_matches_between_main_and_deals(monkeypatch, capsys):
             }
         },
         "generated_at": "2026-10-23T13:15:00Z",
-        "schema_version": 5,
+        "schema_version": 6,
     }
     _stub_quality_run(
         monkeypatch,
@@ -10095,7 +10521,7 @@ def test_run_off_peak_catalog_output_keeps_non_candidate_quality(monkeypatch, ca
             }
         },
         "generated_at": "2026-10-23T13:15:07+00:00",
-        "schema_version": 5,
+        "schema_version": 6,
     }
     _stub_quality_run(
         monkeypatch,

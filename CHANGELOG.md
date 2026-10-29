@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-28
+
+### Changed
+
+- Tool version is `model-compare 0.7.0`.
+- Default quality selection now scores each model at its best measured
+  selectable depth: the highest AA index at an effort OpenRouter supports,
+  with ties going to the deeper effort. For example,
+  `deepseek/deepseek-v4.1-flash-1017` was previously unscored because its
+  OpenRouter default `high` had no AA measurement; it now scores at its
+  selectable measured `max` depth. The Off-peak Deals catalog uses the same
+  rule. Explicit `--reasoning-effort` still selects exactly the requested
+  effort and drops models that cannot run it; it never borrows another depth.
+- CLI and web QUAL descriptions now tell the same story. `*` continues to mark
+  OpenRouter's default, for information only. The web site's muted selectable
+  alternative under QUAL was removed because QUAL itself is now the best
+  selectable depth. Detail rows are thin and do not wrap.
+- Catalog `schema_version` 5 → 6: the producer, quality reader gate and web
+  validator now all require schema 6. The OpenCode plugin reads
+  `quality_effort` from the v6 catalog to pin aliases at the scored depth.
+- `history.json` 4 → 5: default-effort history cannot be compared with
+  best-selectable-depth scores and ranks, so history starts fresh. The 7-day
+  movement and weekly highlights remain without a baseline until fresh
+  snapshots cover a week. `data.json` stays schema 3 and `highlights.json`
+  stays schema 1.
+
 ## [0.6.0] - 2026-10-27
 
 ### Added

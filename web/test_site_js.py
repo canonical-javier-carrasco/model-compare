@@ -155,6 +155,41 @@ def test_fmtprice_non_tie_decimal_matches_python():
 # Site assembly: external assets, view toggle, cookie consent, verbadge
 
 
+def test_expanded_table_rows_stay_thin_and_do_not_wrap():
+    css = SITE_CSS.read_text()
+
+    main_cells = re.search(
+        r"#table th,\s*#table td,\s*#deals th,\s*#deals td\s*\{([^}]*)\}",
+        css,
+    ).group(1)
+    assert re.search(r"white-space:\s*nowrap\s*;", main_cells)
+
+    def rule_body(selector):
+        return re.search(re.escape(selector) + r"\s*\{([^}]*)\}", css).group(1)
+
+    outer_padding = re.search(
+        r"padding:\s*([\d.]+)rem\s+([\d.]+)rem\s+([\d.]+)rem\s*;",
+        rule_body("#table tr.endpoint-row td"),
+    )
+    assert outer_padding is not None
+    assert float(outer_padding.group(1)) < 0.4
+    assert float(outer_padding.group(3)) < 0.4
+
+    nested_cells = re.search(
+        r"#table tr.endpoint-row table th,\s*"
+        r"#table tr.endpoint-row table td\s*\{([^}]*)\}",
+        css,
+    ).group(1)
+    assert re.search(r"padding:\s*0\.1rem\s+0\.4rem\s*;", nested_cells)
+    assert "white-space" not in nested_cells
+
+    for selector in ("#table .endpoint-note", "#table .detail-heading"):
+        margin = re.search(r"margin:\s*([^;]+);", rule_body(selector))
+        assert margin is not None
+        values = re.findall(r"([\d.]+)rem", margin.group(1))
+        assert values and all(float(value) <= 0.15 for value in values)
+
+
 def test_site_references_the_external_assets():
     # The former inline CSS/JS blocks are external files now: the page
     # links them, and its CSP allows same-origin assets but no inline
@@ -246,10 +281,18 @@ def test_simple_view_hidden_columns_and_legend():
     )
     assert '<p class="hint hide-simple">\n      <strong>TASK$</strong>' in html
     assert '<p class="hint">\n      Prices shown are what a long session pays' in html
-    # The plain-language depth paragraph explains QUAL in both views (the
-    # simple cell keeps the effort tag even though the DEPTH column hides).
-    assert "effective OpenRouter default reasoning effort" in html
-    assert "best selectable measured depth" in html
+    # QUAL has one legend entry that explains the best measured selectable
+    # depth and how to interpret its source and benchmark cost.
+    hints = re.findall(r'<p class="hint[^\"]*">(.*?)</p>', html, re.DOTALL)
+    qual_hints = [hint for hint in hints if "<strong>QUAL</strong>" in hint]
+    assert len(qual_hints) == 1
+    qual_hint = re.sub(r"\s+", " ", qual_hints[0])
+    assert "best measured selectable depth" in qual_hint
+    assert "Hover a cell for source, as-of date, and drift notes" in qual_hint
+    assert "<code>#effort</code>" in qual_hint
+    assert "AA <code>$/task</code>" in qual_hint
+    assert "<strong>TASK$</strong> session cost" in qual_hint
+    assert "any selectable effort." in re.sub(r"\s+", " ", html)
 
 
 def test_opencode_headings_keep_version_text_drop_badge():
@@ -1235,15 +1278,6 @@ def test_fmt_effort_marks_default_and_missing():
     assert run_js("fmtEffort({})") == "-"
 
 
-def test_quality_tooltip_names_effort_and_selectable_alternative():
-    out = run_js(
-        "qualityTooltip({quality_source:'aa',quality_as_of:'t1',quality_index:46.8,"
-        "quality_effort:'high',default_effort:'high',supported_efforts:['max','high'],"
-        "reasoning:{depths:[{effort:'max',quality_index:56,cost_per_task_usd:5.46}]}})"
-    )
-    assert "high" in out and "56.0" in out and "selectable" in out
-
-
 def test_quality_tooltip_deals_row_includes_effort():
     out = run_js(
         "qualityTooltip({quality_source:'aa',quality_as_of:'t1',quality_index:44.0,"
@@ -1481,7 +1515,7 @@ def test_render_expanded_row_shows_depth_before_endpoints():
     assert out["aria"] == "true"
 
 
-def test_render_quality_cell_shows_effort_and_best_alternative():
+def test_render_quality_cell_shows_one_quality_value_and_effort():
     row = dict(SIMPLE_VIEW_ROW)
     row.update(
         {
@@ -1521,14 +1555,12 @@ def test_render_quality_cell_shows_effort_and_best_alternative():
         ' view = "expert"; render();'
         " var expert = els.tbody.children[0];"
         " var quality = expert.children[4];"
-        " var alt = quality.children[0];"
         ' view = "simple"; render();'
         " var simple = els.tbody.children[1];"
         " return {"
         "   depth: expert.children[3].textContent,"
         "   quality: quality.textContent,"
-        "   alt: alt.textContent,"
-        "   altClass: alt.className,"
+        "   qualityChildren: quality.children.length,"
         "   title: quality.title,"
         "   simpleQuality: simple.children[3].textContent"
         " };"
@@ -1536,10 +1568,8 @@ def test_render_quality_cell_shows_effort_and_best_alternative():
     )
     assert out["depth"] == "high*"
     assert out["quality"] == "46.8"
-    assert out["alt"] == "max 56.0"
-    assert out["altClass"] == "depth-alt"
+    assert out["qualityChildren"] == 0
     assert "measured at high" in out["title"]
-    assert "Best selectable alternative: max 56.0 at $5.46/task" in out["title"]
     assert out["simpleQuality"] == "46.8 · high"
 
 

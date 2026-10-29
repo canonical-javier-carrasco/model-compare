@@ -349,29 +349,6 @@
           : row.quality_effort;
       }
 
-      // The best measured alternative the user can actually select: an
-      // unselectable AA row stays in the detail table but is never
-      // advertised here.
-      function bestDepthAlternative(row) {
-        var base = finiteNumber(row && row.quality_index);
-        if (base === null) return null;
-        var rows = depthRows(row);
-        var best = null;
-        rows.forEach(function (depth) {
-          if (!depth.selectable || depth.index === null) return;
-          if (depth.effort === row.quality_effort) return;
-          if (depth.index <= base) return;
-          if (best === null || depth.index > best.index) best = depth;
-        });
-        return best;
-      }
-
-      function fmtDepthAlternative(row) {
-        var best = bestDepthAlternative(row);
-        if (!best) return null;
-        return best.effort + " " + pyFixed(best.index, 1);
-      }
-
       function fmtDepthRatio(value) {
         if (value === null) return "-";
         return pyFixed(value, value >= 1 ? 1 : 2) + "x";
@@ -390,9 +367,9 @@
 
       // QUAL cell tooltip: where the quality number came from (the source
       // label verbatim -- display strings from data.json are shown as-is)
-      // and when it was checked, the effort it was measured at, the best
-      // selectable alternative, plus the drift note when the producer
-      // flagged the row as disagreeing with OpenRouter's snapshot by >= 3
+      // and when it was checked, the effort it was measured at, plus any
+      // drift note for a row the producer flagged as disagreeing with
+      // OpenRouter's snapshot by >= 3
       // index points. The connective word mirrors the CLI footer's
       // stamp_words ("checked" for aa, "as of" elsewhere). The note names
       // the row's own OR pair; a flag without a finite check value cannot
@@ -446,18 +423,6 @@
           text +=
             "; OpenRouter does not report the reasoning effort of its " +
             "snapshot: not like-for-like";
-        }
-        var best = bestDepthAlternative(row);
-        if (best) {
-          text +=
-            ". Best selectable alternative: " +
-            best.effort +
-            " " +
-            pyFixed(best.index, 1);
-          if (best.cost !== null) {
-            text += " at $" + pyFixed(best.cost, 2) + "/task";
-          }
-          text += ". Click the row for all depths.";
         }
         return text;
       }
@@ -998,7 +963,6 @@
           if (row.quality_index !== null && depthRow.quality_effort) {
             simpleQuality += " · " + depthRow.quality_effort;
           }
-          var depthAlternative = fmtDepthAlternative(depthRow);
           var cells = [
             String(i + 1),
             row.model,
@@ -1031,14 +995,6 @@
               if (depthTip) td.title = depthTip;
             } else if (idx === 3) {
               if (qualityTip) td.title = qualityTip;
-              // Expert view names the best selectable alternative under
-              // the score; simple view keeps the effort tag instead.
-              if (view !== "simple" && depthAlternative) {
-                var alt = document.createElement("span");
-                alt.className = "depth-alt";
-                alt.textContent = depthAlternative;
-                td.appendChild(alt);
-              }
             } else if (idx === 7) {
               if (precTooltip) td.title = precTooltip;
             } else if (idx === 8) {

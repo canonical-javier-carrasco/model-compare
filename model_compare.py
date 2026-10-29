@@ -25,7 +25,8 @@ priority-dependent weights:
                  --input-share input / rest output) within the candidate
                  pool; free listings score 1.0.
   quality_score  AA intelligence index divided by --quality-ref (default
-                 70), clamped to [0, 1]; unmatched models score 0.
+                 70), measured at the model's best selectable depth and
+                 clamped to [0, 1]; unmatched models score 0.
   context_score  logarithmic bonus from --min-context up to 4x that
                  threshold (extra headroom helps, but with diminishing
                  returns).
@@ -89,8 +90,8 @@ AA_EFFORT_ORDER = (
     "reasoning",
 )
 REASONING_GATEWAY_EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
-# --reasoning-effort values: "default" keeps each model's effective default
-# and does not filter; the rest select and filter (spec §7).
+# --reasoning-effort values: "default" selects each model's best measured
+# selectable effort and does not filter; the rest select and filter (spec §7).
 REASONING_EFFORT_CHOICES = ("default",) + tuple(reversed(REASONING_GATEWAY_EFFORTS))
 # The repo's own published catalog.json -- built by keyed CI runs, hydrated
 # by unkeyed local runs (design: quality source reconciliation, source 2).
@@ -104,7 +105,7 @@ QUALITY_CATALOG_CACHE = "published-catalog"
 # A published catalog generated more than this many days ago is stale:
 # warn but use -- the records' as_of makes the staleness visible downstream.
 QUALITY_CATALOG_MAX_AGE_DAYS = 14
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
 # opencode expects provider-qualified model ids: openrouter/<provider/model>.
@@ -123,7 +124,7 @@ PRIORITY_WEIGHTS = {
     "quality": {"quality": 0.60, "price": 0.20, "context": 0.10, "age": 0.10},
 }
 
-CATALOG_SCHEMA_VERSION = 5
+CATALOG_SCHEMA_VERSION = 6
 
 # The drop-reason keys build_candidates counts, verbatim -- keep in sync with
 # its drop() call sites. pool.dropped lists all of them zero-filled so the
@@ -1238,9 +1239,9 @@ def fetch_session_cost(args) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-# Pre-reconciliation published catalogs (schema v3/v4) are retired: v5 is
-# the only shape whose `quality` means "the index at the requested effort".
-CATALOG_QUALITY_SCHEMA_VERSION = 5
+# Published catalogs before v6 are retired: v6 is the only shape whose
+# `quality` means the best-selectable-depth index.
+CATALOG_QUALITY_SCHEMA_VERSION = CATALOG_SCHEMA_VERSION
 
 
 def _catalog_index(value) -> float | None:
@@ -1256,19 +1257,19 @@ def _catalog_index(value) -> float | None:
     return index
 
 
-def _parse_catalog_v5(doc) -> tuple[dict, dict]:
-    """Pure parser: a published catalog v5 document -> (by_id, depths_by_id).
+def _parse_catalog_v6(doc) -> tuple[dict, dict]:
+    """Pure parser: a published catalog v6 document -> (by_id, depths_by_id).
 
     by_id maps id -> {"index", "source", "as_of", "effort"} for the model's
-    main quality (the index at the keyed run's requested effort). The
+    main quality (the index at its best selectable depth). The
     depth map maps id -> {"default_effort", "depths": {effort: record}} for
     the model's full measured depth list; resolve_quality re-selects from
-    it at the unkeyed run's live effective default.
+    it using the best-selectable-depth rules and the unkeyed run's support data.
 
     Gates (design: failure modes):
-    - schema_version must be an int == 5. v3/v4 predate the depth contract
-      (their `quality` means max effort), so they warn
-      "published catalog schema vX, expected 5; skipping hydration" and
+    - schema_version must be an int == 6. Earlier catalogs predate the
+      best-selectable-depth contract, so they warn
+      "published catalog schema vX, expected 6; skipping hydration" and
       yield empty maps. Mixing semantics is never allowed.
     - Any shape surprise -- a non-dict document, a non-int schema_version,
       a non-list models, a row without a usable id, a main quality that is
@@ -1394,15 +1395,15 @@ def _parse_catalog_v5(doc) -> tuple[dict, dict]:
 
 
 def catalog_quality_by_id(doc) -> dict:
-    """The v5 main-quality map {id: {"index", "source", "as_of", "effort"}}.
+    """The v6 main-quality map {id: {"index", "source", "as_of", "effort"}}.
 
-    Pure parser; see _parse_catalog_v5 for the gates and the depth map.
+    Pure parser; see _parse_catalog_v6 for the gates and the depth map.
     """
-    return _parse_catalog_v5(doc)[0]
+    return _parse_catalog_v6(doc)[0]
 
 
 def _catalog_schedule_entries(doc) -> dict:
-    """Pure parser: published catalog v5 schedules -> id -> recorded provenance.
+    """Pure parser: published catalog v6 schedules -> id -> recorded provenance.
 
     Spec 6.5: unkeyed runs rebuild the Deals table from the published
     catalog's schedules array, because schedule-only models (sub-1M context,
@@ -1416,9 +1417,9 @@ def _catalog_schedule_entries(doc) -> dict:
     a wrong-typed provenance field) are skipped rather than guessed; the
     model then falls through the existing tiers.
 
-    Schema gate: only a v5 catalog contributes schedule entries. v4/v3
-    schedules predate ``quality_effort``, so hydrating them would mix the
-    old max-effort semantics into a default-effort run (spec 9.1).
+    Schema gate: only a v6 catalog contributes schedule entries. Earlier
+    schedules predate ``quality_effort``, so hydrating them would mix old
+    quality semantics into a best-selectable-depth run.
     """
     if not isinstance(doc, dict):
         return {}
@@ -1482,9 +1483,9 @@ def fetch_quality_catalog(args) -> dict | None:
 
     The envelope is cached under QUALITY_CATALOG_CACHE with the standard
     TTL. A usable result (non-empty by_id, depths_by_id or schedules_by_id)
-    is written; so is a v4 catalog's deliberately empty envelope -- that is
+    is written; so is a v5 catalog's deliberately empty envelope -- that is
     the stable deploy-skew state, and caching it avoids a refetch loop.
-    Older/unknown schemas and malformed v5 payloads stay uncached so a
+    Older/unknown schemas and malformed v6 payloads stay uncached so a
     degraded payload self-heals on the next run. A cached envelope from
     before the v5 depth contract lacks depths_by_id, and one from before
     schedule hydration lacks schedules_by_id; both are refetched rather
@@ -1503,6 +1504,7 @@ def fetch_quality_catalog(args) -> dict | None:
             and isinstance(cached.get("by_id"), dict)
             and isinstance(cached.get("depths_by_id"), dict)
             and isinstance(cached.get("schedules_by_id"), dict)
+            and cached.get("schema_version") == CATALOG_QUALITY_SCHEMA_VERSION
         ):
             return cached
     try:
@@ -1510,7 +1512,7 @@ def fetch_quality_catalog(args) -> dict | None:
     except Exception as exc:
         warn(f"published catalog request failed ({exc})")
         return None
-    by_id, depths_by_id = _parse_catalog_v5(doc)
+    by_id, depths_by_id = _parse_catalog_v6(doc)
     schedules_by_id = _catalog_schedule_entries(doc)
     generated_at = doc.get("generated_at") if isinstance(doc, dict) else None
     if not isinstance(generated_at, str):
@@ -1537,12 +1539,16 @@ def fetch_quality_catalog(args) -> dict | None:
                     f"published catalog is stale (generated {generated_at}, "
                     f"{age_days:.0f} days old); using it anyway"
                 )
-    # A v4 catalog is the stable deploy-skew state: its envelope is
-    # deliberately empty (no hydration), but caching it prevents a
-    # refetch-every-run loop. Older/unknown schemas and malformed v5
-    # payloads still self-heal by staying uncached.
-    if usable or (type(schema_version) is int and schema_version == 4):
+    # The previous major schema (reader gate minus one) is the stable
+    # deploy-skew state: its envelope is deliberately empty (no hydration),
+    # but caching it prevents a refetch-every-run loop. Older/unknown schemas
+    # and malformed current-schema payloads still self-heal by staying uncached.
+    if usable or (
+        type(schema_version) is int
+        and schema_version == CATALOG_QUALITY_SCHEMA_VERSION - 1
+    ):
         if not args.no_cache:
+            result["schema_version"] = CATALOG_QUALITY_SCHEMA_VERSION
             save_cache(QUALITY_CATALOG_CACHE, result)
     return result
 
@@ -3076,6 +3082,55 @@ def build_reasoning_metadata(
     return metadata
 
 
+def select_default_depth(cand: dict, depths: dict[str, dict]) -> str | None:
+    """Select the highest finite measured effort the candidate can run.
+
+    A non-empty supported-effort list limits measured records to selectable
+    efforts. Missing or empty metadata leaves all measured records eligible,
+    including the single-state ``reasoning`` pseudo-effort used by older
+    candidate mappings. Equal scores prefer the deeper effort.
+    """
+    supported = cand.get("supported_efforts")
+    if supported is None:
+        reasoning = cand.get("reasoning")
+        supported = (
+            reasoning.get("supported_efforts") if isinstance(reasoning, dict) else None
+        )
+    selectable = set(supported) if supported else None
+
+    best_effort = None
+    best_index = None
+    best_depth = len(AA_EFFORT_ORDER)
+    for effort, record in (depths or {}).items():
+        if not isinstance(record, dict):
+            continue
+        record_effort = record.get("effort") or effort
+        if selectable is not None and record_effort not in selectable:
+            continue
+        index = record.get("index")
+        if not isinstance(index, (int, float)) or isinstance(index, bool):
+            continue
+        try:
+            finite_index = math.isfinite(index)
+        except OverflowError:
+            finite_index = False
+        if not finite_index:
+            continue
+        try:
+            depth = AA_EFFORT_ORDER.index(record_effort)
+        except ValueError:
+            depth = len(AA_EFFORT_ORDER)
+        if (
+            best_index is None
+            or index > best_index
+            or (index == best_index and depth < best_depth)
+        ):
+            best_effort = effort
+            best_index = index
+            best_depth = depth
+    return best_effort
+
+
 def resolve_quality(
     candidates,
     aa_by_id,
@@ -3091,24 +3146,25 @@ def resolve_quality(
     """Per-candidate quality records: AA API primary, catalog next, OR last.
 
     Depth-aware mode (either new input is not None; run() always passes the
-    AA depth lookup) selects the record at the requested effort -- the
-    candidate's effective default when requested_effort is "default", else
-    the explicit --reasoning-effort value. Resolution order per candidate:
-      1. AA depth lookup -- match_depth_quality's exact tiers. source "aa",
-         effort from the record.
+    AA depth lookup) selects the highest-scoring selectable record when
+    requested_effort is "default". An explicit --reasoning-effort selects
+    exactly that effort. Resolution order per candidate:
+      1. AA depth lookup -- best selectable measured effort for a default
+         run, or the exact requested effort. source "aa", effort from the
+         record.
       2. catalog_depths -- the published catalog's per-model depth map,
-         re-selected at the LIVE effective default (which may differ from
-         the keyed run's recorded default). source "catalog", the record's
-         own as_of.
+         selected by the same rules only when AA supplies no record. source
+         "catalog", the record's own as_of.
       3. OpenRouter's benchmark trio -- only for a model known to be
          non-reasoning (is_reasoning False) at effort "none". The trio has
          no effort label, so a reasoning model never uses it as its main
          score; unknown reasoning is not non-reasoning.
       4. No record -- the candidate stays quality-blind.
 
-    Strict selection: a matched base group with no record at the requested
-    effort yields nothing at that tier. Another effort is never
-    substituted, and a reasoning model never falls through to the OR trio.
+    Default selection considers only finite records whose efforts are
+    selectable when support metadata is non-empty; ties prefer the deeper
+    effort. Explicit selection remains strict: another effort is never
+    substituted. A reasoning model never falls through to the OR trio.
 
     The legacy path (both new inputs None) keeps the pre-depth behavior:
     match_quality's exact tiers, then the hydrated catalog_quality by id,
@@ -3130,22 +3186,26 @@ def resolve_quality(
     for cand in candidates:
         record = None
         if depth_mode:
+            default_effort = cand.get("default_effort")
             effort = (
-                requested_effort
-                if requested_effort != "default"
-                else cand.get("default_effort")
+                requested_effort if requested_effort != "default" else default_effort
             )
             measured = []
             group = _depth_group(cand, depth_lookup) if depth_lookup else None
             if group is not None:
                 measured = _ordered_depth_records(group)
-                depth_record = group.get(effort) if effort else None
+                selected_effort = (
+                    effort
+                    if requested_effort != "default"
+                    else select_default_depth(cand, group)
+                )
+                depth_record = group.get(selected_effort) if selected_effort else None
                 if isinstance(depth_record, dict):
                     record = {
                         "index": depth_record["index"],
                         "source": "aa",
                         "as_of": depth_record.get("as_of"),
-                        "effort": depth_record.get("effort") or effort,
+                        "effort": depth_record.get("effort") or selected_effort,
                     }
             if record is None and catalog_depths is not None:
                 catalog_entry = catalog_depths.get(cand["id"])
@@ -3153,19 +3213,31 @@ def resolve_quality(
                     catalog_group = catalog_entry.get("depths")
                     if isinstance(catalog_group, dict):
                         measured = _ordered_depth_records(catalog_group)
-                        depth_record = catalog_group.get(effort) if effort else None
+                        selected_effort = (
+                            effort
+                            if requested_effort != "default"
+                            else select_default_depth(cand, catalog_group)
+                        )
+                        depth_record = (
+                            catalog_group.get(selected_effort)
+                            if selected_effort
+                            else None
+                        )
                         if isinstance(depth_record, dict):
                             record = {
                                 "index": depth_record["index"],
                                 "source": "catalog",
                                 "as_of": depth_record.get("as_of"),
-                                "effort": depth_record.get("effort") or effort,
+                                "effort": depth_record.get("effort") or selected_effort,
                             }
             reasoning = cand.get("reasoning")
             is_non_reasoning = (
                 isinstance(reasoning, dict) and reasoning.get("is_reasoning") is False
             )
-            if record is None and is_non_reasoning and effort == "none":
+            fallback_effort = (
+                effort if requested_effort != "default" else default_effort
+            )
+            if record is None and is_non_reasoning and fallback_effort == "none":
                 bench = aa_by_id.get(base_model_id(cand["id"]))
                 intelligence = bench.get("intelligence_index") if bench else None
                 if intelligence is not None:
@@ -3302,7 +3374,7 @@ def build_schedules(
     Depth-aware mode (run() always supplies the AA depth lookup; an unkeyed
     run supplies the catalog depth map and the published schedule entries)
     follows spec 6.5:
-      0. ``schedule_entries`` (unkeyed runs): the published catalog's v5
+      0. ``schedule_entries`` (unkeyed runs): the published catalog's v6
          schedules array is the source of truth for Deals. Whenever an
          entry exists with a non-null quality AND a non-empty
          ``quality_effort``, its quality and all three provenance fields
@@ -3311,20 +3383,21 @@ def build_schedules(
          with no effort label is legacy/unknown (spec 6.5): its quality is
          null and the lower tiers are skipped. A null-quality or absent
          entry falls through to the tiers below.
-      1. AA depth lookup at the effective default effort (or the explicit
-         ``requested_effort``) -- keyed runs only.
-      2. Catalog depth map at the entry's recorded default effort -- unkeyed
-         runs use that provenance as-is, never re-selecting at the live
-         default.
+      1. AA depth lookup at the highest-scoring selectable effort for a
+         default run, or exactly ``requested_effort`` -- keyed runs only.
+      2. Catalog depth map by the same selection rule when AA has no record;
+         unkeyed runs use that source without merging its records with AA.
       3. Catalog main-quality map, only when the record carries an effort
          (a record without one is legacy/unknown: quality stays null).
       4. OpenRouter's benchmark trio, only for a model known to be
-         non-reasoning (``is_reasoning`` False) at effort "none". A
-         reasoning model never falls through to the trio: it has no effort
-         label, so using it would publish a max-effort snapshot as the
-         default.
-    Strict selection at tiers 1-2: a matched group with no record at the
-    selected effort yields nothing; another effort is never substituted.
+         non-reasoning (``is_reasoning`` False) at effort "none", when the
+         run requests ``default`` (whose effective default is ``none``) or
+         explicitly requests ``none``. An explicit request for another
+         effort never borrows the unscoped trio. Reasoning models never fall
+         through because the trio has no effort label for the measurement.
+    Default selection at tiers 1-2 considers finite records supported by
+    the live reasoning metadata; equal scores prefer deeper effort. Explicit
+    selection remains strict, and another effort is never substituted.
 
     The legacy path (both new inputs None) keeps the pre-depth fallback
     chain: candidate record, hydrated catalog, then the OR trio. Every row
@@ -3376,42 +3449,53 @@ def build_schedules(
                 quality_effort = effort_label
             # else: a recorded entry with no effort label is legacy/unknown
             # (spec 6.5): its quality is null, and the lower tiers are
-            # skipped rather than re-deriving a max-effort OR snapshot.
+            # skipped rather than guessing from an unscoped OR snapshot.
         elif depth_mode:
             reasoning = (reasoning_by_id or {}).get(model_id)
             if not isinstance(reasoning, dict):
                 reasoning = None
+            default_effort = (reasoning or {}).get("default_effort")
             effort = (
-                requested_effort
-                if requested_effort != "default"
-                else (reasoning or {}).get("default_effort")
+                requested_effort if requested_effort != "default" else default_effort
             )
+            candidate = {
+                "supported_efforts": (reasoning or {}).get("supported_efforts"),
+                "reasoning": reasoning,
+            }
             # Tier 1: AA depth lookup (keyed runs).
             group = _depth_group(model, depth_lookup) if depth_lookup else None
-            record = group.get(effort) if group is not None and effort else None
+            selected_effort = (
+                effort
+                if requested_effort != "default"
+                else select_default_depth(candidate, group)
+            )
+            record = (
+                group.get(selected_effort)
+                if group is not None and selected_effort
+                else None
+            )
             if isinstance(record, dict):
                 quality = record.get("index")
                 quality_source = "aa"
                 quality_as_of = record.get("as_of")
-                quality_effort = record.get("effort") or effort
-            # Tier 2: catalog depth map (unkeyed runs), recorded default
-            # effort as-is -- the keyed run's provenance, not a live
-            # re-selection.
+                quality_effort = record.get("effort") or selected_effort
+            # Tier 2: catalog depth map, consulted only when AA has no record.
             if quality is None and catalog_depths is not None:
                 catalog_entry = catalog_depths.get(model_id)
                 if isinstance(catalog_entry, dict):
-                    recorded_default = catalog_entry.get("default_effort")
                     group = catalog_entry.get("depths")
-                    record = (
-                        group.get(recorded_default)
-                        if isinstance(group, dict) and recorded_default
-                        else None
-                    )
-                    if isinstance(record, dict):
-                        quality = record.get("index")
-                        quality_source = "catalog"
-                        quality_as_of = record.get("as_of")
-                        quality_effort = record.get("effort") or recorded_default
+                    if isinstance(group, dict):
+                        selected_effort = (
+                            effort
+                            if requested_effort != "default"
+                            else select_default_depth(candidate, group)
+                        )
+                        record = group.get(selected_effort) if selected_effort else None
+                        if isinstance(record, dict):
+                            quality = record.get("index")
+                            quality_source = "catalog"
+                            quality_as_of = record.get("as_of")
+                            quality_effort = record.get("effort") or selected_effort
             # Tier 3: catalog main-quality map (unkeyed runs). A record with
             # no quality_effort is legacy/unknown: null, never a guess.
             if quality is None and catalog_quality is not None:
@@ -3421,11 +3505,16 @@ def build_schedules(
                     quality_source = "catalog"
                     quality_as_of = catalog_record.get("as_of")
                     quality_effort = catalog_record.get("effort")
-            # Tier 4: OR trio only for known non-reasoning models.
+            # Tier 4: OR trio is eligible only for known non-reasoning models
+            # when this run requests default (effective none) or explicit none.
             if (
                 quality is None
                 and reasoning is not None
                 and reasoning.get("is_reasoning") is False
+                and (
+                    requested_effort == "none"
+                    or (requested_effort == "default" and effort == "none")
+                )
             ):
                 benchmark = aa_by_id.get(base_model_id(model_id)) or {}
                 quality = benchmark.get("intelligence_index")
@@ -3863,7 +3952,7 @@ def _display_default_effort(cand):
 def _published_reasoning_block(cand):
     """The six published reasoning keys plus the measured depth records.
 
-    ``is_reasoning`` is an internal flag: neither catalog v5 nor spec §8.4
+    ``is_reasoning`` is an internal flag: neither catalog v6 nor spec §8.4
     publishes it, so it never appears here.
     """
     reasoning = cand.get("reasoning") or {}
@@ -3878,7 +3967,7 @@ def _published_reasoning_block(cand):
 
 
 def fmt_depth(cand) -> str:
-    """DEPTH cell: the effort QUAL was measured at, ``*`` on the default."""
+    """DEPTH cell: the effort QUAL was measured at; ``*`` is informational."""
     effort = (cand.get("quality_record") or {}).get("effort")
     if not effort:
         return "-"
@@ -4087,13 +4176,16 @@ LEGENDS = {
     "expert": (
         (
             "QUALITY",
-            ['Artificial Analysis intelligence index; "-" = unknown (scores 0)'],
+            [
+                "AA intelligence index at the model's best measured selectable depth",
+                '(default; --reasoning-effort overrides); "-" = unknown, scores 0',
+            ],
         ),
         (
             "DEPTH",
             [
-                "reasoning effort the QUAL score was measured at; * = OpenRouter's",
-                "default; - = no known effort; --no-depths hides the depth detail",
+                "reasoning effort QUAL was measured at; * = OpenRouter's default (informational)",
+                "- = no known effort; --no-depths hides the depth detail",
             ],
         ),
         (
@@ -4130,8 +4222,10 @@ LEGENDS = {
         (
             "QUALITY",
             [
-                'Artificial Analysis intelligence index; "-" = unknown (scores 0)',
-                "the suffix after · is the reasoning effort the score was measured at",
+                "AA intelligence index at the model's best measured selectable depth",
+                "'-' = unknown, scores 0",
+                "suffix after · names the effort used for QUAL; this view has no",
+                "DEPTH column or * marker",
             ],
         ),
         (
@@ -4548,7 +4642,7 @@ def print_json(top):
             "default_effort": _display_default_effort(cand),
             # The six published reasoning fields plus the measured depth
             # records; the internal is_reasoning flag never leaves the
-            # process (catalog v5 and spec §8.4 publish only these keys).
+            # process (catalog v6 and spec §8.4 publish only these keys).
             "reasoning": _published_reasoning_block(cand),
             "input_usd_per_m": round(cand["price_in"], 6),
             "output_usd_per_m": round(cand["price_out"], 6),
@@ -4876,7 +4970,7 @@ def build_catalog(
             "exclude_free": args.exclude_free,
             "include_batch": args.include_batch,
             # The requested effort documents the semantic of every model's
-            # quality value (default = each model's effective default).
+            # quality value (default = best measured selectable effort).
             "reasoning_effort": getattr(args, "reasoning_effort", "default"),
             "weights": weights,
         },
@@ -5088,8 +5182,8 @@ def parse_args(argv=None):
         default="default",
         help=(
             "reasoning effort used for quality and filtering: a specific "
-            "effort drops models that cannot run it (default: each model's "
-            "effective default, no filter)"
+            "effort drops models that cannot run it (default scores each model "
+            "at its best measured selectable depth)"
         ),
     )
     sources.add_argument(

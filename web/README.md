@@ -12,7 +12,7 @@ subprocess.
 
 | file | what it is |
 |------|------------|
-| `index.html` | the picks page: top-20 table per priority tab (10 shown, "Show more" expands) with copy buttons, a 7-day movement column, the DEPTH column with a per-model depth detail row, the TIER column and the Off-peak deals table (dark theme by default, light when the system or browser reports light) |
+| `index.html` | the picks page: top-20 table per priority tab (10 shown, "Show more" expands) with copy buttons, a 7-day movement column, best-selectable-depth QUAL, the DEPTH column with a per-model depth detail row, the TIER column and the Off-peak deals table (dark theme by default, light when the system or browser reports light) |
 | `favicon.svg` + `favicon-16x16.png` / `favicon-32x32.png` / `apple-touch-icon.png` | the icon: the SVG adapts its tile background to the browser theme (`prefers-color-scheme` inside the file — cream tile on dark chrome, dark tile on light chrome, and engines that skip the media query fall back to the dark base rule, matching the site's dark-by-default pages); the static PNGs are Safari/iOS fallbacks with the dark tile (#181a1b) baked in and the rounded corners cut out as real transparency, re-renderable with `web/make_favicon.py` (run it with `--check` to fail on stale committed output) |
 | `data.json` | the rendered rows: per-priority top 20 plus the current best id, the off-peak `schedules` rows, and `generated_at` (ISO timestamp shown as "last refresh: …" between the tab and layout toggles); schema-versioned (`schema_version`, currently 3) and stamped with the `source_revision` (short commit hash) that built it — the footer links it to the exact commit |
 | `best.txt` | the current *balanced* #1 as a plain `opencode --model`-ready id |
@@ -62,17 +62,26 @@ highlights.
   history reset: the catalog-v2 deploy (old snapshots priced at base-tier
   baselines not diffable against effective-tier prices), the history-v3
   cutover (old snapshots priced at advertised models-API scalars not diffable
-  against baseline-endpoint prices) and the history-v4 cutover (old snapshots
-  carry max-effort quality scores not comparable with default-effort ones).
-- **Depth detail** — the DEPTH column and each row's expanded Depth section
-  read the model's `reasoning` block from `catalog.json`: the AA index and AA
-  `$/task` at every measured effort, the cost ratio against the default
-  depth, and copy buttons for `openrouter/<id>#<effort>`. `*` marks
-  OpenRouter's effective default. An AA row for an effort OpenRouter does not
-  support says `not selectable` and offers no copy button; the muted number
-  under QUAL names only a selectable alternative. AA `$/task` is AA's
-  measured benchmark cost at AA's reference price, not the TASK$ session
-  cost. Without a catalog fetch the section says the details are unavailable.
+  against baseline-endpoint prices), the history-v4 cutover (old snapshots
+  carry max-effort quality scores not comparable with default-effort ones) and
+  the history-v5 cutover (old snapshots carry default-effort quality and ranks,
+  which are not comparable with best-selectable-depth quality and ranks).
+- **Depth detail** — QUAL is scored at the model's best measured selectable
+  effort by default; ties go to the deeper effort, and missing or empty
+  `supported_efforts` falls back to all measured efforts. `QUAL -` means no
+  measured selectable effort and no non-reasoning `none` fallback score. An
+  explicit CLI `--reasoning-effort` selects exactly that effort and filters
+  models that
+  cannot run it. The DEPTH column and each row's expanded Depth section read
+  the model's `reasoning` block from
+  `catalog.json`: the AA index and AA `$/task` at every measured effort, the
+  cost ratio against the default depth, and copy buttons for
+  `openrouter/<id>#<effort>`. `*` marks OpenRouter's effective default for
+  information only; it does not choose QUAL. An AA row for an effort
+  OpenRouter does not support says `not selectable` and offers no copy button.
+  AA `$/task` is AA's measured benchmark cost at AA's reference price, not the
+  TASK$ session cost. Without a catalog fetch the section says the details are
+  unavailable.
 - **Simple / Expert layout toggle** — the two buttons on the right of the tab
   line switch the ranked table between the full expert layout (14 columns:
   rank, 7-day, model, depth, quality, in, out, discount, precision, tier,
@@ -92,9 +101,10 @@ highlights.
   off-peak rates. It is built from the catalog's `schedules` index, which is
   deliberately unfiltered (it may list non-ZDR or sub-floor-context models
   that the ranked pool excludes). Each row's QUAL carries the schedule
-  entry's recorded effort and provenance, so the Deals tooltip shows the entry's
-  effort tag and provenance. Schedule entries carry no OpenRouter reference, so
-  the main-table "not like-for-like" drift note does not apply to them.
+  entry's best measured selectable effort and provenance, so the Deals
+  tooltip shows the entry's effort tag and provenance. Schedule entries carry
+  no OpenRouter reference, so the main-table "not like-for-like" drift note
+  does not apply to them.
 - **Published picks consider ZDR models only**, matching the tool's default;
   `best.txt` always serves the *balanced* #1 regardless of the visible tab.
 - **Highlights generation** walks the currently listed `:free` OpenRouter

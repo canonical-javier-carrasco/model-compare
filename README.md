@@ -51,7 +51,8 @@ Quality source: AA index v4.3 - live AA (2 models, checked 13:15Z) |
                 our published catalog (1 model, as of 2026-10-23 13:15Z);
                 1 model unmatched (no quality data; quality score 0)
 
-QUALITY   Artificial Analysis intelligence index; "-" = unknown (scores 0)
+QUALITY   AA intelligence index at the model's best measured selectable depth
+          (default; --reasoning-effort overrides); "-" = unknown, scores 0
 $IN/$OUT  USD per 1M tokens at the cheapest eligible endpoint, blended
           75% input / 25% output (--input-share); differs from the
           openrouter.ai default-endpoint price by design. A higher rate
@@ -93,7 +94,7 @@ legend, leaving only the table(s).
 | `--recency-half-life D` | 120 | age decay half-life (days) |
 | `--max-age-days D` | off | drop models listed more than N days ago |
 | `--quality-ref N` | 70 | index counting as full quality score |
-| `--reasoning-effort E` | `default` | reasoning effort used for quality and filtering: `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; a specific effort drops models that cannot run it |
+| `--reasoning-effort E` | `default` | choices: `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `default` scores each model at its best measured selectable effort; an explicit effort selects exactly that effort and drops models that cannot run it (it never substitutes another effort) |
 | `--no-depths` | off | hide the per-model depth detail below the table (the `DEPTH` and `QUAL` columns stay) |
 | `--aa-api-key KEY` | `$AA_API_KEY` | Artificial Analysis API key |
 | `--exclude-free` | off | drop `:free` variants |
@@ -123,12 +124,13 @@ plus weekly `history.json` and `highlights.json`. How that pipeline works:
 
 OpenRouter's public catalog provides prices, context windows and listing
 dates; model quality comes from the Artificial Analysis intelligence index
-at the model's effective OpenRouter default reasoning effort, resolved
+at each model's best measured selectable reasoning effort by default, resolved
 through a three-source hierarchy with visible provenance (see
-[Model quality](#model-quality) below). Each candidate is scored on quality,
-blended price, context headroom and listing age with weights depending on
-`--priority`, after hard filters (context floor, text-only, tool-calling,
-ZDR by default). The full scoring formulas, filter list, the `--catalog`
+[Model quality](#model-quality) below). An explicit `--reasoning-effort`
+selects that exact effort and filters models that cannot run it. Each
+candidate is scored on quality, blended price, context headroom and listing
+age with weights depending on `--priority`, after hard filters (context floor,
+text-only, tool-calling, ZDR by default). The full scoring formulas, filter list, the `--catalog`
 JSON contract and the test setup are in [DESIGN.md](DESIGN.md).
 
 ## Model quality
@@ -144,32 +146,39 @@ always wins, even when a lower-ranked one is newer.
    [model-compare.dev/catalog.json](https://model-compare.dev/catalog.json),
    the artifact this repo's keyed CI runs publish, joined by exact model id.
 3. **OpenRouter snapshot** — the AA indices OpenRouter republishes per
-   listing, used only for models neither AA path covers.
+   listing, used only as a fallback for known non-reasoning models at effort
+   `none` when neither AA path covers them.
 
 Every quality value carries its provenance end to end: `--json` rows carry
 `quality_source`, `quality_as_of` and `quality_effort`, `catalog.json`
 entries and the site's QUAL tooltips show them, and the CLI's footer note
 lists how many models came from each source and when each was checked.
 
-AA measures a model at several reasoning efforts, and the scores differ. The
-headline `QUAL` is the index at the **effort a default OpenRouter request
-actually runs at** — the model's effective default, marked `*` in the depth
-detail — not AA's primary `max` row. `--reasoning-effort <effort>` re-ranks
-at a chosen effort (`default`, `none`, `minimal`, `low`, `medium`, `high`,
-`xhigh`, `max`) and, for anything but `default`, drops models that cannot
-run it. A model AA has not measured at the selected effort shows `QUAL -`;
-its score is never borrowed from a different effort.
+AA measures a model at several reasoning efforts, and the scores differ. By
+default, headline `QUAL` is the highest AA intelligence index among the
+model's measured efforts that OpenRouter can run (`supported_efforts`). If
+scores tie, the deeper effort wins. When `supported_efforts` is missing or
+empty, all measured efforts are considered. The OpenRouter-default marker
+(`*`) is informational; it does not determine the default score. An explicit
+`--reasoning-effort <effort>` (`none`, `minimal`, `low`, `medium`, `high`,
+`xhigh` or `max`) selects exactly that effort and drops models that cannot
+run it. It never substitutes another effort. If AA has no measurement at
+the selected effort, `QUAL` is `-` unless the known non-reasoning `none`
+OpenRouter fallback supplies a score. Truly unknown quality (no usable AA
+data) scores 0.
 
 The `DEPTH` column names the effort behind `QUAL` (`high*` marks OpenRouter's
-default). Below the table, a depth block per top-N model lists every
-supported and measured effort with its AA index, its AA cost per benchmark
-task, the cost ratio against the default depth, and the OpenCode variant
-suffix that selects it (`#max`). `--no-depths` hides the block; the `DEPTH`
-and `QUAL` columns stay. AA `$/task` is AA's measured benchmark cost at AA's
-reference price, not the OpenRouter per-token price, and it never enters the
-score. In OpenCode, append `#<effort>` to the model id
+default for information only). In Simple view the effort appears after the
+quality as `· <effort>`. Below the table, a depth block per top-N model lists
+every supported and measured effort with its AA index, its AA cost per
+benchmark task, the cost ratio against the default depth, and the OpenCode
+variant suffix that selects it (`#max`). `--no-depths` hides the block; the
+`DEPTH` and `QUAL` columns stay. AA `$/task` is AA's measured benchmark cost
+at AA's reference price, not the OpenRouter per-token price, and it never
+enters the score. In OpenCode, append `#<effort>` to the model id
 (`openrouter/anthropic/claude-sonnet-5.5#max`) to select a depth; the
-model-compare OpenCode plugin pins the catalog's effort on its aliases.
+model-compare OpenCode plugin pins each alias to its scored effort using
+`quality_effort` in the schema-6 catalog.
 
 **Why our QUAL can differ from openrouter.ai:** OpenRouter republishes a
 **frozen copy** of the intelligence index per dated listing, while the AA

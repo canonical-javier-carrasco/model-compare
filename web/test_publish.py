@@ -680,8 +680,8 @@ def test_build_site_aa_gate_fails_when_aa_yields_no_matches(tmp_path, monkeypatc
 def test_check_aa_source_requires_depth_rows_and_default_matches(
     tmp_path, monkeypatch, capsys
 ):
-    # The v5 depth gates: a keyed publish must prove the AA API produced
-    # per-effort rows and at least one candidate got a default-effort score.
+    # The v6 depth gates: a keyed publish must prove the AA API produced
+    # per-effort rows and at least one candidate has quality coverage.
     # Coverage below 25% is a warning, never a failure.
     monkeypatch.setenv("AA_API_KEY", "dummy-key")
     path = tmp_path / "catalog.json"
@@ -701,7 +701,8 @@ def test_check_aa_source_requires_depth_rows_and_default_matches(
     write({**healthy, "matched_default": 4})  # 4/20 = 20% < 25%
     publish.check_aa_source(path)
     err = capsys.readouterr().err
-    assert "matched_default" in err
+    assert "quality-coverage is 4 of 20 candidates" in err
+    assert "quality records cover few candidates" in err
     assert "25%" in err
 
 

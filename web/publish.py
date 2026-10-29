@@ -203,8 +203,8 @@ def check_best(output_dir: Path, catalog: dict) -> None:
 
 
 AA_LIVE_MODE = "aa"
-# Coverage regression threshold (spec 9.4): below this share of candidates
-# carrying a default-effort score the publish warns but still deploys.
+# Quality-coverage regression threshold (spec 9.4): below this share of
+# candidates with a quality record the publish warns but still deploys.
 MIN_MATCHED_DEFAULT_COVERAGE = 0.25
 
 
@@ -217,7 +217,7 @@ def check_aa_source(catalog_path: Path) -> None:
     keyed publish must have live AA data standing behind its quality:
     mode "aa" AND at least one AA-matched model (matched_aa > 0), at least
     one per-effort row (depth_rows > 0), and at least one candidate with a
-    default-effort main score (matched_default > 0) -- a rejected key, an
+    quality-coverage record (matched_default > 0) -- a rejected key, an
     empty result, a catalog-or-OR-only chain, an unknown mode or a
     malformed count all fail closed. Coverage below
     MIN_MATCHED_DEFAULT_COVERAGE warns without failing: a coverage
@@ -263,11 +263,10 @@ def check_aa_source(catalog_path: Path) -> None:
         and matched_default / candidates < MIN_MATCHED_DEFAULT_COVERAGE
     ):
         print(
-            "publish: warning: AA matched_default coverage is "
-            f"{matched_default}/{candidates} "
+            "publish: warning: AA quality-coverage is "
+            f"{matched_default} of {candidates} candidates "
             f"({matched_default / candidates:.0%} < "
-            f"{MIN_MATCHED_DEFAULT_COVERAGE:.0%}): the AA default-effort "
-            "score covers few candidates",
+            f"{MIN_MATCHED_DEFAULT_COVERAGE:.0%}): quality records cover few candidates",
             file=sys.stderr,
         )
     print(

@@ -181,27 +181,28 @@
       }
       #table .endpoint-note {
         color: var(--muted);
-        font-size: 0.8rem;
-      }
-      #table .depth-alt {
-        display: block;
-        color: var(--muted);
-        font-size: 0.8rem;
+        margin: 0.1rem 0;
+        font-size: 0.75rem;
       }
       #table tr.endpoint-row td {
-        padding: 0.5rem 0.75rem 1rem;
+        padding: 0.15rem 0.6rem 0.3rem;
         background: var(--row-alt, transparent);
       }
       #table tr.depth-row td {
-        padding-bottom: 0;
+        padding-top: 0.15rem;
+        padding-bottom: 0.15rem;
       }
       #table .detail-heading {
-        margin: 0 0 0.25rem;
+        margin: 0.1rem 0;
         font-weight: 600;
       }
       #table tr.endpoint-row table {
         width: 100%;
         font-size: 0.8rem;
+      }
+      #table tr.endpoint-row table th,
+      #table tr.endpoint-row table td {
+        padding: 0.1rem 0.4rem;
       }
       #table .depth-table th:first-child,
       #table .depth-table td:first-child {
