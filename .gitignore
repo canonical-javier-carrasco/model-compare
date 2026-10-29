@@ -8,3 +8,4 @@ _site/
 docs/superpowers/
 .superpowers/
 .DS_Store
+.playwright-mcp/
