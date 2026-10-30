@@ -322,13 +322,26 @@ does not change which lines go where.
 Color is SGR attributes only (bold, dim, green, yellow), never pinned hex, so
 the terminal theme picks the actual hues and light themes stay readable.
 `--color auto` colors a stream only when that stream is a TTY and `NO_COLOR`
-is unset or empty; `on` forces it and `off` never does. Column widths are
-computed from the raw text before any escape codes are added, so color never
-shifts alignment.
+is unset or empty — the built-in pager counts as the terminal it feeds —;
+`on` forces it and `off` never does. Column widths are computed from the raw
+text before any escape codes are added, so color never shifts alignment.
 
 `--json`, `--catalog` and `--best` are unaffected by `--color`, `--detail`,
 `--off-peak` and `--bare`: they keep their documented output byte-for-byte,
 and `--best` still prints only the opencode id.
+
+On a terminal the human output runs through a pager: `$PAGER` verbatim when
+set (an empty value counts as unset), else
+`less --quit-if-one-screen --RAW-CONTROL-CHARS --no-init` — page only what
+exceeds one screen, keep the SGR codes, leave the screen intact on exit so
+the stderr notes survive. A pager that cannot start falls back to direct
+printing; quitting early truncates the unwritten tail; Ctrl-C terminates the
+pager and exits 130. `--no-pager` skips the pager, and `--best`, `--json`,
+`--catalog` never page. The pager is spawned with `LESS=FRX` when `$LESS`
+is unset — git's convention (raw control chars, quit-if-one-screen, no
+alt-screen init), one only `less` honors — so a bare `PAGER=less` renders
+the forced-on color instead of escape junk; a user-set `$LESS` always
+wins — include `-R` in it or pass `--color off`. POSIX terminals only.
 
 ## Catalog output contract
 

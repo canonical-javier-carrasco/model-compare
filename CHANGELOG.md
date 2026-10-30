@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-10-30
+
+### Added
+
+- Tool version is `model-compare 0.7.2`.
+- CLI: on a terminal the table output opens in a pager when it exceeds one
+  screen, with colors intact — `$PAGER` verbatim when set, else `less
+  --quit-if-one-screen --RAW-CONTROL-CHARS --no-init`; a pager that cannot
+  start falls back to direct printing; Ctrl-C exits 130; `--no-pager` opts
+  out; `--best`, `--json` and `--catalog` never page. A `less` reached
+  through `$PAGER` is spawned with `LESS=FRX` when `$LESS` is unset, so a
+  bare `PAGER=less` renders colors instead of raw escape codes.
+
 ## [0.7.1] - 2026-10-29
 
 ### Changed

@@ -53,12 +53,15 @@ import json
 import math
 import os
 import re
+import shlex
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -105,7 +108,7 @@ QUALITY_CATALOG_CACHE = "published-catalog"
 # A published catalog generated more than this many days ago is stale:
 # warn but use -- the records' as_of makes the staleness visible downstream.
 QUALITY_CATALOG_MAX_AGE_DAYS = 14
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 USER_AGENT = f"model-compare/{VERSION} (https://github.com/canonical/model-compare)"
 
 # opencode expects provider-qualified model ids: openrouter/<provider/model>.
@@ -5071,6 +5074,110 @@ def color_enabled(mode: str, stream) -> bool:
     return bool(getattr(stream, "isatty", lambda: False)())
 
 
+class PagerInterrupted(Exception):
+    """Ctrl-C reached the parent while the pager was running."""
+
+
+def resolve_pager(args) -> list[str] | None:
+    """The pager argv for the human output path, or None to print directly.
+
+    None when --no-pager is set or stdout is not a TTY. $PAGER is used
+    verbatim (shlex-split, no injected flags; an empty split counts as
+    unset); the fallback pages only what exceeds one screen, keeps the SGR
+    codes and skips the alt-screen init so the stderr notes survive
+    quitting. POSIX terminals only.
+    """
+    if args.no_pager:
+        return None
+    if not getattr(sys.stdout, "isatty", lambda: False)():
+        return None
+    raw = os.environ.get("PAGER")
+    argv = []
+    if raw is not None:
+        try:
+            argv = shlex.split(raw)
+        except ValueError:
+            # Malformed $PAGER (unbalanced quote, trailing backslash):
+            # pager startup problems never crash the run or lose output --
+            # degrade to the fallback, exactly like an unset $PAGER.
+            argv = []
+    if not argv:
+        argv = ["less", "--quit-if-one-screen", "--RAW-CONTROL-CHARS", "--no-init"]
+    return argv
+
+
+@contextmanager
+def paged_stdout(argv: list[str]):
+    """Run argv as a pager taking over sys.stdout; yield True when paged.
+
+    False (direct output) when the pager cannot be started -- startup
+    problems never lose output. Restores sys.stdout in a finally, closes
+    the pager's stdin guarded against EPIPE and reaps the child. A
+    KeyboardInterrupt from the block, the close or the reap terminates the
+    pager (plain less ignores SIGINT without -K) and surfaces as
+    PagerInterrupted; the pager's own exit status is never propagated.
+    """
+    if not argv:
+        yield False
+        return
+    # Colors through a verbatim $PAGER: less reads $LESS, so a bare
+    # `PAGER=less` would otherwise show raw SGR as escape junk. Git's
+    # convention: hand the child LESS=FRX (raw control chars,
+    # quit-if-one-screen, no alt-screen init) when the user has none;
+    # their own $LESS always wins.
+    child_env = {**os.environ, "LESS": "FRX"} if "LESS" not in os.environ else None
+    # Captured before any try so the finally below can always restore it;
+    # the swap itself is the try's first statement, so a Ctrl-C landing
+    # anywhere from the spawn onward still runs the cleanup.
+    original = sys.stdout
+    interrupted = False
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=sys.stdout,
+            text=True,
+            env=child_env,
+            # Write the pipe with the encoding (and error handler) the direct
+            # path would have used: Popen's text-mode default comes from the
+            # locale, which can disagree with sys.stdout.encoding (e.g.
+            # PYTHONIOENCODING=utf-8 over a latin-1 locale) and then a
+            # non-ASCII model name crashes only the paged path.
+            encoding=getattr(sys.stdout, "encoding", None) or "utf-8",
+            errors=getattr(sys.stdout, "errors", None),
+        )
+    except OSError:
+        yield False
+        return
+    try:
+        sys.stdout = proc.stdin
+        yield True
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        sys.stdout = original
+        try:
+            proc.stdin.close()
+        except KeyboardInterrupt:
+            interrupted = True
+        except OSError:
+            pass
+        try:
+            if interrupted and proc.poll() is None:
+                proc.terminate()
+            proc.wait()
+        except KeyboardInterrupt:
+            interrupted = True
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait()
+            except KeyboardInterrupt:
+                pass
+    if interrupted:
+        raise PagerInterrupted
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -5149,8 +5256,14 @@ def parse_args(argv=None):
         "--color",
         choices=("auto", "on", "off"),
         default="auto",
-        help="colorize the table output (default: auto; honors NO_COLOR, and on "
-        "forces color when piping through less -R)",
+        help="colorize the table output (default: auto; honors NO_COLOR; the "
+        "built-in pager keeps color on under auto, and on also forces color "
+        "for manual pipes like less -R)",
+    )
+    output.add_argument(
+        "--no-pager",
+        action="store_true",
+        help="do not page the table output even on a terminal",
     )
     ranking.add_argument(
         "--input-share",
@@ -5409,6 +5522,7 @@ def run(args, models, or_cached) -> int:
     elif args.json:
         print_json(top)
     else:
+        pager_argv = resolve_pager(args)
         style = Style(color_enabled(args.color, sys.stdout))
         err_style = Style(color_enabled(args.color, sys.stderr))
         if not args.bare:
@@ -5445,33 +5559,52 @@ def run(args, models, or_cached) -> int:
         # quality-blind fallback line.
         unmatched = len(candidates) - len(quality_by_id)
         quality_note = quality_footer_note(quality_by_id, aa_index_version, unmatched)
-        print_table(
-            top,
-            weights,
-            quality_note,
-            detail=args.detail,
-            style=style,
-            bare=args.bare,
-            input_share=args.input_share,
-            depth_detail=(None if args.bare or args.no_depths else print_depth_detail),
-        )
-        if args.off_peak:
-            catalog_w = catalog_weights(candidates, quality_by_id)
-            # Use the exact unrounded weighted score (not overall_scores,
-            # whose rounded components can disagree by 0.001) so a candidate
-            # in both tables always prints the same SCORE under balanced.
-            balanced_w = catalog_w["balanced"]
-            balanced = {
-                cand["id"]: weighted_score(cand, balanced_w) for cand in candidates
-            }
-            schedules = build_schedules(
-                models, args, quality_by_id, aa_by_id, balanced, catalog_quality
-            )
-            # build_schedules resolves quality for any listed model; the web
-            # page's deals table shows that resolved value even for models
-            # outside the ranked pool, so keep it here too. Only SCORE is
-            # blanked for non-candidates (balanced is None for them).
-            print_deals(off_peak_deals(schedules), style=style, bare=args.bare)
+        try:
+            with paged_stdout(pager_argv):
+                print_table(
+                    top,
+                    weights,
+                    quality_note,
+                    detail=args.detail,
+                    style=style,
+                    bare=args.bare,
+                    input_share=args.input_share,
+                    depth_detail=(
+                        None if args.bare or args.no_depths else print_depth_detail
+                    ),
+                )
+                if args.off_peak:
+                    catalog_w = catalog_weights(candidates, quality_by_id)
+                    # Use the exact unrounded weighted score (not
+                    # overall_scores, whose rounded components can disagree
+                    # by 0.001) so a candidate in both tables always prints
+                    # the same SCORE under balanced.
+                    balanced_w = catalog_w["balanced"]
+                    balanced = {
+                        cand["id"]: weighted_score(cand, balanced_w)
+                        for cand in candidates
+                    }
+                    schedules = build_schedules(
+                        models,
+                        args,
+                        quality_by_id,
+                        aa_by_id,
+                        balanced,
+                        catalog_quality,
+                    )
+                    # build_schedules resolves quality for any listed model;
+                    # the web page's deals table shows that resolved value
+                    # even for models outside the ranked pool, so keep it
+                    # here too. Only SCORE is blanked for non-candidates
+                    # (balanced is None for them).
+                    print_deals(off_peak_deals(schedules), style=style, bare=args.bare)
+        except BrokenPipeError:
+            # Pager quit early: stop writing quietly (spec §Failure modes) --
+            # deliberate on the direct path too: EPIPE from a closed consumer
+            # leaves the exit status unchanged (CPython's shutdown flush).
+            pass
+        except PagerInterrupted:
+            return 130
     return 0
 
 

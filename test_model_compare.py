@@ -77,6 +77,7 @@ def make_args(**overrides):
         off_peak=False,
         bare=False,
         color="auto",
+        no_pager=False,
     )
     base.update(overrides)
     return Namespace(**base)
@@ -1916,7 +1917,7 @@ def test_pool_accounting_balances_with_endpoint_drops(monkeypatch, capsys):
 
 
 def test_catalog_schema_versions_are_in_lockstep():
-    assert mc.VERSION == "0.7.1"
+    assert mc.VERSION == "0.7.2"
     assert mc.CATALOG_QUALITY_SCHEMA_VERSION == mc.CATALOG_SCHEMA_VERSION == 6
     assert (
         mc.CATALOG_QUALITY_SCHEMA_VERSION
@@ -2637,12 +2638,14 @@ def test_run_auto_colors_when_streams_are_ttys(monkeypatch):
         make_model(id="acme/short", name="Acme: Short", context_length=1000),
     ]
     _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
     out, err = _TTYStringIO(), _TTYStringIO()
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.delenv("NO_COLOR", raising=False)
     assert mc.run(make_args(min_context=1_000_000), models, False) == 0
-    assert "\x1b[1m" in out.getvalue()  # bold header
+    (proc,) = procs  # the human path paged; bold header went to the pager
+    assert "\x1b[1m" in proc.stdin.getvalue()
     assert "\x1b[2m(dropped: 1 context)\x1b[0m" in err.getvalue()
 
 
@@ -2652,13 +2655,548 @@ def test_run_auto_honors_no_color_when_streams_are_ttys(monkeypatch):
         make_model(id="acme/short", name="Acme: Short", context_length=1000),
     ]
     _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
     out, err = _TTYStringIO(), _TTYStringIO()
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
     monkeypatch.setenv("NO_COLOR", "1")
     assert mc.run(make_args(min_context=1_000_000), models, False) == 0
-    assert "\x1b[" not in out.getvalue()
+    (proc,) = procs
+    assert "\x1b[" not in proc.stdin.getvalue()
     assert "\x1b[" not in err.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# pager
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_pager_off_when_no_pager_flag(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", _FakeStream(True))
+    assert mc.resolve_pager(make_args(no_pager=True)) is None
+
+
+def test_resolve_pager_off_without_tty(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", _FakeStream(False))
+    monkeypatch.delenv("PAGER", raising=False)
+    assert mc.resolve_pager(make_args()) is None
+
+
+def test_resolve_pager_less_fallback_without_pager_env(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", _FakeStream(True))
+    monkeypatch.delenv("PAGER", raising=False)
+    assert mc.resolve_pager(make_args()) == [
+        "less",
+        "--quit-if-one-screen",
+        "--RAW-CONTROL-CHARS",
+        "--no-init",
+    ]
+
+
+@pytest.mark.parametrize("empty", ["", "   "])
+def test_resolve_pager_empty_env_counts_as_unset(monkeypatch, empty):
+    monkeypatch.setattr(sys, "stdout", _FakeStream(True))
+    monkeypatch.setenv("PAGER", empty)
+    assert mc.resolve_pager(make_args())[0] == "less"
+
+
+def test_resolve_pager_uses_pager_env_verbatim(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", _FakeStream(True))
+    monkeypatch.setenv("PAGER", "pager -X -R")
+    assert mc.resolve_pager(make_args()) == ["pager", "-X", "-R"]
+
+
+@pytest.mark.parametrize("malformed", ['less "', "a\\"])
+def test_resolve_pager_malformed_env_counts_as_unset(monkeypatch, malformed):
+    # shlex.split raises ValueError on unbalanced quotes / trailing
+    # backslashes; a hostile $PAGER must degrade to the fallback, never
+    # abort the run (spec invariant: pager startup problems never lose
+    # output).
+    monkeypatch.setattr(sys, "stdout", _FakeStream(True))
+    monkeypatch.setenv("PAGER", malformed)
+    assert mc.resolve_pager(make_args()) == [
+        "less",
+        "--quit-if-one-screen",
+        "--RAW-CONTROL-CHARS",
+        "--no-init",
+    ]
+
+
+class _PagerStdin(io.StringIO):
+    """Pager-stdin double: close() records itself instead of sealing the buffer.
+
+    The real contract is that the pager's stdin is closed after the output
+    (the EOF signal); a plain StringIO would then refuse getvalue(), so the
+    double keeps the bytes readable for assertions.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.close_called = False
+
+    def close(self):
+        self.close_called = True
+
+
+class _FakePagerProc:
+    """Minimal Popen double: writable stdin, poll/terminate/wait bookkeeping."""
+
+    def __init__(self, argv):
+        self.argv = argv
+        self.stdin = _PagerStdin()
+        self.terminated = False
+        self.reaped = False
+
+    def poll(self):
+        return 0 if self.reaped else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self):
+        self.reaped = True
+        return 0
+
+
+def _stub_pager(monkeypatch):
+    """Replace subprocess.Popen with a fake pager; return its procs list.
+
+    The list fills as the code under test spawns, so callers that only
+    assert on spawns must unpack after the call.
+    """
+    procs = []
+
+    def fake_popen(argv, **kwargs):
+        procs.append(_FakePagerProc(argv))
+        return procs[-1]
+
+    monkeypatch.setattr(mc.subprocess, "Popen", fake_popen)
+    return procs
+
+
+def _stub_pager_proc(monkeypatch, proc):
+    """Like _stub_pager but every spawn returns the given pre-built double.
+
+    For tests that must customize the double (stdin, wait) BEFORE entering
+    the pager context.
+    """
+
+    def fake_popen(argv, **kwargs):
+        proc.argv = argv
+        return proc
+
+    monkeypatch.setattr(mc.subprocess, "Popen", fake_popen)
+
+
+def test_paged_stdout_swaps_swaps_back_and_reaps(monkeypatch):
+    proc = _FakePagerProc(["less"])
+    _stub_pager_proc(monkeypatch, proc)
+    original = sys.stdout
+    with mc.paged_stdout(["less"]):
+        assert sys.stdout is proc.stdin
+        print("hello")
+    assert sys.stdout is original
+    assert proc.stdin.getvalue() == "hello\n"
+    assert proc.stdin.close_called is True  # EOF signaled to the pager
+    assert proc.reaped is True and proc.terminated is False
+
+
+def test_paged_stdout_spawn_failure_yields_false(monkeypatch, capsys):
+    def broken_popen(argv, **kwargs):
+        raise OSError("no pager")
+
+    monkeypatch.setattr(mc.subprocess, "Popen", broken_popen)
+    with mc.paged_stdout(["less"]) as paged:
+        assert paged is False
+        print("direct")
+    assert capsys.readouterr().out == "direct\n"
+
+
+def test_paged_stdout_no_argv_never_spawns(monkeypatch):
+    spawned = []
+
+    def spy_popen(argv, **kwargs):
+        spawned.append(argv)
+        raise AssertionError("Popen must not run without a pager argv")
+
+    monkeypatch.setattr(mc.subprocess, "Popen", spy_popen)
+    with mc.paged_stdout(None) as paged:
+        assert paged is False
+        print("direct")
+    assert spawned == []
+
+
+def test_paged_stdout_sets_less_frx_for_child_when_unset(monkeypatch):
+    # A bare `PAGER=less` reads no flags and would show raw SGR as junk
+    # (the human-reported bug). Git's convention: give the child
+    # LESS=FRX when the user has none — colors render, one-screen output
+    # exits immediately, the stderr notes survive quitting.
+    captured = {}
+
+    def spy_popen(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakePagerProc(argv)
+
+    monkeypatch.setattr(mc.subprocess, "Popen", spy_popen)
+    monkeypatch.delenv("LESS", raising=False)
+    with mc.paged_stdout(["less"]):
+        pass
+    assert captured["env"]["LESS"] == "FRX"
+
+
+def test_paged_stdout_keeps_user_less_env(monkeypatch):
+    # The user's own $LESS always wins: inherit the environment untouched.
+    captured = {}
+
+    def spy_popen(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakePagerProc(argv)
+
+    monkeypatch.setattr(mc.subprocess, "Popen", spy_popen)
+    monkeypatch.setenv("LESS", "-R")
+    with mc.paged_stdout(["less"]):
+        pass
+    assert captured["env"] is None
+
+
+def test_paged_stdout_keeps_empty_less_env(monkeypatch):
+    # git parity: set-but-empty $LESS counts as set -- the child inherits it
+    # untouched; only a genuinely unset $LESS triggers the LESS=FRX injection.
+    captured = {}
+
+    def spy_popen(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakePagerProc(argv)
+
+    monkeypatch.setattr(mc.subprocess, "Popen", spy_popen)
+    monkeypatch.setenv("LESS", "")
+    with mc.paged_stdout(["less"]):
+        pass
+    assert captured["env"] is None
+
+
+def test_paged_stdout_pipe_encoding_defaults_to_utf8(monkeypatch):
+    # The pager pipe must write with the encoding the direct path would have
+    # used, not the locale's: Popen's text mode uses
+    # locale.getpreferredencoding, which can disagree with sys.stdout.encoding
+    # (e.g. PYTHONIOENCODING=utf-8 over a latin-1 locale) and then a non-ASCII
+    # model name raises UnicodeEncodeError mid-table only when paged.
+    # _TTYStringIO carries StringIO's encoding=None -> the utf-8 fallback.
+    captured = {}
+
+    def spy_popen(argv, **kwargs):
+        captured.update(kwargs)
+        return _FakePagerProc(argv)
+
+    monkeypatch.setattr(mc.subprocess, "Popen", spy_popen)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    with mc.paged_stdout(["less"]):
+        pass
+    assert captured.get("encoding") == "utf-8"
+
+
+def test_paged_stdout_pipe_encoding_follows_stdout(monkeypatch):
+    # A stream with its own encoding pins the pipe's encoding (and error
+    # handler) to exactly what a direct print would have used.
+    captured = {}
+
+    def spy_popen(argv, **kwargs):
+        captured.update(kwargs)
+        return _FakePagerProc(argv)
+
+    monkeypatch.setattr(mc.subprocess, "Popen", spy_popen)
+
+    class _AsciiTTY(_TTYStringIO):
+        encoding = "ascii"
+
+    fake = _AsciiTTY()
+    monkeypatch.setattr(sys, "stdout", fake)
+    expected = (fake.encoding, fake.errors)
+    with mc.paged_stdout(["less"]):
+        pass
+    assert (captured.get("encoding"), captured.get("errors")) == expected
+
+
+def test_paged_stdout_block_interrupt_terminates_and_signals(monkeypatch):
+    proc = _FakePagerProc(["less"])
+    _stub_pager_proc(monkeypatch, proc)
+    with pytest.raises(mc.PagerInterrupted):
+        with mc.paged_stdout(["less"]):
+            raise KeyboardInterrupt
+    assert proc.terminated is True and proc.reaped is True
+
+
+def test_paged_stdout_close_broken_pipe_is_swallowed(monkeypatch):
+    proc = _FakePagerProc(["less"])
+    _stub_pager_proc(monkeypatch, proc)
+
+    class _EpipeClose(io.StringIO):
+        # Fire EPIPE once -- the CM's guarded close; a later close (the
+        # destructor's) must seal quietly or GC logs an unraisable error.
+        def __init__(self):
+            super().__init__()
+            self.epipe_fired = False
+
+        def close(self):
+            if not self.epipe_fired:
+                self.epipe_fired = True
+                raise BrokenPipeError
+            super().close()
+
+    proc.stdin = _EpipeClose()
+    with mc.paged_stdout(["less"]):
+        pass
+    assert proc.reaped is True
+
+
+def test_paged_stdout_close_interrupt_terminates_and_signals(monkeypatch):
+    # A Ctrl-C landing inside the guarded stdin close() must count as an
+    # interrupt: terminate + reap the pager and surface PagerInterrupted
+    # (run() -> 130), never a raw KeyboardInterrupt traceback.
+    proc = _FakePagerProc(["less"])
+    _stub_pager_proc(monkeypatch, proc)
+
+    class _InterruptClose(_PagerStdin):
+        # Fire KI once -- the CM's guarded close; a later close (the
+        # destructor's) must seal quietly or GC logs an unraisable error.
+        def __init__(self):
+            super().__init__()
+            self.ki_fired = False
+
+        def close(self):
+            if not self.ki_fired:
+                self.ki_fired = True
+                raise KeyboardInterrupt
+            super().close()
+
+    proc.stdin = _InterruptClose()
+    original = sys.stdout
+    with pytest.raises(mc.PagerInterrupted):
+        with mc.paged_stdout(["less"]):
+            pass
+    assert sys.stdout is original
+    assert proc.terminated is True and proc.reaped is True
+
+
+def test_paged_stdout_wait_interrupt_exits_via_sentinel(monkeypatch):
+    proc = _FakePagerProc(["less"])
+    _stub_pager_proc(monkeypatch, proc)
+    raised = []
+
+    def flaky_wait():
+        if not raised:
+            raised.append(True)
+            raise KeyboardInterrupt
+        proc.reaped = True
+        return 0
+
+    proc.wait = flaky_wait
+    with pytest.raises(mc.PagerInterrupted):
+        with mc.paged_stdout(["less"]):
+            pass
+    assert proc.terminated is True
+
+
+def test_run_pages_human_output_on_tty(monkeypatch):
+    models = [
+        make_model(id="acme/model-a", name="Acme: A"),
+        make_model(id="acme/short", name="Acme: Short", context_length=1000),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    monkeypatch.setattr(sys, "stderr", _TTYStringIO())
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("PAGER", raising=False)
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+    (proc,) = procs
+    assert proc.argv == [
+        "less",
+        "--quit-if-one-screen",
+        "--RAW-CONTROL-CHARS",
+        "--no-init",
+    ]
+    assert "RANK" in proc.stdin.getvalue()
+
+
+@pytest.mark.parametrize("mode", [{"best": True}, {"json": True}, {"catalog": True}])
+def test_run_machine_modes_never_page(monkeypatch, mode):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    out, err = _TTYStringIO(), _TTYStringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    assert mc.run(make_args(min_context=1_000_000, **mode), models, False) == 0
+    assert procs == []
+    assert out.getvalue() != ""
+
+
+def test_run_never_pages_without_tty(monkeypatch, capsys):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+    assert procs == []
+    assert "RANK" in capsys.readouterr().out
+
+
+def test_run_no_pager_flag_prints_directly(monkeypatch):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    out, err = _TTYStringIO(), _TTYStringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    assert mc.run(make_args(min_context=1_000_000, no_pager=True), models, False) == 0
+    assert procs == []
+    assert "RANK" in out.getvalue()
+
+
+def test_run_pager_start_failure_prints_directly(monkeypatch):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+
+    def broken_popen(argv, **kwargs):
+        raise OSError("no pager binary")
+
+    monkeypatch.setattr(mc.subprocess, "Popen", broken_popen)
+    out, err = _TTYStringIO(), _TTYStringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+    assert "RANK" in out.getvalue()
+
+
+def test_run_malformed_pager_env_degrades_to_fallback(monkeypatch):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    monkeypatch.setattr(sys, "stderr", _TTYStringIO())
+    monkeypatch.setenv("PAGER", 'less "')
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+    (proc,) = procs
+    assert proc.argv == [
+        "less",
+        "--quit-if-one-screen",
+        "--RAW-CONTROL-CHARS",
+        "--no-init",
+    ]
+    assert "RANK" in proc.stdin.getvalue()
+
+
+def test_run_pager_early_quit_does_not_crash(monkeypatch):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+
+    class _ExplodingSink:
+        def write(self, text):
+            raise BrokenPipeError
+
+        def close(self):
+            pass
+
+    proc = _FakePagerProc(["less"])
+    _stub_pager_proc(monkeypatch, proc)
+    proc.stdin = _ExplodingSink()
+    out, err = _TTYStringIO(), _TTYStringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+    assert proc.reaped is True
+
+
+def test_run_pager_exit_status_not_propagated(monkeypatch):
+    class _FailingPagerProc(_FakePagerProc):
+        def wait(self):
+            self.reaped = True
+            return 1  # pager exited nonzero; run()'s own status is unaffected
+
+    def fake_popen(argv, **kwargs):
+        return _FailingPagerProc(argv)
+
+    monkeypatch.setattr(mc.subprocess, "Popen", fake_popen)
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    monkeypatch.setattr(sys, "stderr", _TTYStringIO())
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 0
+
+
+def test_run_pager_off_peak_and_bare(monkeypatch):
+    models = [
+        make_model(id="acme/deal", pricing=hy4_pricing(), context_length=262144),
+        make_model(id="acme/plain"),
+    ]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    monkeypatch.setattr(sys, "stderr", _TTYStringIO())
+    assert (
+        mc.run(
+            make_args(off_peak=True, bare=True, min_context=1_000_000), models, False
+        )
+        == 0
+    )
+    (proc,) = procs
+    # --bare drops the deals title and legend (DESIGN.md "CLI output");
+    # the deals table itself must still reach the pager.
+    assert "OFF-PEAK" in proc.stdin.getvalue()
+
+
+@pytest.mark.parametrize("flags", [{"bare": True}, {"no_depths": True}])
+def test_run_pager_output_variants(monkeypatch, flags):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    monkeypatch.setattr(sys, "stderr", _TTYStringIO())
+    assert mc.run(make_args(min_context=1_000_000, **flags), models, False) == 0
+    (proc,) = procs
+    assert "RANK" in proc.stdin.getvalue()
+
+
+def test_run_interrupted_while_paging_exits_130(monkeypatch):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    monkeypatch.setattr(sys, "stderr", _TTYStringIO())
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mc, "print_table", interrupted)
+    assert mc.run(make_args(min_context=1_000_000), models, False) == 130
+    (proc,) = procs
+    assert proc.terminated is True and proc.reaped is True
+
+
+@pytest.mark.parametrize(
+    "env,flag,expected_color",
+    [
+        ("", None, True),  # auto + TTY: color forced on through the pager
+        ("1", None, False),  # NO_COLOR silences auto
+        ("1", "on", True),  # explicit on beats NO_COLOR, through the pager too
+        (None, "off", False),
+    ],
+)
+def test_run_pager_color_resolution(monkeypatch, env, flag, expected_color):
+    models = [make_model(id="acme/model-a", name="Acme: A")]
+    _stub_quality_run(monkeypatch, models, aa_raises=True)
+    procs = _stub_pager(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", _TTYStringIO())
+    monkeypatch.setattr(sys, "stderr", _TTYStringIO())
+    if env is None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    else:
+        monkeypatch.setenv("NO_COLOR", env)
+    kwargs = {} if flag is None else {"color": flag}
+    assert mc.run(make_args(min_context=1_000_000, **kwargs), models, False) == 0
+    (proc,) = procs
+    sgr = "\x1b[" in proc.stdin.getvalue()
+    assert sgr is expected_color
 
 
 def test_footer_legend_lines(capsys):
@@ -8326,6 +8864,11 @@ def test_parse_args_accepts_catalog_alone():
     assert args.catalog is True
 
 
+def test_parse_args_no_pager_flag():
+    assert mc.parse_args(["--no-pager"]).no_pager is True
+    assert mc.parse_args([]).no_pager is False
+
+
 MC_SCRIPT = Path(__file__).resolve().parent / "model_compare.py"
 
 
@@ -8337,7 +8880,7 @@ def test_version_flag():
         check=True,
     )
     # Literal pin: a release that forgets to bump VERSION fails here.
-    assert proc.stdout.strip() == "model-compare 0.7.1"
+    assert proc.stdout.strip() == "model-compare 0.7.2"
 
 
 # ---------------------------------------------------------------------------
